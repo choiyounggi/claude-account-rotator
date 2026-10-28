@@ -45,11 +45,35 @@ class Profile:
     organization_name: Optional[str] = field(default=None, repr=False)
     rate_limit_tier: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        for name in ("account_id", "home", "keychain_service"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError("Profile.%s must be a non-empty str" % name)
+        if not os.path.isabs(self.home):
+            raise ValueError("Profile.home must be absolute")
+
 
 @dataclass(frozen=True)
 class UsageWindow:
     utilization: float  # 0.0..100.0 inclusive; ints are stored as float
     resets_at: Optional[datetime] = None  # aware UTC or None
+
+    def __post_init__(self) -> None:
+        u = self.utilization
+        if isinstance(u, bool) or not isinstance(u, (int, float)):
+            raise ValueError("UsageWindow.utilization must be a number")
+        # Range check before float(): it is False for NaN/inf and a huge int
+        # compares without OverflowError.
+        if not (0 <= u <= 100):
+            raise ValueError("UsageWindow.utilization must be within 0..100")
+        u = float(u)
+        if not math.isfinite(u):
+            raise ValueError("UsageWindow.utilization must be within 0..100")
+        object.__setattr__(self, "utilization", u)
+        r = self.resets_at
+        if r is not None and not (isinstance(r, datetime) and r.utcoffset() is not None):
+            raise ValueError("UsageWindow.resets_at must be timezone-aware")
 
 
 @dataclass(frozen=True)
@@ -61,13 +85,40 @@ class AccountUsage:
     seven_day: Optional[UsageWindow] = None
     error: Optional[str] = None  # None, or USAGE_ERROR_RE.fullmatch(error) is not None
 
+    def __post_init__(self) -> None:
+        if self.source not in USAGE_SOURCES:
+            raise ValueError("AccountUsage.source must be one of USAGE_SOURCES")
+        f = self.fetched_at
+        if not (isinstance(f, datetime) and f.utcoffset() is not None):
+            raise ValueError("AccountUsage.fetched_at must be timezone-aware")
+        e = self.error
+        if e is not None and not (isinstance(e, str) and USAGE_ERROR_RE.fullmatch(e) is not None):
+            raise ValueError("AccountUsage.error must match USAGE_ERROR_RE")
+        has_window = self.five_hour is not None or self.seven_day is not None
+        if self.source == "live" and (e is not None or not has_window):
+            raise ValueError("live AccountUsage needs a window and no error")
+        if self.source == "cache" and not has_window:
+            raise ValueError("cache AccountUsage needs a window")
+        if self.source == "unavailable" and (has_window or e is None or ";cache_" not in e):
+            raise ValueError("unavailable AccountUsage needs no window and a live;cache error")
+
     def max_utilization(self, now: Optional[datetime] = None) -> Optional[float]:
         """Max utilization over present windows; None when both are absent.
 
         With an aware ``now``, a window whose ``resets_at`` is not None and
         ``<= now`` contributes 0.0. A naive ``now`` raises ValueError.
         """
-        raise NotImplementedError("contract stub: t1 implements")
+        if now is not None and now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        values = []
+        for w in (self.five_hour, self.seven_day):
+            if w is None:
+                continue
+            if now is not None and w.resets_at is not None and w.resets_at <= now:
+                values.append(0.0)
+            else:
+                values.append(w.utilization)
+        return max(values) if values else None
 
 
 @dataclass(frozen=True)
@@ -92,3 +143,23 @@ class Session:
     argv: Tuple[str, ...]  # a tuple, may be empty
     terminal_handle: Optional[str] = None  # ORCA_TERMINAL_HANDLE, e.g. "term_<id>"
     started_at: Optional[datetime] = None  # aware if present
+
+    def __post_init__(self) -> None:
+        # type() not isinstance(): bool is an int subclass and must be refused.
+        if type(self.pid) is not int:
+            raise TypeError("Session.pid must be an int")
+        if self.pid <= 0:
+            raise ValueError("Session.pid must be > 0")
+        for name in ("session_id", "cwd"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError("Session.%s must be a non-empty str" % name)
+        if self.status not in SESSION_STATUSES:
+            raise ValueError("Session.status must be one of SESSION_STATUSES")
+        if not isinstance(self.config_dir, str) or not os.path.isabs(self.config_dir):
+            raise ValueError("Session.config_dir must be absolute")
+        if not isinstance(self.argv, tuple):
+            raise TypeError("Session.argv must be a tuple")
+        s = self.started_at
+        if s is not None and not (isinstance(s, datetime) and s.utcoffset() is not None):
+            raise ValueError("Session.started_at must be timezone-aware")
