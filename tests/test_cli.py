@@ -23,7 +23,7 @@ from unittest import mock
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Set
 
-from rotator import cli, daemon, launchd
+from rotator import cli, daemon, launchd, refresh
 from rotator.cli import STATUS_KEYS, build_status, main, render
 from rotator.config import (
     CONFIG_DIR_DEFAULT, LOG_DIR_DEFAULT, TIMEOUT_KEYS, TOP_KEYS, Config, ConfigError, load_config, parse_config, prompt_ok,
@@ -104,6 +104,13 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(a.state_dir, CONFIG_DIR_DEFAULT)
         self.assertEqual(b.state_dir, CONFIG_DIR_DEFAULT)
 
+    def test_token_refresh_default(self):
+        self.assertIs(Config().token_refresh, True)
+        self.assertIs(load("{}").token_refresh, True)
+
+    def test_token_refresh_false(self):
+        self.assertIs(load('{"token_refresh": false}').token_refresh, False)
+
     def test_policy_config_carries_overrides(self):
         cfg = load('{"cooldown_s": 60, "stale_max_age_s": 120}')
         pc = cfg.policy_config()
@@ -129,6 +136,8 @@ class TestConfigValidation(unittest.TestCase):
         ('{"soft_pc": 80}', "soft_pc"),
         ('{"state_dir": "/x"}', "state_dir"),
         ('{"dry_run": 1}', "dry_run"),
+        ('{"token_refresh": "no"}', "token_refresh"),
+        ('{"token_refresh": 1}', "token_refresh"),
         ('{"profiles_root": "rel/x"}', "profiles_root"),
         ('{"continue_prompt": "a\\tb"}', "continue_prompt"),
     ]
@@ -334,6 +343,10 @@ def _not_used(*a, **k):
     raise AssertionError("not used by the CLI")
 
 
+def _no_refresh(*a, **k):
+    raise AssertionError("status never refreshes")
+
+
 class CliEnv:
     def __init__(self):
         self.profiles: List[Profile] = []
@@ -437,6 +450,7 @@ class CliEnv:
 
         fields = dict(
             discover_profiles=discover_profiles, fetch_usage=fetch_usage,
+            refresh_token=_no_refresh, refresh_held=_no_refresh,
             discover_sessions=discover_sessions, switch=switch, make_driver=_NoDriver,
             procs=_NullProbe(), read_pointer=read_pointer, write_pointer=_not_used,
             now=lambda: env.now_v, monotonic=lambda: env.mono_v, spawn=_not_used, wait_stop=wait_stop, lock=lock,
@@ -659,7 +673,8 @@ class TestBuildStatus(StatusBase):
         self.assertEqual(doc["schema"], 1)
         self.assertEqual(set(doc["daemon"]), {"running", "pid", "snapshot_age_s", "flags"})
         self.assertEqual(set(doc["accounts"][0]), {"account_id", "source", "error", "fetched_at", "five_hour",
-                                                   "seven_day", "fable", "label", "plan", "pointer", "sessions"})
+                                                   "seven_day", "fable", "label", "plan", "pointer", "sessions",
+                                                   "refresh"})
         self.assertEqual(set(doc["sessions"][0]), {
             "pid", "session_id", "status", "account_id", "decision", "would_switch", "in_flight", "in_flight_pid",
             "stuck", "unswitchable", "hard_hold_until", "excluded", "record_state", "last_result", "hint",
@@ -2335,6 +2350,156 @@ class TestSwitchCommand(MainBase):
 # --- Task 15 ---------------------------------------------------------------------------------------------
 
 
+OFF = {"state": "skipped", "reason": "daemon_off", "at": None, "last_refreshed_at": None}
+REFRESHED = {"state": "refreshed", "reason": "ok", "at": T0_ISO, "last_refreshed_at": T0_ISO}
+
+
+class TestStatusRefresh(StatusBase):
+    def snapshot(self, written_at, entries=None, accounts=(ACC_A, ACC_B, ACC_C)):
+        doc = json.loads(snapshot_doc(self.env, written_at, accounts=accounts))
+        for a in doc["accounts"]:
+            if entries and a["account_id"] in entries:
+                a["refresh"] = entries[a["account_id"]]
+        self.env.files[self.state_path] = json.dumps(doc)
+        self.env.alive_pids = {4242}
+
+    def assert_no_refresh_call(self):
+        # The cli fakes for refresh_token / refresh_held raise; reaching here means neither ran.
+        self.assertIs(self.deps.refresh_token, self.deps.refresh_held)
+        with self.assertRaises(AssertionError):
+            self.deps.refresh_token()
+
+    def test_daemon_off(self):
+        doc = self.doc()
+        for a in doc["accounts"]:
+            self.assertEqual(a["refresh"], OFF)
+        doc["accounts"][0]["refresh"]["reason"] = "mutated"
+        self.assertEqual(refresh.DAEMON_OFF_RECORD["reason"], "daemon_off")
+        self.assert_no_refresh_call()
+
+    def test_fresh_snapshot_record_passes_through(self):
+        self.snapshot(T0 - timedelta(seconds=5), {ACC_A: REFRESHED})
+        doc = self.doc()
+        self.assertEqual(self.account(doc, ACC_A)["refresh"], REFRESHED)
+        self.assertIsNone(self.account(doc, ACC_B)["refresh"])  # older daemon: no key
+
+    def test_running_daemon_missing_account_is_null(self):
+        self.snapshot(T0 - timedelta(seconds=5), {ACC_A: REFRESHED}, accounts=(ACC_A, ACC_B))
+        doc = self.doc()
+        self.assertIsNone(self.account(doc, ACC_C)["refresh"])
+        self.assertEqual(self.account(doc, ACC_C)["source"], "live")
+
+    def test_stale_snapshot_is_null(self):
+        self.snapshot(T0 - timedelta(minutes=10), {ACC_A: REFRESHED})
+        doc = self.doc()
+        for a in doc["accounts"]:
+            self.assertIsNone(a["refresh"])
+
+    def test_status_json_has_no_secret(self):
+        self.snapshot(T0 - timedelta(seconds=5), {ACC_A: REFRESHED})
+        text = json.dumps(self.doc())
+        # The fixture profiles carry planted identity values; none may reach the status JSON.
+        for planted in (UUID_SECRET, EMAIL, ORG, "SECRET-", "accessToken", "refreshToken"):
+            self.assertNotIn(planted, text)
+        self.assertIn(ACC_A, text)  # negative control: the document holds the accounts
+        self.assertIn('"refresh"', text)
+
+
+class TestRefreshReasons(unittest.TestCase):
+    def test_every_display_token_has_text(self):
+        for tok in sorted(refresh.REFRESH_REASONS - {"fresh", "ok", "write_recovered"}):
+            with self.subTest(tok=tok):
+                self.assertIn(tok, cli._REASONS)
+
+    def tokens(self, source, error, rec):
+        return cli._reason_tokens({"source": source, "error": error, "refresh": rec})
+
+    def test_joined_reasons_refresh_first(self):
+        self.assertEqual(self.tokens("cache", "token_expired", {"state": "stopped", "reason": "invalid_grant"}),
+                         "invalid_grant;token_expired")
+        self.assertEqual(cli.reason_text(self.tokens("cache", "token_expired",
+                                                     {"state": "stopped", "reason": "invalid_grant"})),
+                         "재로그인 필요·토큰 만료")
+        self.assertEqual(cli.reason_text(self.tokens("unavailable", "token_missing",
+                                                     {"state": "skipped", "reason": "no_credential"})),
+                         "토큰 없음")
+        self.assertEqual(self.tokens("cache", None, {"state": "failed", "reason": "write_failed"}), "write_failed")
+
+    def test_daemon_off_never_in_cells(self):
+        for source in ("cache", "unavailable"):
+            with self.subTest(source=source):
+                self.assertEqual(self.tokens(source, "token_expired",
+                                             {"state": "skipped", "reason": "daemon_off"}), "token_expired")
+
+    def test_unchanged_cases(self):
+        self.assertEqual(self.tokens("live", "token_expired", {"state": "skipped", "reason": "live_session"}),
+                         "token_expired")
+        self.assertEqual(self.tokens("cache", "token_expired", None), "token_expired")
+        self.assertEqual(self.tokens("cache", "token_expired", {"state": "not_needed", "reason": "fresh"}),
+                         "token_expired")
+        self.assertEqual(self.tokens("cache", "token_expired", {"state": "refreshed", "reason": "ok"}),
+                         "token_expired")
+        self.assertEqual(self.tokens("cache", None, None), "")
+
+
+class TestRenderRefresh(unittest.TestCase):
+    lines = TestRender.lines
+    row = TestRender.row
+
+    def doc_with(self, **acc):
+        doc = render_doc()
+        doc["accounts"][0].update(acc)
+        return doc
+
+    def test_daemon_off_only_in_json(self):
+        # The daemon is off: every record is daemon_off in the JSON, never in a table cell.
+        env = standard_env()
+        env.usages[ACC_A] = AccountUsage(account_id=ACC_A, source="cache", fetched_at=T0 - timedelta(minutes=12),
+                                         five_hour=UsageWindow(50.0, T0 + timedelta(hours=1)), error="token_expired")
+        env.usages[ACC_B] = AccountUsage(account_id=ACC_B, source="unavailable", fetched_at=T0,
+                                         error="token_expired;cache_missing")
+        doc = build_status(make_cfg(), env.deps(), T0)
+        self.assertEqual([a["refresh"]["reason"] for a in doc["accounts"]], ["daemon_off"] * 3)
+        self.assertIn("daemon_off", json.dumps(doc))
+        lines = self.lines(doc, width=260)
+        for row in account_rows(lines):
+            self.assertNotIn("데몬 꺼짐", row)
+        rows = [cells(l) for l in account_rows(lines)]
+        self.assertTrue(any(c.endswith("(토큰 만료)") for r in rows for c in r), rows)
+
+    def test_cache_past_reset_shows_zero_and_reason(self):
+        doc = self.doc_with(source="cache", error="token_expired", five_hour=win(90.0, timedelta(minutes=-1)),
+                            refresh={"state": "stopped", "reason": "invalid_grant", "at": None,
+                                     "last_refreshed_at": None})
+        row = self.row(self.lines(doc), "alice")
+        joined = " ".join(row)
+        self.assertIn("(캐시)", joined)
+        five = next(c for c in row if "(캐시)" in c)
+        self.assertIn("0%", five)
+        self.assertNotIn("90%", joined)
+        age = row[-1]
+        self.assertTrue(age.startswith("12초 전 (재로그인"), age)
+
+    def test_unavailable_shows_refresh_reason(self):
+        doc = self.doc_with(source="unavailable", error="token_expired;cache_missing", five_hour=None,
+                            seven_day=None, refresh={"state": "failed", "reason": "write_failed", "at": None,
+                                                     "last_refreshed_at": None})
+        five = self.row(self.lines(doc, width=260), "alice")[3]
+        self.assertTrue(five.startswith("-  (키체인 저장 실패·토큰"), five)
+
+    def test_cache_age_cell_leads_with_refresh_reason(self):
+        doc = self.doc_with(source="cache", error="token_expired", five_hour=win(90.0, timedelta(minutes=-1)),
+                            refresh={"state": "failed", "reason": "write_failed", "at": None,
+                                     "last_refreshed_at": None})
+        row = self.row(self.lines(doc), "alice")
+        self.assertTrue(row[-1].startswith("12초 전 (키체인 저"), row)
+
+    def test_live_account_hides_live_session(self):
+        doc = self.doc_with(refresh={"state": "skipped", "reason": "live_session", "at": None,
+                                     "last_refreshed_at": None})
+        self.assertNotIn("사용 중", " ".join(self.row(self.lines(doc), "alice")))
+
+
 class TestReadme(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -2350,6 +2515,21 @@ class TestReadme(unittest.TestCase):
         for k in TOP_KEYS + TIMEOUT_KEYS:
             self.assertIn(k, self.text)
         self.assertIn(DEFAULT_CONTINUE_PROMPT, self.text)
+
+    def test_token_refresh_documented(self):
+        sec = self.section("## Idle-account token refresh")
+        for needle in ("token_refresh", "2.1.296", "1.4.241", "security -i", ".oauth_refresh.lock", "restart",
+                       "invalid_grant", "dry-run", "status --watch", "re-login"):
+            self.assertIn(needle, sec)
+        for tok in sorted(refresh.REFRESH_REASONS - {"fresh", "ok", "write_recovered"}):
+            self.assertIn(cli._REASONS[tok], sec, tok)
+            self.assertIn("`%s`" % tok, sec, tok)
+        self.assertIn("refresh", self.section("## Status JSON (schema 1)"))
+
+    def test_refresh_residual_risks(self):
+        sec = self.section("## Known residual risks")
+        for needle in ("lock_changed", "reuse", "44", "restart", "2.1.296"):
+            self.assertIn(needle, sec)
 
     def test_status_schema_documented(self):
         for k in STATUS_KEYS:

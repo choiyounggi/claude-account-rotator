@@ -23,7 +23,7 @@ import unicodedata
 from datetime import datetime, timezone, tzinfo
 from typing import Any, Callable, Dict, List, Optional, Sequence, TextIO, Tuple
 
-from rotator import launchd
+from rotator import launchd, refresh
 from rotator.accounts import profile_for_config_dir
 from rotator.config import CONFIG_PATH_DEFAULT, LOG_DIR_DEFAULT, Config, ConfigError, load_config
 from rotator.daemon import (
@@ -160,7 +160,17 @@ GLYPHS_ASCII = Glyphs("-", "|", "+++++++++", "#", ".", "~", ">=", "/", "(%s)")
 _REASONS = {"token_expired": "토큰 만료", "token_missing": "토큰 없음", "request_error": "요청 실패",
             "http_429": "호출 제한", "network": "연결 실패", "timeout": "연결 실패", "bad_json": "응답 이상",
             "bad_shape": "응답 이상", "cache_missing": "캐시 없음", "cache_bad_json": "캐시 손상",
-            "cache_bad_shape": "캐시 손상"}
+            "cache_bad_shape": "캐시 손상",
+            # token refresh reasons (rotator.refresh.REFRESH_REASONS minus the success tokens)
+            "disabled": "자동 갱신 꺼짐", "dry_run": "드라이런", "no_credential": "토큰 없음",
+            "no_refresh_token": "재로그인 필요", "plaintext_store": "갱신 불가", "live_session": "사용 중",
+            "discovery_failed": "세션 확인 실패", "keychain_item_unclear": "갱신 불가", "payload_too_large": "갱신 불가",
+            "deferred": "갱신 대기", "locked": "갱신 중", "cc_lock_busy": "갱신 중", "cc_lock_stale": "잠금 남음",
+            "changed_under_lock": "갱신 중", "keychain_write_unavailable": "키체인 쓰기 불가",
+            "invalid_grant": "재로그인 필요", "invalid_scope": "재로그인 필요", "rejected": "갱신 거부",
+            "malformed_response": "응답 이상", "outcome_unknown": "갱신 결과 불명", "network_error": "연결 실패",
+            "server_error": "갱신 실패", "rate_limited": "호출 제한", "write_failed": "키체인 저장 실패",
+            "conflict": "갱신 충돌", "internal_error": "갱신 실패", "daemon_off": "데몬 꺼짐"}
 
 
 def reason_text(error: object, sep: str = "·") -> str:
@@ -341,9 +351,16 @@ def build_status(cfg: Config, deps: Deps, now: datetime, usage: Optional[UsageCa
     attention.sort(key=lambda a: a["updated_at"], reverse=True)
 
     profile_by_id = {p.account_id: p for p in profiles}
+
+    def _refresh_of(aid: str) -> Optional[dict]:
+        if aid in by_id:
+            rec = by_id[aid].get("refresh")
+            return dict(rec) if isinstance(rec, dict) else None
+        return dict(refresh.DAEMON_OFF_RECORD) if not running else None
+
     accounts = [dict(summaries[aid], label=account_label(profile_by_id[aid]),
                      plan=plan_tag(profile_by_id[aid].rate_limit_tier),
-                     pointer=(aid == pointer_id), sessions=per_account.get(aid, []))
+                     pointer=(aid == pointer_id), sessions=per_account.get(aid, []), refresh=_refresh_of(aid))
                 for aid in sorted(summaries)]
     return {
         "schema": STATUS_SCHEMA,
@@ -447,11 +464,26 @@ def _label_cell(a: dict, suffixes: Dict[str, str], cap: int, ctx: _Ctx) -> str:
     return clip(_row_label(a), cap - display_width(suffix, ctx.amb), ctx.amb, ctx.g.ell) + suffix
 
 
+def _reason_tokens(a: dict) -> str:
+    """A non-live account's refresh reason, then its usage error (``;``-separated tokens).
+
+    The refresh reason goes first so it survives the fixed cell caps. ``daemon_off`` is left out: the header
+    already says the daemon is off, and the cells then read as they did before token refresh existed.
+    """
+    err = a.get("error")
+    base = err if isinstance(err, str) else ""
+    rec = a.get("refresh")
+    if (a.get("source") != "live" and isinstance(rec, dict) and rec.get("state") in ("skipped", "failed", "stopped")
+            and isinstance(rec.get("reason"), str) and rec["reason"] and rec["reason"] != "daemon_off"):
+        return rec["reason"] + ";" + base if base else rec["reason"]
+    return base
+
+
 def _usage_cell(a: dict, key: str, now: datetime, ctx: _Ctx, *, bars: bool, cells: int, remaining: bool,
                 reason_cap: Optional[int]) -> Tuple[str, Optional[float]]:
     """Cell text and the utilization it shows (None when it shows no number)."""
     if a.get("source") == "unavailable":
-        reason = reason_text(a.get("error"), ctx.g.join) if reason_cap is not None else ""
+        reason = reason_text(_reason_tokens(a), ctx.g.join) if reason_cap is not None else ""
         return ("-  (%s)" % clip(reason, reason_cap or 0, ctx.amb, ctx.g.ell) if reason else "-"), None
     st = _window_state(a.get(key), now)
     if st is None:
@@ -476,8 +508,9 @@ def _age_cell(a: dict, now: datetime, ctx: _Ctx) -> str:
     if fetched is None:
         return "-"
     text = age_text((now - fetched).total_seconds())
-    if a.get("source") == "cache" and a.get("error"):
-        text += " (%s)" % reason_text(a.get("error"), ctx.g.join)
+    toks = _reason_tokens(a)
+    if a.get("source") == "cache" and toks:
+        text += " (%s)" % reason_text(toks, ctx.g.join)
     return clip(text, _AGE_CAP, ctx.amb, ctx.g.ell)
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import functools
 import hashlib
 import json
 import logging
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Sequence, Set, Tuple
 
-from rotator import accounts, pointer, sessions, switcher, usage
+from rotator import accounts, pointer, refresh, sessions, switcher, usage
 from rotator.accounts import profile_for_config_dir
 from rotator.config import LOG_DIR_DEFAULT, Config
 from rotator.models import AccountUsage, Profile, Session, UsageWindow
@@ -154,6 +155,8 @@ class InFlight:
     deadline: float
     worker: Optional[Worker]
     stuck: bool = False
+    # Every account this switch may touch (source, first target, retargets); phase 2 never refreshes them.
+    account_ids: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -163,6 +166,8 @@ class Deps:
 
     discover_profiles: Callable[[str], List[Profile]]
     fetch_usage: Callable[[Profile], AccountUsage]
+    refresh_token: Callable[..., dict]
+    refresh_held: Callable[..., List[str]]
     discover_sessions: Callable[[Sequence[str]], List[Session]]
     switch: Callable[..., SwitchResult]
     make_driver: Callable[[], TerminalDriver]
@@ -539,6 +544,7 @@ def setup_logging(log_dir: str, stderr_is_tty: bool) -> logging.Logger:
 # --- usage cadence ---------------------------------------------------------------------------------------
 
 USAGE_BACKOFF_MAX_S = 300.0
+_cache_log = logging.getLogger("rotator.daemon")
 RETRY_AFTER_MAX_S = 900.0
 RATE_LIMITED_TOKEN = "http_429"
 
@@ -558,21 +564,40 @@ class UsageCache:
         self._poll_s = poll_s
         self._lock = threading.Lock()
         self._entries: Dict[str, Tuple[float, float, AccountUsage]] = {}
+        self._refresh: Dict[str, dict] = {}
+        self._flush_next: bool = True
 
     def refresh(self, profiles: Sequence[Profile], *, fetch: Callable[[Profile], AccountUsage],
-                monotonic: Callable[[], float], now: datetime, log: logging.Logger) -> List[str]:
-        """Fetch every account whose interval elapsed; returns the account ids fetched, in order."""
+                monotonic: Callable[[], float], now: datetime, log: logging.Logger,
+                pre: Optional[Callable[[Profile, Sequence[Profile]], dict]] = None) -> List[str]:
+        """Fetch every account whose interval elapsed; returns the account ids fetched, in order.
+
+        ``pre(profile, profiles)`` (the token-refresh gate) runs right before each fetch and its record is kept."""
         mono = monotonic()
         ids = {p.account_id for p in profiles}
         with self._lock:
             for aid in [a for a in self._entries if a not in ids]:
                 del self._entries[aid]
+            for aid in [a for a in self._refresh if a not in ids]:
+                del self._refresh[aid]
         fetched: List[str] = []
         for p in profiles:
             with self._lock:
                 entry = self._entries.get(p.account_id)
             if entry is not None and mono - entry[0] < entry[1]:
                 continue
+            if pre is not None:
+                kind = None
+                rec = None
+                try:
+                    rec = pre(p, profiles)
+                except Exception as e:
+                    kind = type(e).__name__
+                if kind is not None:
+                    log.error("event=token_refresh_error account=%s exc=%s", p.account_id, kind)
+                    rec = {"state": "failed", "reason": "internal_error", "at": _iso(now), "last_refreshed_at": None}
+                with self._lock:
+                    self._refresh[p.account_id] = rec
             stamp = monotonic()
             try:
                 u = fetch(p)
@@ -609,7 +634,59 @@ class UsageCache:
 
     def summaries(self) -> List[dict]:
         with self._lock:
-            return [usage_summary(u) for _, (_, _, u) in sorted(self._entries.items())]
+            return [dict(usage_summary(u),
+                         refresh=(dict(self._refresh[aid]) if isinstance(self._refresh.get(aid), dict) else None))
+                    for aid, (_, _, u) in sorted(self._entries.items())]
+
+    def refresh_record(self, account_id: str) -> Optional[dict]:
+        with self._lock:
+            rec = self._refresh.get(account_id)
+            return dict(rec) if isinstance(rec, dict) else None
+
+    def mark_due(self, account_id: str) -> None:
+        """Make the next refresh() fetch this account now (not when it is rate-limited)."""
+        with self._lock:
+            entry = self._entries.get(account_id)
+            if entry is not None and not rate_limited(entry[2]):
+                self._entries[account_id] = (entry[0], 0.0, entry[2])
+
+    def refresh_one(self, profiles: Sequence[Profile], *, call: Callable[[Profile, Sequence[Profile]], dict],
+                    held: Callable[..., List[str]], skip: FrozenSet[str] = frozenset()) -> Optional[str]:
+        """Run ``call`` for at most one account: a due held-set flush or a deferred refresh, alternating.
+
+        Held ids come from ``held`` only (never from stored records); ``skip`` ids are never picked."""
+        due = set(held(due_only=True))
+        every = set(held())
+        with self._lock:
+            recs = {aid: r for aid, r in self._refresh.items()}
+            flush_next = self._flush_next
+        flush = [p for p in profiles if p.account_id in due and p.account_id not in skip]
+        waiting = [p for p in profiles
+                   if isinstance(recs.get(p.account_id), dict) and recs[p.account_id].get("reason") == "deferred"
+                   and p.account_id not in every and p.account_id not in skip]
+        if flush and flush_next:
+            pick, src = flush[0], "flush"
+        elif waiting:
+            pick, src = waiting[0], "waiting"
+        elif flush:
+            pick, src = flush[0], "flush"
+        else:
+            return None
+        kind = None
+        rec = None
+        try:
+            rec = call(pick, profiles)
+        except Exception as e:
+            kind = type(e).__name__
+        if kind is not None:
+            _cache_log.error("event=token_refresh_error account=%s exc=%s", pick.account_id, kind)
+            rec = {"state": "failed", "reason": "internal_error", "at": None, "last_refreshed_at": None}
+        with self._lock:
+            self._refresh[pick.account_id] = rec
+            self._flush_next = (src == "waiting")
+        if isinstance(rec, dict) and rec.get("state") == "refreshed":
+            self.mark_due(pick.account_id)
+        return pick.account_id
 
 
 # --- the daemon ------------------------------------------------------------------------------------------
@@ -670,11 +747,18 @@ class Daemon:
             self._write_snapshot()
             return
         self._handle_sessions(profiles, usages, found, now)
+        if not self.stopping():
+            self._usage.refresh_one(profiles, call=self._deps.refresh_token, held=self._deps.refresh_held,
+                                    skip=self._switch_accounts())
         self._write_snapshot()
 
     def _refresh_usage(self, profiles: Sequence[Profile], now: datetime) -> None:
         self._usage.refresh(profiles, fetch=self._deps.fetch_usage, monotonic=self._deps.monotonic, now=now,
-                            log=self._log)
+                            log=self._log, pre=functools.partial(self._deps.refresh_token, network=False))
+
+    def _switch_accounts(self) -> FrozenSet[str]:
+        with self._lock:
+            return frozenset(a for inf in self._inflight.values() for a in inf.account_ids)
 
     def _pointer_step(self, profiles: Sequence[Profile], usages: Mapping[str, AccountUsage],
                       now: datetime) -> None:
@@ -805,7 +889,8 @@ class Daemon:
         ident = identity_of(s)
         self._inflight[s.session_id] = InFlight(
             identity=ident, handle=s.terminal_handle,
-            deadline=mono + switch_budget_s(self._cfg.timeouts) + LEASE_MARGIN_S, worker=None)
+            deadline=mono + switch_budget_s(self._cfg.timeouts) + LEASE_MARGIN_S, worker=None,
+            account_ids=(own.account_id, target.account_id))
         if s.terminal_handle is not None:
             self._inflight_handles[s.terminal_handle] = s.session_id
         prev_touched_at = self._touched_at.get(s.session_id)
@@ -867,6 +952,11 @@ class Daemon:
                 return None
             if d2.action == "none" or d2.target is None:
                 return None
+            # Earlier targets stay listed: an attempt on them may still touch them until the worker ends.
+            with self._lock:
+                inf = self._inflight.get(sid)
+                if inf is not None and d2.target.account_id not in inf.account_ids:
+                    inf.account_ids = inf.account_ids + (d2.target.account_id,)
             return (d2.action, d2.target)
 
         try:
@@ -971,6 +1061,16 @@ class Daemon:
 # --- run loop and real seams -----------------------------------------------------------------------------
 
 
+def _log_held_at_exit(deps: Deps, log: logging.Logger) -> None:
+    held: List[str] = []
+    try:
+        held = [str(a) for a in deps.refresh_held()]
+    except Exception:
+        held = []
+    if held:
+        log.error("event=token_refresh_held_at_exit accounts=%s", ",".join(held))
+
+
 def run_daemon(cfg: Config, deps: Deps) -> int:
     """Run the daemon until SIGTERM/SIGINT; 0 on a clean stop, 1 when another daemon holds the lock,
     2 when profiles_root is missing."""
@@ -988,6 +1088,7 @@ def run_daemon(cfg: Config, deps: Deps) -> int:
         log.error("event=already_running another rotator daemon is running (pid %s)",
                   owner if owner.isdigit() else "?")
         return 1
+    held_logged = False
     try:
         lk.write_owner(os.getpid())
         d = Daemon(cfg, deps, log)
@@ -1002,10 +1103,15 @@ def run_daemon(cfg: Config, deps: Deps) -> int:
                 log.error("event=tick_error exc=%s", type(e).__name__)
             if deps.wait_stop(d._stop, cfg.session_poll_s):
                 break
+        # Before drain: drain waits out switch leases, which can outlast launchd's SIGKILL grace.
+        held_logged = True
+        _log_held_at_exit(deps, log)
         d.drain()
         log.info("event=daemon_stop")
         return 0
     finally:
+        if not held_logged:
+            _log_held_at_exit(deps, log)
         lk.release()
 
 
@@ -1052,7 +1158,14 @@ def _make_logger() -> logging.Logger:
 
 def real_deps(cfg: Config) -> Deps:
     """The only constructor of real seams; building it touches nothing."""
+    r = refresh.Refresher(cfg, read_item=accounts.read_keychain_item, item_exists=accounts.keychain_item_exists,
+                          account_name=accounts.claude_code_keychain_account, write_item=accounts.write_keychain_item,
+                          post=refresh._urllib_post, discover=sessions.discover_sessions, list_dir=os.listdir,
+                          pid_alive=_pid_alive, exists=os.path.lexists, lock=try_lock, cc_lock=refresh.take_cc_lock,
+                          now=_utc_now, monotonic=time.monotonic, sleep=time.sleep,
+                          log=logging.getLogger("rotator.refresh"))
     return Deps(discover_profiles=accounts.discover_profiles, fetch_usage=usage.fetch_usage,
+                refresh_token=r.refresh, refresh_held=r.held_accounts,
                 discover_sessions=sessions.discover_sessions_with_model, switch=switcher.switch_session,
                 make_driver=switcher.OrcaCliDriver, procs=switcher.OsProcessProbe(),
                 read_pointer=pointer.read_selected_host, write_pointer=pointer.set_selected_host,

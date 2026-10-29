@@ -9,10 +9,11 @@ import threading
 import time
 import stat
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Set
 
-from rotator import daemon, switcher
+from rotator import daemon, refresh, switcher, usage
 from rotator.config import Config
 from rotator.daemon import (
     GONE_REASONS, IN_PROGRESS_HINT, Daemon, UsageCache, rate_limited, real_deps, run_daemon, ORPHANED_HINT, STRUCTURAL_REASONS, TARGET_REASONS, TOUCHED_ONLY_REASONS, TRANSIENT_REASONS,
@@ -173,6 +174,12 @@ class FakeEnv:
         self.probe = FakeProbe()
         self.log_records: List[str] = []
         self._logger: Optional[logging.Logger] = None
+        self.refresh_calls: List[tuple] = []
+        self.gate_results: Dict[str, dict] = {}
+        self.refresh_results: Dict[str, dict] = {}
+        self.held_ids: List[str] = []
+        self.held_due: List[str] = []
+        self.held_raises = False
 
     def advance(self, seconds):
         self.now_v = self.now_v + timedelta(seconds=seconds)
@@ -278,8 +285,21 @@ class FakeEnv:
         def install_signals(handler):
             env.signal_handler = handler
 
+        def refresh_token(p, profiles, *, network=True):
+            env.refresh_calls.append(("refresh_token", p.account_id, network))
+            table = env.refresh_results if network else env.gate_results
+            return dict(table.get(p.account_id, {"state": "not_needed", "reason": "fresh", "at": None,
+                                                 "last_refreshed_at": None}))
+
+        def refresh_held(*, due_only=False):
+            env.refresh_calls.append(("refresh_held", due_only))
+            if env.held_raises:
+                raise RuntimeError("held boom")
+            return list(env.held_due if due_only else env.held_ids)
+
         fields = dict(
-            discover_profiles=discover_profiles, fetch_usage=fetch_usage, discover_sessions=discover_sessions,
+            discover_profiles=discover_profiles, fetch_usage=fetch_usage, refresh_token=refresh_token,
+            refresh_held=refresh_held, discover_sessions=discover_sessions,
             switch=switch, make_driver=lambda: FakeDriver(env), procs=env.probe, read_pointer=read_pointer,
             write_pointer=write_pointer, now=lambda: env.now_v, monotonic=lambda: env.mono_v, spawn=spawn,
             wait_stop=wait_stop, lock=lock, read_text=read_text, write_text=write_text, list_dir=list_dir,
@@ -370,7 +390,7 @@ class TestDeps(unittest.TestCase):
         fields = dataclasses.fields(Deps)
         with self.assertRaises(TypeError):
             Deps(**{f.name: None for f in fields[:-1]})
-        self.assertEqual(len(fields), 20)
+        self.assertEqual(len(fields), 22)
         for f in fields:
             self.assertIs(f.default, dataclasses.MISSING, f.name)
             self.assertIs(f.default_factory, dataclasses.MISSING, f.name)
@@ -1019,6 +1039,165 @@ class TestUsageCache(unittest.TestCase):
                 b_times.append(t)
         self.assertEqual(b_times, [120])
         self.assertEqual(self.c.interval(ACC_B), 30.0)
+
+
+def rrec(reason, state="skipped"):
+    return {"state": state, "reason": reason, "at": None, "last_refreshed_at": None}
+
+
+class TestUsageCacheRefresh(unittest.TestCase):
+    """UsageCache's side of the two refresh phases (gate before fetch; one network refresh per call)."""
+
+    def setUp(self):
+        self.env = FakeEnv()
+        self.deps = self.env.deps()
+        self.log = self.deps.make_logger()
+        self.c = UsageCache(30.0)
+        self.env.usages[ACC_A] = live(ACC_A, 20.0)
+        self.env.usages[ACC_B] = live(ACC_B, 30.0)
+        self.profiles = [prof(ACC_A), prof(ACC_B)]
+        self.held_all: List[str] = []
+        self.held_due: List[str] = []
+        self.calls: List[str] = []
+        self.results: Dict[str, dict] = {}
+
+    def pre_step(self, pre):
+        out = self.c.refresh(self.profiles, fetch=self.deps.fetch_usage, monotonic=self.deps.monotonic,
+                             now=self.env.now_v, log=self.log, pre=pre)
+        self.env.advance(10)
+        return out
+
+    def spy(self, ret=None):
+        def pre(p, profiles):
+            self.env.calls.append(("pre", p.account_id, [q.account_id for q in profiles]))
+            return dict(ret or rrec("deferred"))
+        return pre
+
+    def held(self, *, due_only=False):
+        return list(self.held_due if due_only else self.held_all)
+
+    def call(self, p, profiles):
+        self.calls.append(p.account_id)
+        return dict(self.results.get(p.account_id, rrec("deferred")))
+
+    def one(self, skip=frozenset()):
+        return self.c.refresh_one(self.profiles, call=self.call, held=self.held, skip=skip)
+
+    def test_pre_runs_right_before_each_fetch(self):
+        self.pre_step(self.spy())
+        both = [ACC_A, ACC_B]
+        self.assertEqual(self.env.calls, [("pre", ACC_A, both), ("fetch", ACC_A), ("pre", ACC_B, both),
+                                          ("fetch", ACC_B)])
+        self.env.calls.clear()
+        self.pre_step(self.spy())
+        self.assertEqual(self.env.calls, [])
+
+    def test_record_stored_as_copy(self):
+        ret = rrec("deferred")
+        self.pre_step(self.spy(ret))
+        got = self.c.refresh_record(ACC_A)
+        self.assertEqual(got, ret)
+        got["reason"] = "mutated"
+        self.assertEqual(self.c.refresh_record(ACC_A)["reason"], "deferred")
+
+    def test_pre_raising_is_internal_error_and_fetch_runs(self):
+        def pre(p, profiles):
+            raise RuntimeError("x")
+        self.pre_step(pre)
+        self.assertEqual(self.c.refresh_record(ACC_A),
+                         {"state": "failed", "reason": "internal_error", "at": T0.isoformat(),
+                          "last_refreshed_at": None})
+        self.assertIn(("fetch", ACC_A), self.env.calls)
+        self.assertIn("event=token_refresh_error account=%s exc=RuntimeError" % ACC_A, self.env.log_records)
+
+    def test_no_pre_keeps_old_behaviour(self):
+        out = self.c.refresh(self.profiles, fetch=self.deps.fetch_usage, monotonic=self.deps.monotonic,
+                             now=self.env.now_v, log=self.log)
+        self.assertEqual(out, [ACC_A, ACC_B])
+        self.assertIsNone(self.c.refresh_record(ACC_A))
+        self.assertEqual([s["refresh"] for s in self.c.summaries()], [None, None])
+
+    def test_pruned_with_profiles(self):
+        self.pre_step(self.spy())
+        self.assertEqual([s["refresh"] for s in self.c.summaries()], [rrec("deferred")] * 2)
+        self.profiles = [prof(ACC_A)]
+        self.pre_step(self.spy())
+        self.assertIsNone(self.c.refresh_record(ACC_B))
+        self.assertEqual([s["account_id"] for s in self.c.summaries()], [ACC_A])
+
+    def test_held_id_without_record_is_picked(self):
+        self.held_all = self.held_due = [ACC_B]
+        self.assertEqual(self.one(), ACC_B)
+        self.assertEqual(self.calls, [ACC_B])
+        # also after its record was pruned and the account came back
+        self.pre_step(self.spy())
+        self.profiles = [prof(ACC_A)]
+        self.pre_step(self.spy())
+        self.profiles = [prof(ACC_A), prof(ACC_B)]
+        self.assertIsNone(self.c.refresh_record(ACC_B))
+        self.calls.clear()
+        self.results[ACC_A] = rrec("fresh", "not_needed")
+        self.c._flush_next = True
+        self.assertEqual(self.one(), ACC_B)
+
+    def test_alternation(self):
+        self.profiles = [prof(ACC_A), prof(ACC_B), prof(ACC_C)]
+        self.env.usages[ACC_C] = live(ACC_C, 10.0)
+        self.pre_step(self.spy())
+        self.held_all = self.held_due = [ACC_A]
+        self.results[ACC_B] = rrec("live_session")  # B leaves the waiting list once tried
+        picks = [self.one() for _ in range(4)]
+        self.assertEqual(picks, [ACC_A, ACC_B, ACC_A, ACC_C])
+        self.assertEqual(self.calls, picks)
+
+    def test_held_not_due_waits(self):
+        self.pre_step(self.spy())
+        self.held_all = [ACC_A]
+        self.held_due = []
+        self.assertEqual(self.one(), ACC_B)
+        self.assertEqual(self.one(), ACC_B)
+        self.assertNotIn(ACC_A, self.calls)
+
+    def test_skip_and_none(self):
+        self.pre_step(self.spy())
+        self.assertIsNone(self.one(skip=frozenset({ACC_A, ACC_B})))
+        self.assertEqual(self.calls, [])
+        self.held_all = self.held_due = [ACC_A]
+        self.assertEqual(self.one(skip=frozenset({ACC_A})), ACC_B)
+        self.assertEqual(self.calls, [ACC_B])
+
+    def test_no_candidate(self):
+        self.pre_step(self.spy(rrec("fresh", "not_needed")))
+        self.assertIsNone(self.one())
+        self.assertEqual(self.calls, [])
+
+    def test_call_raising(self):
+        self.pre_step(self.spy())
+
+        def boom(p, profiles):
+            raise RuntimeError("x")
+        with self.assertLogs("rotator.daemon", "ERROR") as cm:
+            self.assertEqual(self.c.refresh_one(self.profiles, call=boom, held=self.held), ACC_A)
+        self.assertEqual(self.c.refresh_record(ACC_A)["reason"], "internal_error")
+        self.assertEqual(cm.output, ["ERROR:rotator.daemon:event=token_refresh_error account=%s exc=RuntimeError"
+                                     % ACC_A])
+
+    def test_refreshed_marks_due(self):
+        self.pre_step(self.spy())
+        self.results[ACC_A] = rrec("ok", "refreshed")
+        self.assertEqual(self.one(), ACC_A)
+        self.env.calls.clear()
+        self.pre_step(self.spy())
+        self.assertIn(("fetch", ACC_A), self.env.calls)
+        self.assertNotIn(("fetch", ACC_B), self.env.calls)
+
+    def test_rate_limited_not_marked_due(self):
+        self.env.usages[ACC_A] = limited(ACC_A)
+        self.pre_step(self.spy())
+        self.c.mark_due(ACC_A)
+        self.env.calls.clear()
+        self.pre_step(self.spy())
+        self.assertNotIn(("fetch", ACC_A), self.env.calls)
 
 
 class TickBase(unittest.TestCase):
@@ -1704,6 +1883,138 @@ class TestRunDaemon(RunDaemonBase):
         self.assertEqual(len(self.fetches()), 3)
 
 
+# --- token refresh wiring ----------------------------------------------------------------------------------
+
+DEFERRED = {"state": "skipped", "reason": "deferred", "at": None, "last_refreshed_at": None}
+
+
+class TestTickRefresh(TickBase):
+    def setUp(self):
+        super().setUp()
+        self.env.gate_results = {ACC_A: dict(DEFERRED), ACC_B: dict(DEFERRED)}
+        env = self.env
+        base = env.deps()
+
+        def discover_sessions(homes):
+            env.refresh_calls.append(("discover_sessions",))
+            return base.discover_sessions(homes)
+        self.deps = env.deps(discover_sessions=discover_sessions)
+        self.d = Daemon(self.cfg, self.deps, self.deps.make_logger())
+
+    def network_calls(self):
+        return [c for c in self.env.refresh_calls if c[0] == "refresh_token" and c[2] is True]
+
+    def test_phase_order_and_one_per_tick(self):
+        self.d.tick()
+        self.assertEqual(self.env.refresh_calls, [
+            ("refresh_token", ACC_A, False), ("refresh_token", ACC_B, False), ("refresh_token", ACC_C, False),
+            ("discover_sessions",), ("refresh_held", True), ("refresh_held", False),
+            ("refresh_token", ACC_A, True)])
+        self.assertEqual(self.account(ACC_A)["refresh"],
+                         {"state": "not_needed", "reason": "fresh", "at": None, "last_refreshed_at": None})
+        self.assertEqual(self.account(ACC_B)["refresh"], DEFERRED)
+        self.env.refresh_calls.clear()
+        self.env.advance(10)
+        self.d.tick()
+        self.assertEqual(self.network_calls(), [("refresh_token", ACC_B, True)])
+        self.assertNotIn(("refresh_token", ACC_A, False), self.env.refresh_calls)
+
+    def test_no_phase_two_when_stopping(self):
+        self.d.request_stop()
+        self.d.tick()
+        self.assertEqual(self.network_calls(), [])
+        self.assertFalse([c for c in self.env.refresh_calls if c[0] == "refresh_held"])
+
+    def test_no_phase_two_on_discovery_errors(self):
+        for attr in ("profiles_raise", "sessions_raise"):
+            with self.subTest(attr=attr):
+                self.setUp()
+                setattr(self.env, attr, True)
+                self.d.tick()
+                self.assertEqual(self.network_calls(), [])
+                self.assertFalse([c for c in self.env.refresh_calls if c[0] == "refresh_held"])
+
+    def test_cache_fallback_pinned(self):
+        self.env.gate_results = {ACC_A: {"state": "stopped", "reason": "invalid_grant", "at": None,
+                                         "last_refreshed_at": None}}
+        self.env.usages[ACC_A] = AccountUsage(
+            account_id=ACC_A, source="cache", fetched_at=T0 - timedelta(hours=2),
+            five_hour=UsageWindow(90.0, T0 - timedelta(minutes=1)), error="token_expired")
+        self.d.tick()
+        a = self.account(ACC_A)
+        self.assertEqual(a["source"], "cache")
+        self.assertEqual(a["refresh"]["reason"], "invalid_grant")
+        self.assertEqual(usage_from_summary(a).max_utilization(T0), 0.0)
+
+    def test_refreshed_account_fetched_next_tick(self):
+        self.env.refresh_results = {ACC_A: {"state": "refreshed", "reason": "ok", "at": None,
+                                            "last_refreshed_at": None}}
+        self.d.tick()
+        self.env.calls.clear()
+        self.env.advance(10)
+        self.d.tick()
+        self.assertEqual(self.fetches(), [("fetch", ACC_A)])
+
+
+class TestTickRefreshSkip(DispatchBase):
+    def setUp(self):
+        super().setUp()
+        self.env.gate_results = {a: dict(DEFERRED) for a in (ACC_A, ACC_B, ACC_C)}
+        self.env.results = [result("untouched", "target_untrusted"),
+                            result("continued", None, ok=True, step="continue_prompt")]
+        env = self.env
+        base = env.deps()
+        self.seen: List[frozenset] = []
+
+        def switch(session, target, mode, **kw):
+            self.seen.append(self.d._switch_accounts())
+            return base.switch(session, target, mode, **kw)
+        self.deps = env.deps(switch=switch)
+        self.d = Daemon(self.cfg, self.deps, self.deps.make_logger())
+
+    def test_in_flight_accounts_never_refreshed(self):
+        self.d.tick()
+        self.assertEqual(self.d._switch_accounts(), frozenset({ACC_A, ACC_B}))
+        net = [c[1] for c in self.env.refresh_calls if c[0] == "refresh_token" and c[2] is True]
+        self.assertEqual(net, [ACC_C])
+        self.env.run_worker(0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_B, "hard"), ("switch", 101, ACC_C, "hard")])
+        self.assertEqual(self.seen[1], frozenset({ACC_A, ACC_B, ACC_C}))
+        self.assertEqual(self.d._switch_accounts(), frozenset())
+
+
+class TestRefreshExitLog(RunDaemonBase):
+    def run_once(self):
+        env = self.env
+        env.wait_hook = lambda n: env.signal_handler() if n == 1 else None
+        marks: List[int] = []
+        base = env.deps()
+
+        def write_text(path, text):
+            base.write_text(path, text)
+            if path.endswith("state.json"):
+                marks.append(len(env.log_records))
+        self.assertEqual(self.run_d(env.deps(write_text=write_text)), 0)
+        return marks
+
+    def test_held_ids_logged_before_drain(self):
+        self.env.held_ids = ["a1"]
+        marks = self.run_once()
+        hits = [i for i, r in enumerate(self.env.log_records)
+                if r == "event=token_refresh_held_at_exit accounts=a1"]
+        self.assertEqual(len(hits), 1)
+        self.assertGreater(marks[-1], hits[0])
+
+    def test_nothing_held_no_log(self):
+        self.run_once()
+        self.assertEqual(self.env.logs("token_refresh_held_at_exit"), [])
+
+    def test_held_raising_still_exits_clean(self):
+        self.env.held_raises = True
+        self.run_once()
+        self.assertEqual(self.env.logs("token_refresh_held_at_exit"), [])
+
+
 class TestRealDeps(unittest.TestCase):
     def test_identity(self):
         deps = real_deps(make_cfg())
@@ -1719,6 +2030,16 @@ class TestRealDeps(unittest.TestCase):
         self.assertIs(deps.read_pointer, pointer.read_selected_host)
         self.assertIs(deps.write_pointer, pointer.set_selected_host)
         self.assertIs(deps.discover_sessions, sessions.discover_sessions_with_model)
+        self.assertIsInstance(deps.refresh_token.__self__, refresh.Refresher)
+        self.assertIs(deps.refresh_held.__self__, deps.refresh_token.__self__)
+        self.assertEqual(deps.refresh_token.__name__, "refresh")
+        self.assertEqual(deps.refresh_held.__name__, "held_accounts")
+
+    def test_building_touches_nothing(self):
+        with unittest.mock.patch("subprocess.run", side_effect=AssertionError("real seam")), \
+                unittest.mock.patch.object(usage._NO_REDIRECT_OPENER, "open", side_effect=AssertionError("real seam")):
+            deps = real_deps(dataclasses.replace(make_cfg(), profiles_root="/nonexistent-rotator-test"))
+        self.assertIsInstance(deps, Deps)
 
     def test_with_model_reader_bound(self):
         self.assertEqual(real_deps(make_cfg()).discover_sessions.__name__, "discover_sessions_with_model")

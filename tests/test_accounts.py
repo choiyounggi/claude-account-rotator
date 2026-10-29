@@ -5,18 +5,25 @@ import os
 import pickle
 import subprocess
 import tempfile
+import types
 import unittest
 import unittest.mock
 from datetime import datetime, timezone
 from typing import Any, Dict
 
+import rotator.accounts as accounts_mod
 from rotator.accounts import (
     Credential,
     _read_text_utf8,
+    claude_code_keychain_account,
     discover_profiles,
+    keychain_item_exists,
     keychain_service_for,
     profile_for_config_dir,
     read_credential,
+    read_keychain_item,
+    security_add_line,
+    write_keychain_item,
 )
 from rotator.models import MODEL_RE, AccountUsage, Profile, Session, UsageWindow, is_fable_model
 
@@ -553,3 +560,143 @@ class SessionModelTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SVC = "Claude Code-credentials-0a1b2c3d"
+SECRET_TOKEN = "SECRET-ACCESS-7f3a"
+SECRET_JSON = '{"claudeAiOauth":{"accessToken":"SECRET-ACCESS-7f3a"}}'
+
+
+class FakeRun:
+    """Recording `run(argv, **kw)` seam: returns rc/stdout or raises."""
+
+    def __init__(self, returncode=0, stdout="", exc=None):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.exc = exc
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append((list(argv), kw))
+        if self.exc is not None:
+            raise self.exc
+        return types.SimpleNamespace(returncode=self.returncode, stdout=self.stdout)
+
+
+def _never():
+    raise AssertionError("passwd consulted")
+
+
+class TestKeychainAccount(unittest.TestCase):
+    def test_user_wins(self):
+        self.assertEqual(claude_code_keychain_account(environ={"USER": "alice"}, passwd_name=lambda: "bob"), "alice")
+
+    def test_missing_or_empty_user_uses_passwd(self):
+        self.assertEqual(claude_code_keychain_account(environ={}, passwd_name=lambda: "bob"), "bob")
+        self.assertEqual(claude_code_keychain_account(environ={"USER": ""}, passwd_name=lambda: "bob"), "bob")
+
+    def test_empty_passwd_gives_fallback(self):
+        self.assertEqual(claude_code_keychain_account(environ={}, passwd_name=lambda: ""), "claude-code-user")
+
+    def test_invalid_user_gives_fallback_without_passwd(self):
+        self.assertEqual(claude_code_keychain_account(environ={"USER": "a b"}, passwd_name=_never), "claude-code-user")
+
+    def test_invalid_passwd_gives_fallback(self):
+        self.assertEqual(claude_code_keychain_account(environ={}, passwd_name=lambda: "a b"), "claude-code-user")
+
+    def test_passwd_name_lookup_failure_is_empty(self):
+        with unittest.mock.patch("rotator.accounts.pwd.getpwuid", side_effect=KeyError("uid")):
+            self.assertEqual(accounts_mod._passwd_name(), "")
+
+
+class TestKeychainItemSeams(unittest.TestCase):
+    READ_ARGV = ["/usr/bin/security", "find-generic-password", "-a", "alice", "-s", SVC, "-w"]
+    EXISTS_ARGV = ["/usr/bin/security", "find-generic-password", "-a", "alice", "-s", SVC]
+
+    def _timeout(self):
+        return subprocess.TimeoutExpired(cmd="x", timeout=1, output=SECRET_TOKEN)
+
+    # read_keychain_item
+    def test_read_argv_and_one_newline_removed(self):
+        run = FakeRun(stdout=SECRET_JSON + "\n")
+        self.assertEqual(read_keychain_item(SVC, "alice", run=run), SECRET_JSON)
+        self.assertEqual(run.calls[0][0], self.READ_ARGV)
+
+    def test_read_strips_only_one_newline(self):
+        self.assertEqual(read_keychain_item(SVC, "alice", run=FakeRun(stdout="x\n\n")), "x\n")
+
+    def test_read_rc_not_found_is_none(self):
+        self.assertIsNone(read_keychain_item(SVC, "alice", run=FakeRun(returncode=44, stdout="")))
+
+    def test_read_timeout_is_none_without_leak(self):
+        self.assertIsNone(read_keychain_item(SVC, "alice", run=FakeRun(exc=self._timeout())))
+
+    def test_read_oserror_is_none(self):
+        self.assertIsNone(read_keychain_item(SVC, "alice", run=FakeRun(exc=OSError("boom"))))
+
+    # keychain_item_exists
+    def test_exists_argv_has_no_secret_flags(self):
+        run = FakeRun(returncode=0)
+        self.assertIs(keychain_item_exists(SVC, "alice", run=run), True)
+        argv = run.calls[0][0]
+        self.assertEqual(argv, self.EXISTS_ARGV)
+        self.assertNotIn("-w", argv)
+        self.assertNotIn("-g", argv)
+
+    def test_exists_rc_classes(self):
+        self.assertIs(keychain_item_exists(SVC, "alice", run=FakeRun(returncode=44)), False)
+        self.assertIsNone(keychain_item_exists(SVC, "alice", run=FakeRun(returncode=51)))
+        self.assertIsNone(keychain_item_exists(SVC, "alice", run=FakeRun(exc=self._timeout())))
+        self.assertIsNone(keychain_item_exists(SVC, "alice", run=FakeRun(exc=OSError("boom"))))
+
+    # write_keychain_item
+    def test_write_secret_only_on_stdin(self):
+        run = FakeRun(returncode=0)
+        self.assertIs(write_keychain_item(SVC, "alice", SECRET_JSON, run=run), True)
+        argv, kw = run.calls[0]
+        self.assertEqual(argv, ["/usr/bin/security", "-i"])
+        hexed = SECRET_JSON.encode("utf-8").hex()
+        self.assertNotIn(SECRET_TOKEN, str(argv))
+        self.assertNotIn(hexed, str(argv))
+        self.assertEqual(kw["input"], 'add-generic-password -U -a "alice" -s "%s" -X "%s"\n' % (SVC, hexed))
+        self.assertIs(kw["stdout"], subprocess.DEVNULL)
+        self.assertIs(kw["stderr"], subprocess.DEVNULL)
+        self.assertEqual(kw["timeout"], 5.0)
+
+    def test_write_failures_are_false(self):
+        self.assertIs(write_keychain_item(SVC, "alice", SECRET_JSON, run=FakeRun(returncode=1)), False)
+        self.assertIs(write_keychain_item(SVC, "alice", SECRET_JSON, run=FakeRun(exc=self._timeout())), False)
+        self.assertIs(write_keychain_item(SVC, "alice", SECRET_JSON, run=FakeRun(exc=OSError("boom"))), False)
+
+    # "alice2" makes the fixed part of the line even, so hex output can land exactly on 4032.
+    ACCT = "alice2"
+
+    def _secret_for_line_len(self, n):
+        base = len(security_add_line(SVC, self.ACCT, ""))
+        return "a" * ((n - base) // 2)
+
+    def test_write_line_limit(self):
+        at_limit = self._secret_for_line_len(4032)
+        self.assertEqual(len(security_add_line(SVC, self.ACCT, at_limit)), 4032)
+        run = FakeRun(returncode=0)
+        self.assertIs(write_keychain_item(SVC, self.ACCT, at_limit, run=run), True)
+        self.assertEqual(len(run.calls), 1)
+        over = at_limit + "a"
+        self.assertEqual(len(security_add_line(SVC, self.ACCT, over)), 4034)
+        run = FakeRun(returncode=0)
+        self.assertIs(write_keychain_item(SVC, self.ACCT, over, run=run), False)
+        self.assertEqual(run.calls, [])
+
+    def test_bad_names_rejected_without_secret(self):
+        bad = [("other-0a1b2c3d", "alice"), ("Claude Code-credentials-0A1B2C3D", "alice"), (SVC, "a b"), (SVC, "")]
+        for service, account in bad:
+            for call in (
+                lambda: security_add_line(service, account, SECRET_JSON),
+                lambda: read_keychain_item(service, account, run=FakeRun()),
+                lambda: keychain_item_exists(service, account, run=FakeRun()),
+                lambda: write_keychain_item(service, account, SECRET_JSON, run=FakeRun()),
+            ):
+                with self.subTest(service=service, account=account):
+                    with self.assertRaises(ValueError) as cm:
+                        call()
+                    self.assertEqual(str(cm.exception), "bad keychain item name")

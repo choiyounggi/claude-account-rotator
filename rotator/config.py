@@ -34,6 +34,7 @@ TOP_KEYS = (
     "dry_run",
     "auto_switch",
     "pointer_correction",
+    "token_refresh",
     "profiles_root",
 )
 TIMEOUT_KEYS = ("idle_s", "exit_s", "shell_s", "ready_s", "prompt_s", "poll_s")
@@ -63,6 +64,7 @@ class Config:
     dry_run: bool = False
     auto_switch: bool = True
     pointer_correction: bool = True
+    token_refresh: bool = True
     profiles_root: str = PROFILES_ROOT_DEFAULT
     # Not a JSON key: where state, locks and records live. load_config always uses CONFIG_DIR_DEFAULT
     # whatever --config names, so every daemon and CLI process contends on the same lock files.
@@ -153,7 +155,7 @@ def parse_config(obj: object, *, state_dir: str) -> Config:
             if not prompt_ok(value):
                 raise ConfigError(_PROMPT_MESSAGE)
             vals[key] = value
-        elif key in ("dry_run", "auto_switch", "pointer_correction"):
+        elif key in ("dry_run", "auto_switch", "pointer_correction", "token_refresh"):
             if type(value) is not bool:
                 raise ConfigError("%s: must be true or false" % key)
             vals[key] = value

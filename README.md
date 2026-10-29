@@ -130,6 +130,101 @@ q 또는 Ctrl-C 종료
   interface: if it changes, `model` becomes unknown and the session is treated as non-Fable.
 - `rotator status` shows the `fable` window in the 페이블 column and each session's model id in the 모델 column.
 
+## Idle-account token refresh
+
+Claude Code refreshes an account's OAuth token only while a session runs on it, so an idle account's token
+expires and its usage falls back to the `.claude.json` cache. The daemon closes that gap.
+
+**What.** Only the daemon refreshes. It refreshes the OAuth token of an account that has no live Claude session,
+with the same request Claude Code 2.1.296 sends (`POST https://platform.claude.com/v1/oauth/token`, JSON body with
+`grant_type=refresh_token`, the refresh token, the stored client id or Claude Code's default one, and Claude
+Code's scope rule), and writes the new tokens back to the same Keychain item Claude Code reads
+(`-a <Claude Code's account name> -s "Claude Code-credentials-<hash>"`), keeping every other field of the stored
+JSON (subscription, rate-limit tier, MCP OAuth entries and anything unknown).
+
+**When.** The access token is expired or has less than 5 minutes left; at most once per usage poll per account; at
+most one account's network refresh per daemon tick, after that tick's switch decisions; never for the source or
+target of an in-flight switch; never in dry-run (`--dry-run` or `"dry_run": true`, shown as "드라이런"); not while
+the daemon is stopping. `rotator status`, `status --json`, `status --watch` and `rotator switch` never refresh:
+with the daemon running they show its records; with it stopped the status JSON records say `daemon_off`
+("데몬 꺼짐", which the table shows only in its header) and usage falls back to the cache. After a
+successful refresh the next poll fetches that account's live usage.
+
+**How to disable.** Set `"token_refresh": false` in `config.json`; every account then shows "자동 갱신 꺼짐".
+
+**Safety rules.**
+
+- Locks: the rotator's own `locks/r-*.lock` (so two rotator processes never refresh one account) plus Claude
+  Code's own `<home>/.oauth_refresh.lock` and legacy `<profile>/home.lock` dirs. Claude Code's dirs are taken
+  without waiting and never taken over: a busy one is "갱신 중", one older than 60 s is "잠금 남음".
+- Under the locks the Keychain item is read again and compared with what the gate saw; any change skips the
+  account ("갱신 중").
+- A probe write of the unchanged item (and a read-back) runs before the request, so a Keychain that refuses
+  writes is found before the refresh token is spent ("키체인 쓰기 불가", retried after a back-off).
+- The live-session check runs three times: in the gate, under the locks, and right before the request. A
+  session-discovery failure counts as live ("세션 확인 실패").
+- The secret goes only to `security -i` on stdin, never on the command line; `security` output is discarded. An
+  item whose write line would exceed 4032 characters is not refreshed ("갱신 불가"), and neither is a profile that
+  stores its credentials in a plaintext `.credentials.json`.
+- After `invalid_grant`, an unknown outcome (a timeout or dropped connection after the request was sent), a
+  malformed response or another rejection, the account is not retried until its Keychain item changes (a
+  re-login in Orca or a refresh by Claude Code). Server errors, network errors before sending and 429 back off
+  5 min doubling to 1 h (429 honours `Retry-After`).
+- Stop and back-off state lives in memory only, so a daemon restart retries each stopped account once.
+- No token is ever logged, printed, put in an exception message or written to a file; the status JSON carries
+  only the record below.
+
+**The write-failure window.** After a successful refresh the old refresh token is dead. Each write is a re-read,
+a write and a read-back; if all 3 writes fail the daemon keeps only the new token set in memory, keeps the
+account's rotator lock, and retries the write with back-off 30 s doubling to 10 min, alternating with other
+accounts ("키체인 저장 실패"). If the item turns out to hold a different refresh token (or is gone on two
+consecutive lookups) the set is dropped ("갱신 충돌"). The held set is lost when the daemon stops — the account
+then needs a re-login in Orca; on a normal stop or SIGTERM the daemon log names the affected account ids at
+ERROR (`event=token_refresh_held_at_exit`) before waiting for in-flight switches. A SIGKILL or a crash — including
+launchd's kill after its exit timeout while a long write window or switch drain is still running — loses a held
+set with no log line at all.
+
+**`cc_lock_stale` ("잠금 남음").** Remove `<home>/.oauth_refresh.lock` (and `<profile>/home.lock`) by hand only
+when no Claude session runs on that account. A stale `.oauth_refresh.lock.owner` file is left alone: Claude Code
+answers `record_mismatch` for it and does not take the lock over.
+
+**Reasons** (the `reason` of a record; for a cached or unavailable account the table shows the Korean text first,
+then the usage error, clipped to the cell width; `daemon_off` appears only in the JSON):
+
+| reason | text | meaning |
+|--------|------|---------|
+| `disabled` | 자동 갱신 꺼짐 | `token_refresh` is false |
+| `dry_run` | 드라이런 | dry-run: nothing is refreshed |
+| `daemon_off` | 데몬 꺼짐 | the daemon is not running, so nothing refreshes (JSON only; the header says so) |
+| `no_credential` | 토큰 없음 | no readable Claude Code credentials item |
+| `no_refresh_token` | 재로그인 필요 | the item has no usable refresh token |
+| `plaintext_store` | 갱신 불가 | the profile keeps a plaintext `.credentials.json` |
+| `keychain_item_unclear` | 갱신 불가 | the item was not found under Claude Code's account name |
+| `payload_too_large` | 갱신 불가 | the write line would exceed 4032 characters |
+| `live_session` | 사용 중 | a Claude session runs on the account (Claude Code refreshes it) |
+| `discovery_failed` | 세션 확인 실패 | sessions could not be listed, so nothing is refreshed |
+| `deferred` | 갱신 대기 | waiting for its turn (one network refresh per tick) |
+| `locked` | 갱신 중 | another rotator process holds the account's lock |
+| `cc_lock_busy` | 갱신 중 | Claude Code holds its refresh lock |
+| `cc_lock_stale` | 잠금 남음 | Claude Code's lock dir is older than 60 s (see above) |
+| `changed_under_lock` | 갱신 중 | the item changed while the lock was taken |
+| `keychain_write_unavailable` | 키체인 쓰기 불가 | the probe write failed; retried after a back-off |
+| `invalid_grant` | 재로그인 필요 | the server rejected the refresh token |
+| `invalid_scope` | 재로그인 필요 | the server rejected the scopes |
+| `rejected` | 갱신 거부 | another 4xx or an unexpected status |
+| `malformed_response` | 응답 이상 | a 200 whose body is not a valid token set |
+| `outcome_unknown` | 갱신 결과 불명 | the request may have reached the server; not retried |
+| `network_error` | 연결 실패 | DNS or connection refused before sending; backed off |
+| `server_error` | 갱신 실패 | a 5xx; backed off |
+| `rate_limited` | 호출 제한 | a 429; backed off |
+| `write_failed` | 키체인 저장 실패 | the new tokens are held in memory, write retried |
+| `conflict` | 갱신 충돌 | the item holds another refresh token; the new set was dropped |
+| `internal_error` | 갱신 실패 | an unexpected error; backed off |
+
+**Version note.** Every statement about Claude Code and Orca above was measured on Claude Code 2.1.296 and Orca
+1.4.241 (request, scopes, Keychain item and write, lock protocol, stored JSON shape); re-verify after either
+updates.
+
 ## Status JSON (schema 1)
 
 `rotator status --json` prints one object:
@@ -152,6 +247,9 @@ organization, token or environment value is included. The only argv or transcrip
 model id (`model`, from the transcript or its `--model` argument, validated as above). Changes within schema 1 are
 additive only.
 `model` is the session's model id or null.
+Every `accounts[]` entry also has `refresh`: `{state, reason, at, last_refreshed_at}` (`state` one of
+`not_needed`, `skipped`, `refreshed`, `failed`, `stopped`; see "Idle-account token refresh") or null; the schema
+stays 1.
 
 ## Configuration
 
@@ -180,6 +278,7 @@ starts with the key.
 | `dry_run` | `false` | `true` / `false` |
 | `auto_switch` | `true` | `true` / `false` |
 | `pointer_correction` | `true` | `true` / `false` |
+| `token_refresh` | `true` | `true` / `false`; `false` turns idle-account token refresh off (see "Idle-account token refresh") |
 | `profiles_root` | `~/Library/Application Support/orca/claude-profiles` | absolute path (`~` expanded) |
 
 Numbers must be finite and not `true`/`false`.
@@ -228,7 +327,8 @@ Numbers must be finite and not `true`/`false`.
    as `target_untrusted`, and the rotator then excludes that target for the session and tries the next one.
 7. The shape of a real accepted Orca send receipt has not been sampled live.
 8. Under launchd the daemon is expected to see the same `PATH` and Keychain access as an interactive shell;
-   Keychain access from a launchd job context is not measured.
+   Keychain access from a launchd job context is not measured; token refresh probes the write path first and
+   reports "키체인 쓰기 불가" instead of refreshing when it fails.
 9. Logout or shutdown may SIGKILL an in-flight switch despite `ExitTimeOut`; its intent record keeps the session
    marked "outcome unknown".
 10. Several sessions on one hot account may all pick the same lowest-used target in one tick (only a
@@ -237,3 +337,22 @@ Numbers must be finite and not `true`/`false`.
 12. With `KeepAlive`, a foreground `rotator daemon` makes the agent copy exit 1 and respawn every 10 s; run
     `rotator uninstall` first.
 13. `locks/` and `sessions/` under the state dir are never pruned by the program.
+14. A Claude Code session that starts on an account during a refresh section and needs a refresh itself sees
+    `lock_changed` while the rotator touches the lock dirs and waits about 2 × (5-10 s) + 7.5 s before giving up
+    with `lock_busy`; in the worst case (every step hitting its timeout, about 2 minutes) its first request can
+    fail.
+15. While a write-failed token set is held, a Claude Code session refreshing that account posts the dead refresh
+    token; the server's refresh-token reuse detection may then revoke the whole token family, and the account
+    needs a re-login in Orca.
+16. `security` exit code 44 ("item not found") cannot be told apart from an item that exists in a keychain
+    missing from the search list; the rotator drops a held token set as "item gone" only after two consecutive
+    code-44 lookups.
+17. Stop and back-off state is not persisted: a daemon restart retries each stopped account once (for example
+    one more `invalid_grant`).
+18. The refresh request, scope rule, Keychain write and lock protocol mirror Claude Code 2.1.296; a future Claude
+    Code build that refreshes without either lock, or changes the stored JSON shape, is not covered until
+    re-verified.
+19. A step inside a refresh section that stalls longer than 60 s without a lock-dir touch (for example a DNS
+    lookup, which the urllib timeout does not bound) lets Claude Code treat the lock as stale and refresh the
+    same account at the same time; on release the rotator then leaves any lock dir that is no longer its own
+    (different inode or birth time) in place.
