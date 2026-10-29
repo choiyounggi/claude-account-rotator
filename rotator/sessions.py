@@ -4,16 +4,19 @@ from __future__ import annotations
 import calendar
 import ctypes
 import ctypes.util
+import dataclasses
+import glob
 import json
 import logging
 import os
 import re
+import stat
 import struct
 from datetime import datetime, timezone
 from typing import Callable, Dict, FrozenSet, List, NamedTuple, Optional, Sequence, Tuple
 
 from rotator.accounts import _read_text_utf8
-from rotator.models import Profile, ReadText, Session
+from rotator.models import MODEL_RE, Profile, ReadText, Session
 
 log = logging.getLogger("rotator.sessions")
 
@@ -31,6 +34,11 @@ PidAlive = Callable[[int], bool]
 ProcInfo = Tuple[str, Tuple[str, ...], Dict[str, str]]
 ReadProc = Callable[[int], ProcInfo]
 ProcStart = Callable[[int], Optional[datetime]]
+
+TRANSCRIPT_TAIL_BYTES = 1_048_576  # measured: last real assistant line is <= 482 KB from EOF in 78/78 transcripts
+TRANSCRIPT_CHUNK_BYTES = 65_536
+ReadModel = Callable[[str, str, str], Optional[str]]  # (config_dir, cwd, session_id) -> model id or None
+_NO_VERDICT = object()
 
 _CTL_KERN = 1
 _KERN_ARGMAX = 8
@@ -273,6 +281,112 @@ def _pick_winner(cands: Sequence[_Candidate]) -> _Candidate:
     return min(cands, key=lambda c: (-c.status_updated_at, c.order))
 
 
+def _transcript_path(config_dir: str, cwd: str, session_id: str) -> Optional[str]:
+    projects = os.path.join(config_dir, "projects")
+    derived = os.path.join(projects, re.sub(r"[^A-Za-z0-9]", "-", cwd), session_id + ".jsonl")
+    if os.path.isfile(derived):
+        return derived
+    hits = glob.glob(os.path.join(glob.escape(projects), "*", glob.escape(session_id) + ".jsonl"))
+    return hits[0] if len(hits) == 1 else None
+
+
+def _line_model(raw: bytes) -> object:
+    """_NO_VERDICT (keep scanning), a model id, or None (the last real assistant entry has no usable model)."""
+    line = raw.strip()
+    if not line or b'"assistant"' not in line:
+        return _NO_VERDICT
+    try:
+        text = line.decode("utf-8")
+    except UnicodeDecodeError:
+        return _NO_VERDICT
+    try:
+        obj = json.loads(text)
+    except (ValueError, RecursionError):
+        return _NO_VERDICT
+    if not isinstance(obj, dict) or obj.get("type") != "assistant" or obj.get("isSidechain") is True:
+        return _NO_VERDICT
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return _NO_VERDICT
+    m = msg.get("model")
+    # Claude Code writes "<synthetic>" for API-error and interrupt turns.
+    if not isinstance(m, str) or m == "<synthetic>":
+        return _NO_VERDICT
+    return m if MODEL_RE.fullmatch(m) else None
+
+
+def read_session_model(config_dir: str, cwd: str, session_id: str, *, tail_bytes: int = TRANSCRIPT_TAIL_BYTES,
+                       chunk_bytes: int = TRANSCRIPT_CHUNK_BYTES) -> Optional[str]:
+    """Model id of the last real assistant entry within the transcript's last tail_bytes; None when unknown.
+
+    Reads at most tail_bytes. Returns only a MODEL_RE-valid id; never logs and never returns transcript text.
+    """
+    if tail_bytes <= 0 or chunk_bytes <= 0:
+        raise ValueError("tail_bytes and chunk_bytes must be > 0")
+    if not session_id or os.sep in session_id or "\x00" in session_id or session_id in (".", ".."):
+        return None
+    try:
+        path = _transcript_path(config_dir, cwd, session_id)
+        if path is None:
+            return None
+        # A plain open() of a FIFO blocks until a writer appears; open non-blocking and read regular files only.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            regular = stat.S_ISREG(os.fstat(fd).st_mode)
+        except OSError:
+            os.close(fd)
+            raise
+        if not regular:
+            os.close(fd)
+            return None
+        with open(fd, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            pos, carry = size, b""
+            while pos > 0 and size - pos < tail_bytes:
+                n = min(chunk_bytes, pos, tail_bytes - (size - pos))
+                pos -= n
+                f.seek(pos)
+                parts = (f.read(n) + carry).split(b"\n")
+                if pos > 0:
+                    # parts[0] may be a partial line, completed by the next chunk; once the bound stops
+                    # the loop it is dropped.
+                    carry, lines = parts[0], parts[1:]
+                else:
+                    carry, lines = b"", parts
+                for raw in reversed(lines):
+                    verdict = _line_model(raw)
+                    if verdict is not _NO_VERDICT:
+                        return verdict
+    except OSError:
+        return None
+    return None
+
+
+_ALIAS_SUFFIX_RE = re.compile(r"\[[^\[\]]*\]\Z")
+
+
+def model_from_argv(argv: Sequence[str]) -> Optional[str]:
+    """The --model value of a Claude Code argv (last one wins), minus one trailing "[...]" alias suffix such as
+    "[1m]"; None unless the rest is MODEL_RE-valid."""
+    items = list(argv)
+    found = None
+    i = 0
+    while i < len(items):
+        item = items[i]
+        if item == "--model":
+            found = items[i + 1] if i + 1 < len(items) else None
+            i += 2
+            continue
+        if isinstance(item, str) and item.startswith("--model="):
+            found = item[len("--model="):]
+        i += 1
+    if isinstance(found, str):
+        found = _ALIAS_SUFFIX_RE.sub("", found, count=1)
+        if MODEL_RE.fullmatch(found):
+            return found
+    return None
+
+
 def session_homes(profiles: Sequence[Profile]) -> List[str]:
     """Registry homes to scan: Claude Code's default ~/.claude first, then each profile home in order."""
     return [os.path.normpath(os.path.expanduser("~/.claude"))] + [p.home for p in profiles]
@@ -286,12 +400,16 @@ def discover_sessions(
     pid_alive: Optional[PidAlive] = None,
     read_proc: Optional[ReadProc] = None,
     proc_start: Optional[ProcStart] = None,
+    read_model: Optional[ReadModel] = None,
 ) -> List[Session]:
     """Return the live interactive Claude Code sessions registered under ``homes``, sorted by pid.
 
     Never raises for bad registry data or unreadable processes: those entries are skipped with a
     DEBUG record on the ``rotator.sessions`` logger. Only CLAUDE_CONFIG_DIR and ORCA_TERMINAL_HANDLE
     are read from a process env. A ``str`` ``homes`` raises TypeError.
+
+    read_model None: Session.model stays None and no transcript is read; otherwise the model comes
+    from read_model(config_dir, cwd, session_id), else from model_from_argv(argv).
     """
     if isinstance(homes, str):
         raise TypeError("homes must be a sequence of paths, not a str")
@@ -381,6 +499,25 @@ def discover_sessions(
         except (ValueError, TypeError):
             _skip(w.path, "invalid")
             continue
+        if read_model is not None:
+            model = None
+            try:
+                model = read_model(s.config_dir, s.cwd, s.session_id)
+            except Exception:  # one session's reader failure must never stop discovery of the others
+                log.debug("session model pid=%d: %s", s.pid, "reader_error")
+                model = None
+            if model is None:
+                model = model_from_argv(s.argv)
+            if model is not None:
+                try:
+                    s = dataclasses.replace(s, model=model)
+                except (ValueError, TypeError):
+                    log.debug("session model pid=%d: %s", s.pid, "invalid_model")
         out.append(s)
 
     return sorted(out, key=lambda s: s.pid)
+
+
+def discover_sessions_with_model(homes: Sequence[str]) -> List[Session]:
+    """discover_sessions with the transcript model reader; the daemon and CLI bind this one."""
+    return discover_sessions(homes, read_model=read_session_model)

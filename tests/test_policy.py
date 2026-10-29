@@ -38,6 +38,15 @@ def _session(status, n=1, config_dir=None):
                    config_dir=config_dir or _profile(n).home, argv=("claude",))
 
 
+def _fusage(n, five, seven, fable, *, fable_resets_at=None, fetched_at=NOW, **kw):
+    u = _usage(n, five, seven, fetched_at=fetched_at, **kw)
+    return dataclasses.replace(u, fable=None if fable is None else UsageWindow(utilization=fable, resets_at=fable_resets_at))
+
+
+def _fsession(status, n=1, model="claude-fable-5-1", **kw):
+    return dataclasses.replace(_session(status, n, **kw), model=model)
+
+
 class TestPolicyConfig(unittest.TestCase):
     def test_defaults(self):
         c = PolicyConfig()
@@ -797,6 +806,140 @@ class TestDecidePointer(unittest.TestCase):
                 self.assertNotIn("@", d.reason)
                 self.assertNotIn("/x/claude-profiles", d.reason)
                 self.assertNotIn("Profile(", d.reason)
+
+
+
+class TestFableTrigger(unittest.TestCase):
+    def cand(self):
+        return _fusage(2, 10.0, 10.0, 10.0)
+
+    def test_soft_on_fable(self):
+        d = _decide("idle", _fusage(1, 10.0, 20.0, 85.0), self.cand(), session=_fsession("idle"))
+        self.assertEqual(d.action, "soft")
+        self.assertEqual(d.target.account_id, _pid(2))
+        self.assertEqual(d.utilization, 85.0)
+        self.assertTrue(d.reason.startswith("max(5h,7d,fable)=85.0% >= soft 85.0%"), d.reason)
+
+    def test_below_soft_boundary(self):
+        d = _decide("idle", _fusage(1, 10.0, 20.0, 84.9), self.cand(), session=_fsession("idle"))
+        self.assertEqual(d.action, "none")
+        self.assertEqual(d.reason, "max(5h,7d,fable)=84.9% below soft 85.0%")
+
+    def test_hard_on_fable(self):
+        d = _decide("busy", _fusage(1, 10.0, 20.0, 95.0), self.cand(), session=_fsession("busy"))
+        self.assertEqual(d.action, "hard")
+        self.assertEqual(d.target.account_id, _pid(2))
+        self.assertTrue(d.reason.startswith("max(5h,7d,fable)=95.0% >= hard 95.0%"), d.reason)
+
+    def test_busy_soft_waits(self):
+        d = _decide("busy", _fusage(1, 10.0, 20.0, 94.9), self.cand(), session=_fsession("busy"))
+        self.assertEqual(d.action, "none")
+        self.assertEqual(d.reason, "max(5h,7d,fable)=94.9% >= soft 85.0%; session busy, waiting for idle")
+
+    def test_reset_fable_counts_zero(self):
+        own = _fusage(1, 10.0, 20.0, 99.0, fable_resets_at=NOW - timedelta(minutes=1))
+        d = _decide("idle", own, self.cand(), session=_fsession("idle"))
+        self.assertEqual(d.action, "none")
+        self.assertEqual(d.utilization, 20.0)
+        self.assertTrue(d.reason.startswith("max(5h,7d,fable)=20.0%"), d.reason)
+
+    def test_non_fable_unchanged(self):
+        own = _fusage(1, 10.0, 20.0, 85.0)
+        opus = _decide("idle", own, self.cand(), session=_fsession("idle", model="claude-opus-5-5"))
+        plain = _decide("idle", own, self.cand())
+        self.assertEqual(opus, plain)
+        self.assertEqual(plain.reason, "max(5h,7d)=20.0% below soft 85.0%")
+
+    def test_non_fable_ignores_fable_fields_entirely(self):
+        scenarios = [("idle", _usage(1, 86), _usage(2, 40)), ("busy", _usage(1, 96), _usage(2, 40)),
+                     ("busy", _usage(1, 97), _usage(2, 80))]
+        for status, own, cand in scenarios:
+            with self.subTest(status=status, own=own.five_hour.utilization):
+                plain = _decide(status, own, cand)
+                with_fable = _decide(status, dataclasses.replace(own, fable=UsageWindow(99.0)),
+                                     dataclasses.replace(cand, fable=UsageWindow(99.0)))
+                self.assertEqual(plain, with_fable)
+
+    def test_own_fable_unknown_label(self):
+        d = _decide("idle", _fusage(1, 90.0, 10.0, None), self.cand(), session=_fsession("idle"))
+        self.assertEqual(d.action, "soft")
+        self.assertTrue(d.reason.startswith("max(5h,7d; fable unknown)=90.0% >= soft 85.0%"), d.reason)
+
+    def test_stale_own_fable_without_reset_not_lower_bound(self):
+        stale = dict(fetched_at=NOW - H2, five_resets_at=NOW + H2, seven_resets_at=NOW + D3)
+        d = _decide("idle", _fusage(1, 90.0, 10.0, 99.0, **stale), self.cand(), session=_fsession("idle"))
+        self.assertEqual(d.action, "none")
+        self.assertIn("not a lower bound", d.reason)
+        d = _decide("idle", _fusage(1, 90.0, 10.0, 99.0, fable_resets_at=NOW + D3, **stale), self.cand(),
+                    session=_fsession("idle"))
+        self.assertEqual(d.action, "hard")
+        self.assertEqual(d.utilization, 99.0)
+
+    def test_return_sites_in_fable_mode(self):
+        own = _fusage(1, 10.0, 20.0, 90.0)
+        d = _decide("idle", own, self.cand(), session=_fsession("idle", config_dir="/x/other/.claude"))
+        self.assertEqual(d.reason, "unmanaged session: config_dir maps to no profile")
+        d = _decide("shell", own, self.cand(), session=_fsession("shell"))
+        self.assertTrue(d.reason.startswith("session status shell"), d.reason)
+        d = _decide("idle", self.cand(), profiles=[_profile(1), _profile(2)], session=_fsession("idle"))
+        self.assertTrue(d.reason.startswith("current account "), d.reason)
+        d = _decide("idle", own, self.cand(), session=_fsession("idle"), last_switch_at=NOW - timedelta(minutes=2))
+        self.assertEqual(d.action, "none")
+        self.assertIn("; cooldown: last switch 120s ago", d.reason)
+
+
+class TestFableTargets(unittest.TestCase):
+    def own(self):
+        return _fusage(1, 90.0, 10.0, 90.0)
+
+    def b(self):
+        return _fusage(2, 10.0, 10.0, None)
+
+    def c(self, fable=50.0, **kw):
+        return _fusage(3, 30.0, 30.0, fable, **kw)
+
+    def test_unknown_fable_candidate_skipped(self):
+        d = _decide("idle", self.own(), self.b(), self.c(), session=_fsession("idle"))
+        self.assertEqual(d.target.account_id, _pid(3))
+        self.assertTrue(d.reason.endswith("target %s at 50.0%%" % _pid(3)), d.reason)
+
+    def test_only_unknown_candidate(self):
+        d = _decide("idle", self.own(), self.b(), session=_fsession("idle"))
+        self.assertEqual(d.action, "none")
+        self.assertIn("%s: fable unknown" % _pid(2), d.reason)
+
+    def test_candidate_above_line(self):
+        d = _decide("idle", self.own(), self.c(fable=76.0), session=_fsession("idle"))
+        self.assertEqual(d.action, "none")
+        self.assertIn("> headroom line 75.0%", d.reason)
+
+    def test_candidate_at_line_valid(self):
+        d = _decide("idle", self.own(), self.c(fable=75.0), session=_fsession("idle"))
+        self.assertEqual(d.target.account_id, _pid(3))
+
+    def test_candidate_fable_reset_valid(self):
+        d = _decide("idle", self.own(), self.c(fable=99.0, fable_resets_at=NOW - timedelta(minutes=1)),
+                    session=_fsession("idle"))
+        self.assertEqual(d.target.account_id, _pid(3))
+        self.assertTrue(d.reason.endswith("target %s at 30.0%%" % _pid(3)), d.reason)
+
+    def test_non_fable_session_same_usages(self):
+        d = _decide("idle", self.own(), self.b(), self.c())
+        self.assertEqual(d.target.account_id, _pid(2))
+        self.assertTrue(d.reason.endswith("target %s at 10.0%%" % _pid(2)), d.reason)
+
+    def test_stale_candidate_still_stale_cause(self):
+        d = _decide("idle", self.own(), self.c(fable=None, fetched_at=NOW - H2), session=_fsession("idle"))
+        self.assertEqual(d.action, "none")
+        self.assertIn("%s: usage stale" % _pid(3), d.reason)
+
+
+class TestFablePointerUnchanged(unittest.TestCase):
+    def test_pointer_ignores_fable(self):
+        with_fable = _pointer(_fusage(1, 20.0, 20.0, 99.0), _fusage(2, 10.0, 10.0, 10.0), pointer=_profile(1))
+        without = _pointer(_fusage(1, 20.0, 20.0, None), _fusage(2, 10.0, 10.0, None), pointer=_profile(1))
+        self.assertEqual(with_fable, without)
+        self.assertIn("max(5h,7d)=20.0% below soft 85.0%", with_fable.reason)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, FrozenSet, Mapping, Optional, Pattern, Tuple
+from typing import Callable, FrozenSet, Mapping, Optional, Pattern, Sequence, Tuple
 
 PROFILES_ROOT_DEFAULT: str = os.path.expanduser("~/Library/Application Support/orca/claude-profiles")
 KEYCHAIN_SERVICE_PREFIX: str = "Claude Code-credentials-"
@@ -25,6 +25,12 @@ USAGE_ERROR_RE: Pattern[str] = re.compile(
     r"(token_missing|token_expired|http_[0-9]{3}|network|timeout|request_error|bad_json|bad_shape)"
     r"(;cache_(missing|bad_json|bad_shape))?\Z"
 )
+MODEL_RE: Pattern[str] = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,63}")  # always .fullmatch: <= 64 chars, no space, newline, "<" or "/"
+
+
+def is_fable_model(model: Optional[str]) -> bool:
+    """True when a Session.model names a Fable model; the only Fable predicate."""
+    return isinstance(model, str) and "fable" in model.casefold()
 
 # Injectable seams. Defaults live in rotator.accounts / rotator.usage and are
 # chosen at call time when a caller passes None.
@@ -76,6 +82,20 @@ class UsageWindow:
             raise ValueError("UsageWindow.resets_at must be timezone-aware")
 
 
+def _max_over(windows: Sequence[Optional[UsageWindow]], now: Optional[datetime]) -> Optional[float]:
+    if now is not None and now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    values = []
+    for w in windows:
+        if w is None:
+            continue
+        if now is not None and w.resets_at is not None and w.resets_at <= now:
+            values.append(0.0)
+        else:
+            values.append(w.utilization)
+    return max(values) if values else None
+
+
 @dataclass(frozen=True)
 class AccountUsage:
     account_id: str
@@ -84,6 +104,8 @@ class AccountUsage:
     five_hour: Optional[UsageWindow] = None
     seven_day: Optional[UsageWindow] = None
     error: Optional[str] = None  # None, or USAGE_ERROR_RE.fullmatch(error) is not None
+    fable: Optional[UsageWindow] = None  # Fable weekly_scoped window; not a 5h/7d window for the validity rules
+    retry_after_s: Optional[float] = None  # server delay of a live HTTP 429, seconds
 
     def __post_init__(self) -> None:
         if self.source not in USAGE_SOURCES:
@@ -101,6 +123,23 @@ class AccountUsage:
             raise ValueError("cache AccountUsage needs a window")
         if self.source == "unavailable" and (has_window or e is None or ";cache_" not in e):
             raise ValueError("unavailable AccountUsage needs no window and a live;cache error")
+        if self.fable is not None and not isinstance(self.fable, UsageWindow):
+            raise ValueError("AccountUsage.fable must be a UsageWindow or None")
+        if self.source == "unavailable" and self.fable is not None:
+            raise ValueError("unavailable AccountUsage needs no fable window")
+        r = self.retry_after_s
+        if r is not None:
+            if isinstance(r, bool) or not isinstance(r, (int, float)):
+                raise ValueError("AccountUsage.retry_after_s must be a number")
+            try:
+                rf = float(r)
+            except OverflowError:
+                raise ValueError("AccountUsage.retry_after_s must be a number") from None
+            if not math.isfinite(rf) or rf < 0:
+                raise ValueError("AccountUsage.retry_after_s must be finite and >= 0")
+            if not (isinstance(e, str) and (e == "http_429" or e.startswith("http_429;"))):
+                raise ValueError("AccountUsage.retry_after_s needs an http_429 error")
+            object.__setattr__(self, "retry_after_s", rf)
 
     def max_utilization(self, now: Optional[datetime] = None) -> Optional[float]:
         """Max utilization over present windows; None when both are absent.
@@ -108,17 +147,11 @@ class AccountUsage:
         With an aware ``now``, a window whose ``resets_at`` is not None and
         ``<= now`` contributes 0.0. A naive ``now`` raises ValueError.
         """
-        if now is not None and now.utcoffset() is None:
-            raise ValueError("now must be timezone-aware")
-        values = []
-        for w in (self.five_hour, self.seven_day):
-            if w is None:
-                continue
-            if now is not None and w.resets_at is not None and w.resets_at <= now:
-                values.append(0.0)
-            else:
-                values.append(w.utilization)
-        return max(values) if values else None
+        return _max_over((self.five_hour, self.seven_day), now)
+
+    def max_utilization_fable(self, now: Optional[datetime] = None) -> Optional[float]:
+        """Like max_utilization over (five_hour, seven_day, fable)."""
+        return _max_over((self.five_hour, self.seven_day, self.fable), now)
 
 
 @dataclass(frozen=True)
@@ -143,6 +176,7 @@ class Session:
     argv: Tuple[str, ...]  # a tuple, may be empty
     terminal_handle: Optional[str] = None  # ORCA_TERMINAL_HANDLE, e.g. "term_<id>"
     started_at: Optional[datetime] = None  # aware if present
+    model: Optional[str] = None  # last assistant model id, or argv --model; MODEL_RE-valid
 
     def __post_init__(self) -> None:
         # type() not isinstance(): bool is an int subclass and must be refused.
@@ -163,3 +197,8 @@ class Session:
         s = self.started_at
         if s is not None and not (isinstance(s, datetime) and s.utcoffset() is not None):
             raise ValueError("Session.started_at must be timezone-aware")
+        m = self.model
+        if m is not None and not isinstance(m, str):
+            raise TypeError("Session.model must be a str or None")
+        if m is not None and MODEL_RE.fullmatch(m) is None:
+            raise ValueError("Session.model must match MODEL_RE")

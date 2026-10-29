@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import dataclasses
 import io
 import json
 import logging
@@ -651,11 +652,11 @@ class TestBuildStatus(StatusBase):
         self.assertEqual(doc["schema"], 1)
         self.assertEqual(set(doc["daemon"]), {"running", "pid", "snapshot_age_s", "flags"})
         self.assertEqual(set(doc["accounts"][0]), {"account_id", "source", "error", "fetched_at", "five_hour",
-                                                   "seven_day", "pointer", "sessions"})
+                                                   "seven_day", "fable", "pointer", "sessions"})
         self.assertEqual(set(doc["sessions"][0]), {
             "pid", "session_id", "status", "account_id", "decision", "would_switch", "in_flight", "in_flight_pid",
             "stuck", "unswitchable", "hard_hold_until", "excluded", "record_state", "last_result", "hint",
-            "post_verify"})
+            "post_verify", "model"})
 
     def test_fresh_snapshot_no_fetch(self):
         self.env.alive_pids = {4242}
@@ -747,9 +748,42 @@ class TestBuildStatus(StatusBase):
                      argv=("claude",), terminal_handle=None, started_at=None)
         self.env.sessions = [sess(101, ACC_A), um]
         doc = self.doc()
-        self.assertEqual(doc["unmanaged_sessions"], [{"pid": 555, "session_id": SID2, "status": "idle"}])
+        self.assertEqual(doc["unmanaged_sessions"], [{"pid": 555, "session_id": SID2, "status": "idle", "model": None}])
         self.assertEqual([r["pid"] for r in doc["sessions"]], [101])
         self.assertEqual([x["pid"] for a in doc["accounts"] for x in a["sessions"]], [101])
+
+    def test_model_on_every_row(self):
+        um = Session(pid=555, session_id=SID2, cwd="/Users/user/proj", status="idle", config_dir="/Users/user/.claude",
+                     argv=("claude",), terminal_handle=None, started_at=None, model="claude-opus-5-5")
+        self.env.sessions = [dataclasses.replace(sess(101, ACC_A), model="claude-fable-5-1"), um]
+        doc = self.doc()
+        self.assertEqual(doc["sessions"][0]["model"], "claude-fable-5-1")
+        self.assertEqual(doc["unmanaged_sessions"][0]["model"], "claude-opus-5-5")
+        self.assertEqual(self.account(doc, ACC_A)["sessions"], [{"pid": 101, "status": "idle", "model": "claude-fable-5-1"}])
+
+    def test_fable_in_accounts(self):
+        self.env.usages[ACC_A] = dataclasses.replace(live(ACC_A, 20.0), fable=UsageWindow(25.0, T0 + timedelta(days=5)))
+        doc = self.doc()
+        self.assertEqual(self.account(doc, ACC_A)["fable"],
+                         {"utilization": 25.0, "resets_at": "2026-11-02T12:00:00+00:00"})
+        self.assertIsNone(self.account(doc, ACC_B)["fable"])
+
+    def test_discover_error_contained(self):
+        def boom(homes):
+            raise RuntimeError("SECRET-PROMPT-TEXT")
+
+        self.env.sessions = [sess(101, ACC_A)]
+        deps = self.env.deps(discover_sessions=boom)
+        with self.assertLogs("rotator.cli", "ERROR") as cm:
+            doc = build_status(self.cfg, deps, self.env.now_v)
+        self.assertEqual(doc["sessions"], [])
+        self.assertEqual(doc["unmanaged_sessions"], [])
+        self.assertTrue(doc["accounts"])
+        for a in doc["accounts"]:
+            self.assertEqual(a["sessions"], [])
+        msgs = [r.getMessage() for r in cm.records]
+        self.assertTrue(any("event=discover_error what=sessions exc=RuntimeError" in m for m in msgs), msgs)
+        self.assertFalse(any("SECRET-PROMPT-TEXT" in m for m in msgs))
 
     def test_snapshot_row_merged_only_for_same_session(self):
         self.env.alive_pids = {4242}
@@ -966,6 +1000,48 @@ class TestRender(unittest.TestCase):
 
 
 # --- Task 13 ---------------------------------------------------------------------------------------------
+
+    def fable_doc(self):
+        doc = copy.deepcopy(render_doc())
+        doc["accounts"][0]["fable"] = {"utilization": 25.0, "resets_at": (T0 + timedelta(days=5)).isoformat()}
+        doc["sessions"][0]["model"] = "claude-fable-5-1"
+        doc["unmanaged_sessions"][0]["model"] = "claude-fable-5-1"
+        return doc
+
+    def test_fable_column(self):
+        doc = self.fable_doc()
+        lines = self.lines(doc)
+        a = self.line_for(lines, ACC_A)
+        self.assertIn("fable 25.0% (", a)
+        self.assertIn("in 5d00h)", a)
+        self.assertIn("fable -", self.line_for(lines, ACC_B))
+        doc["accounts"][1]["fable"] = None
+        self.assertIn("fable -", self.line_for(self.lines(doc), ACC_B))
+
+    def test_model_parts(self):
+        def row(model, absent=False):
+            doc = copy.deepcopy(render_doc())
+            if not absent:
+                doc["sessions"][0]["model"] = model
+            return next(l for l in self.lines(doc) if l.startswith("  pid 101 "))
+
+        self.assertIn("model claude-fable-5-1 [fable]", row("claude-fable-5-1"))
+        opus = row("claude-opus-5-5")
+        self.assertIn("model claude-opus-5-5", opus)
+        self.assertNotIn("[fable]", opus)
+        self.assertNotIn("model ", row(None))
+        self.assertNotIn("model ", row(None, absent=True))
+        um = next(l for l in self.lines(self.fable_doc()) if l.startswith("  pid 555 "))
+        self.assertTrue(um.endswith("model claude-fable-5-1 [fable]"), um)
+        plain_um = next(l for l in self.lines(copy.deepcopy(render_doc())) if l.startswith("  pid 555 "))
+        self.assertEqual(plain_um, "  pid 555 busy")
+
+    def test_width_with_fable(self):
+        doc = self.fable_doc()
+        for line in self.lines(doc, width=40):
+            self.assertLessEqual(len(line), 40)
+        for line in self.lines(doc, width=400):
+            self.assertTrue(line.isascii(), line)
 
 
 class MainBase(unittest.TestCase):
@@ -1387,6 +1463,17 @@ class TestReadme(unittest.TestCase):
             self.assertTrue(self.text.startswith("<you>", m.end()), self.text[m.start():m.end() + 20])
         self.assertIsNone(re.search(r"term_[0-9A-Za-z]", self.text))
         self.assertIsNone(re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", self.text))
+
+    def test_fable_documented(self):
+        section = self.section("## Fable usage")
+        for needle in ("max(5h, 7d, fable)", "fable unknown", "1 MiB", "<synthetic>", "--model", "selected-host"):
+            self.assertIn(needle, section)
+        cadence = self.section("### Live usage cadence")
+        for needle in ("Retry-After", "RFC 9110", "%d" % int(daemon.RETRY_AFTER_MAX_S)):
+            self.assertIn(needle, cadence)
+        rows = self.text.splitlines()
+        self.assertIn("model", next(l for l in rows if l.startswith("| `unmanaged_sessions`")))
+        self.assertIn("fable", next(l for l in rows if l.startswith("| `accounts`")))
 
     def test_cadence_documented(self):
         for needle in ("### Live usage cadence", "rate_limited", "--interval", "ago"):

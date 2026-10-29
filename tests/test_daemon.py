@@ -442,9 +442,29 @@ class TestFileLock(unittest.TestCase):
 class TestSerializers(unittest.TestCase):
     def test_usage_summary_keys(self):
         s = usage_summary(live(ACC_A, 42.0))
-        self.assertEqual(set(s), {"account_id", "source", "error", "fetched_at", "five_hour", "seven_day"})
+        self.assertEqual(set(s), {"account_id", "source", "error", "fetched_at", "five_hour", "seven_day", "fable"})
         self.assertEqual(s["fetched_at"], "2026-10-28T12:00:00+00:00")
         self.assertEqual(set(s["five_hour"]), {"utilization", "resets_at"})
+        self.assertIsNone(s["fable"])
+
+    def test_fable_round_trip(self):
+        u = dataclasses.replace(live(ACC_A, 42.0), fable=UsageWindow(25.0, T0 + timedelta(days=5)))
+        self.assertEqual(usage_summary(u)["fable"], {"utilization": 25.0, "resets_at": "2026-11-02T12:00:00+00:00"})
+        self.assertEqual(usage_from_summary(usage_summary(u)), u)
+        v = dataclasses.replace(live(ACC_A, 42.0), fable=UsageWindow(25.0))
+        self.assertEqual(usage_from_summary(usage_summary(v)), v)
+
+    def test_old_summary_without_fable(self):
+        d = usage_summary(live(ACC_A, 42.0))
+        del d["fable"]
+        got = usage_from_summary(d)
+        self.assertIsNotNone(got)
+        self.assertIsNone(got.fable)
+
+    def test_retry_after_not_serialized(self):
+        u = dataclasses.replace(limited(ACC_B), retry_after_s=120.0)
+        self.assertNotIn("retry_after_s", usage_summary(u))
+        self.assertIsNone(usage_from_summary(usage_summary(u)).retry_after_s)
 
     def test_round_trip(self):
         for u in (live(ACC_A, 42.0),
@@ -878,6 +898,10 @@ def limited(aid, source="cache"):
     return AccountUsage(account_id=aid, source="unavailable", fetched_at=T0, error="http_429;cache_missing")
 
 
+def limited_ra(aid, ra, source="cache"):
+    return dataclasses.replace(limited(aid, source), retry_after_s=ra)
+
+
 class TestUsageCache(unittest.TestCase):
     def setUp(self):
         self.env = FakeEnv()
@@ -968,6 +992,33 @@ class TestUsageCache(unittest.TestCase):
         fetched = self.run_until(30)
         self.assertEqual([t for t, ids in fetched.items() if ACC_B in ids], [30])
         self.assertEqual([t for t, ids in fetched.items() if ACC_A in ids], [0, 30])
+
+    def test_retry_after_sets_interval(self):
+        for ra, expected in [(120.0, 120.0), (5.0, 30.0), (3600.0, 900.0), (0.0, 30.0), (900.0, 900.0)]:
+            with self.subTest(ra=ra):
+                cache = UsageCache(30.0)
+                self.env.usages[ACC_B] = limited_ra(ACC_B, ra)
+                self.step(cache)
+                self.assertEqual(cache.interval(ACC_B), expected)
+                recs = [r for r in self.env.log_records if r.startswith("event=usage_rate_limited account=%s" % ACC_B)]
+                self.assertTrue(recs[-1].endswith("next_s=%d" % int(expected)), recs[-1])
+
+    def test_retry_after_unavailable(self):
+        self.env.usages[ACC_B] = limited_ra(ACC_B, 120.0, "unavailable")
+        self.step()
+        self.assertEqual(self.c.interval(ACC_B), 120.0)
+
+    def test_retry_after_then_success(self):
+        self.env.usages[ACC_B] = limited_ra(ACC_B, 120.0)
+        self.step()
+        self.assertEqual(self.c.interval(ACC_B), 120.0)
+        self.env.usages[ACC_B] = live(ACC_B, 20.0)
+        b_times = []
+        for t in range(10, 131, 10):
+            if ACC_B in self.step():
+                b_times.append(t)
+        self.assertEqual(b_times, [120])
+        self.assertEqual(self.c.interval(ACC_B), 30.0)
 
 
 class TickBase(unittest.TestCase):
@@ -1167,11 +1218,32 @@ class TestSnapshot(TickBase):
                                      "pointer_target_account_id", "sessions"})
         self.assertEqual(snap["daemon_pid"], os.getpid())
         self.assertEqual(set(snap["sessions"][0]), {"pid", "session_id", "status", "account_id", "decision",
-                                                    "would_switch", "in_flight", "in_flight_pid", "stuck"})
+                                                    "would_switch", "in_flight", "in_flight_pid", "stuck", "model"})
         for secret in SECRETS + ("Fixture User",):
             self.assertNotIn(secret, text)
         self.assertIn(ACC_A, text)
         self.assertEqual(self.d.snapshot()["sessions"], snap["sessions"])
+
+    def test_model_in_rows(self):
+        self.env.sessions = [dataclasses.replace(sess(101, ACC_A), model="claude-fable-5-1")]
+        self.d.tick()
+        self.assertEqual(self.snap()["sessions"][0]["model"], "claude-fable-5-1")
+        self.env.sessions = [sess(101, ACC_A)]
+        self.d.tick()
+        self.assertIsNone(self.snap()["sessions"][0]["model"])
+
+    def test_fable_decision_in_tick(self):
+        later = T0 + timedelta(days=2)
+        self.env.usages[ACC_A] = dataclasses.replace(live(ACC_A, 20.0), fable=UsageWindow(90.0, later))
+        for a in (ACC_B, ACC_C):
+            self.env.usages[a] = dataclasses.replace(live(a, 20.0), fable=UsageWindow(10.0, later))
+        self.env.sessions = [dataclasses.replace(sess(101, ACC_A, status="busy"), model="claude-fable-5-1")]
+        self.d.tick()
+        row = self.snap()["sessions"][0]
+        self.assertEqual(row["decision"]["action"], "none")
+        self.assertTrue(row["decision"]["reason"].startswith("max(5h,7d,fable)=90.0% >= soft 85.0%"),
+                        row["decision"]["reason"])
+        self.assertEqual([c for c in self.env.calls if c[0] == "switch"], [])
 
     def test_snapshot_written_under_daemon_lock(self):
         base = self.deps
@@ -1646,7 +1718,10 @@ class TestRealDeps(unittest.TestCase):
         from rotator import pointer, sessions
         self.assertIs(deps.read_pointer, pointer.read_selected_host)
         self.assertIs(deps.write_pointer, pointer.set_selected_host)
-        self.assertIs(deps.discover_sessions, sessions.discover_sessions)
+        self.assertIs(deps.discover_sessions, sessions.discover_sessions_with_model)
+
+    def test_with_model_reader_bound(self):
+        self.assertEqual(real_deps(make_cfg()).discover_sessions.__name__, "discover_sessions_with_model")
 
     def test_pid_alive_guards(self):
         self.assertIs(daemon._pid_alive(0), False)

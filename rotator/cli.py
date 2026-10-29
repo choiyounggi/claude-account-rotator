@@ -21,6 +21,7 @@ from rotator.daemon import (
     IN_PROGRESS_HINT, ORPHANED_HINT, RATE_LIMITED_TOKEN, STATE_FILENAME, Deps, UsageCache, identity_of,
     load_records, real_deps, run_daemon, run_switch, touched, usage_summary,
 )
+from rotator.models import is_fable_model
 from rotator.policy import decide
 from rotator.sessions import session_homes
 from rotator.switcher import STATE_HINTS, build_relaunch_command
@@ -72,7 +73,11 @@ def build_status(cfg: Config, deps: Deps, now: datetime, usage: Optional[UsageCa
     """
     log = logging.getLogger("rotator.cli")  # never deps.make_logger(): status writes nothing
     profiles = deps.discover_profiles(cfg.profiles_root)
-    found = deps.discover_sessions(session_homes(profiles))
+    try:
+        found = deps.discover_sessions(session_homes(profiles))
+    except Exception as e:  # a reader or registry bug must not take the status view down
+        log.error("event=discover_error what=sessions exc=%s", type(e).__name__)
+        found = []
     snap: Optional[dict] = None
     try:
         raw = json.loads(deps.read_text(os.path.join(cfg.state_dir, STATE_FILENAME)))
@@ -114,9 +119,9 @@ def build_status(cfg: Config, deps: Deps, now: datetime, usage: Optional[UsageCa
     for s in found:
         own = profile_for_config_dir(profiles, s.config_dir)
         if own is None:
-            unmanaged.append({"pid": s.pid, "session_id": s.session_id, "status": s.status})
+            unmanaged.append({"pid": s.pid, "session_id": s.session_id, "status": s.status, "model": s.model})
             continue
-        per_account.setdefault(own.account_id, []).append({"pid": s.pid, "status": s.status})
+        per_account.setdefault(own.account_id, []).append({"pid": s.pid, "status": s.status, "model": s.model})
         ident = identity_of(s)
         live_idents.add(ident)
         rec = records.get(ident)
@@ -128,6 +133,7 @@ def build_status(cfg: Config, deps: Deps, now: datetime, usage: Optional[UsageCa
             "session_id": s.session_id,
             "status": s.status,
             "account_id": own.account_id,
+            "model": s.model,
             "decision": sr.get("decision") if sr else None,
             "would_switch": sr.get("would_switch") if sr else None,
             "in_flight": bool(sr.get("in_flight")) if sr else False,
@@ -215,6 +221,12 @@ def _win(w: Optional[dict], now: datetime, tz: tzinfo) -> str:
                             _countdown(w.get("resets_at"), now))
 
 
+def _model_part(model: object) -> str:
+    if not isinstance(model, str) or not model:
+        return ""
+    return "model " + model + (" [fable]" if is_fable_model(model) else "")
+
+
 def _err_label(e: str) -> str:
     if e == RATE_LIMITED_TOKEN or e.startswith(RATE_LIMITED_TOKEN + ";"):
         return "rate_limited" + e[len(RATE_LIMITED_TOKEN):]
@@ -255,21 +267,28 @@ def render(doc: Optional[dict], now: datetime, tz: tzinfo, width: int) -> List[s
         return [line[:w] for line in lines]
     lines = [header]
     for a in accounts:
-        lines.append("%s %s  5h %s  7d %s  %s%s%s  sessions: %s" % (
+        lines.append("%s %s  5h %s  7d %s  fable %s  %s%s%s  sessions: %s" % (
             "*" if a.get("pointer") else " ", a["account_id"], _win(a.get("five_hour"), now, tz),
-            _win(a.get("seven_day"), now, tz), a.get("source"),
+            _win(a.get("seven_day"), now, tz), _win(a.get("fable"), now, tz), a.get("source"),
             " (%s)" % _err_label(a["error"]) if a.get("error") else "", _age(a, now),
             ", ".join("%d %s" % (x["pid"], x["status"]) for x in a.get("sessions") or []) or "none"))
     unmanaged = d.get("unmanaged_sessions") or []
     if unmanaged:
         lines.append("unmanaged:")
         for u in unmanaged:
-            lines.append("  pid %d %s" % (u["pid"], u["status"]))
+            line = "  pid %d %s" % (u["pid"], u["status"])
+            mp = _model_part(u.get("model"))
+            if mp:
+                line += "  " + mp
+            lines.append(line)
     rows = d.get("sessions") or []
     if rows:
         lines.append("sessions:")
         for r in rows:
             parts = ["  pid %d %s on %s" % (r["pid"], r["status"], r["account_id"])]
+            mp = _model_part(r.get("model"))
+            if mp:
+                parts.append(mp)
             dec = r.get("decision")
             if dec:
                 target = dec.get("target_account_id")

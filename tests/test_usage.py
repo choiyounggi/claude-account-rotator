@@ -1,3 +1,4 @@
+import email.utils
 import http.client
 import io
 import json
@@ -14,10 +15,14 @@ from rotator.accounts import keychain_service_for
 import rotator.usage
 from rotator.models import USAGE_URL, AccountUsage, Profile, UsageWindow
 from rotator.usage import (
+    HttpResult,
     _NO_REDIRECT_OPENER,
     _NoRedirect,
     _urllib_http,
+    _urllib_http_ex,
     fetch_usage,
+    parse_fable,
+    parse_retry_after,
     parse_resets_at,
     parse_window,
     parse_windows,
@@ -505,6 +510,240 @@ class SecretAbsenceTest(unittest.TestCase):
                     self.assertIsNone(record.exc_info)
                 self.assertIn(ACC1, repr(result))
                 self.assertTrue(any(ACC1 in r.getMessage() for r in cap.records))
+
+
+FABLE_ITEM = {"group": "weekly", "is_active": False, "kind": "weekly_scoped", "percent": 25,
+              "resets_at": "2026-11-03T21:00:00.322623+00:00",
+              "scope": {"model": {"display_name": "Fable", "id": None}, "surface": None}, "severity": "normal"}
+
+
+def fable_item(**over):
+    d = json.loads(json.dumps(FABLE_ITEM))
+    d.update(over)
+    return d
+
+
+def fable_named(name):
+    d = fable_item()
+    d["scope"]["model"]["display_name"] = name
+    return d
+
+
+class ParseFableTest(unittest.TestCase):
+    def test_measured_shape(self):
+        w = parse_fable({"limits": [{"kind": "session", "scope": None, "percent": 4},
+                                    {"kind": "weekly_all", "scope": None, "percent": 32}, FABLE_ITEM]})
+        self.assertEqual(w, UsageWindow(25.0, parse_resets_at(FABLE_ITEM["resets_at"])))
+        self.assertIsNotNone(w.resets_at)
+
+    def test_display_name_case_and_space(self):
+        for name in ("FABLE", " fable "):
+            with self.subTest(name=name):
+                self.assertEqual(parse_fable({"limits": [fable_named(name)]}).utilization, 25.0)
+
+    def test_other_model_ignored(self):
+        self.assertIsNone(parse_fable({"limits": [fable_named("Opus")]}))
+        self.assertIsNone(parse_fable({"limits": [fable_item(kind="weekly_all")]}))
+
+    def test_malformed_items_skipped(self):
+        no_name = fable_item()
+        no_name["scope"]["model"]["display_name"] = None
+        cases = ["x", fable_item(scope=None), fable_item(scope={"model": "Fable"}), no_name,
+                 fable_item(percent="25"), fable_item(percent=True), fable_item(percent=float("nan")),
+                 fable_item(percent=1e400), fable_item(percent=10 ** 400)]
+        for i, item in enumerate(cases):
+            with self.subTest(i=i):
+                self.assertIsNone(parse_fable({"limits": [item]}))
+
+    def test_limits_missing_or_wrong_type(self):
+        for obj in ({}, {"limits": None}, {"limits": {}}, None, []):
+            with self.subTest(obj=obj):
+                self.assertIsNone(parse_fable(obj))
+
+    def test_highest_wins(self):
+        self.assertEqual(parse_fable({"limits": [fable_item(percent=25), fable_item(percent=60)]}).utilization, 60.0)
+        self.assertEqual(parse_fable({"limits": [fable_item(percent="x"), fable_item(percent=40)]}).utilization, 40.0)
+
+    def test_tie_first_wins(self):
+        first = fable_item(percent=50, resets_at="2026-11-03T21:00:00+00:00")
+        second = fable_item(percent=50, resets_at="2026-11-10T21:00:00+00:00")
+        w = parse_fable({"limits": [first, second]})
+        self.assertEqual(w.resets_at, parse_resets_at(first["resets_at"]))
+
+    def test_clamped(self):
+        self.assertEqual(parse_fable({"limits": [fable_item(percent=150)]}).utilization, 100.0)
+        self.assertEqual(parse_fable({"limits": [fable_item(percent=-5)]}).utilization, 0.0)
+
+    def test_missing_resets_at(self):
+        item = fable_item()
+        del item["resets_at"]
+        w = parse_fable({"limits": [item]})
+        self.assertIsNone(w.resets_at)
+        self.assertEqual(w.utilization, 25.0)
+
+
+def cache_with_fable(percent=40):
+    cache = default_cache()
+    cache["utilization"]["limits"] = [fable_item(percent=percent)]
+    return cache
+
+
+class FableUsagePathsTest(unittest.TestCase):
+    def test_live_fable_parsed(self):
+        u = run(http=FakeHttp(200, json.dumps(dict(json.loads(LIVE_BODY), limits=[FABLE_ITEM]))))
+        self.assertEqual(u.source, "live")
+        self.assertEqual(u.fable.utilization, 25.0)
+
+    def test_live_without_limits_fable_none(self):
+        u = run(http=FakeHttp(200, LIVE_BODY))
+        self.assertEqual(u.source, "live")
+        self.assertIsNone(u.fable)
+        self.assertEqual(u.five_hour.utilization, 42.5)
+
+    def test_fable_only_body_is_bad_shape(self):
+        u = run(http=FakeHttp(200, json.dumps({"limits": [FABLE_ITEM]})))
+        self.assertEqual(u.source, "unavailable")
+        self.assertEqual(u.error, "bad_shape;cache_missing")
+        self.assertIsNone(u.fable)
+
+    def test_cache_fable_parsed(self):
+        usage, reason = read_cached_usage(PROFILE, read_text=FakeFiles({CLAUDE_JSON_PATH: claude_json(cache_with_fable())}))
+        self.assertIsNone(reason)
+        self.assertEqual(usage.source, "cache")
+        self.assertEqual(usage.fable.utilization, 40.0)
+
+    def test_cache_without_limits_fable_none(self):
+        usage, reason = read_cached_usage(PROFILE, read_text=FakeFiles({CLAUDE_JSON_PATH: claude_json(default_cache())}))
+        self.assertIsNone(reason)
+        self.assertIsNone(usage.fable)
+
+    def test_live_failure_keeps_cache_fable(self):
+        u = run(http=FakeHttp(500, ""), read_text=FakeFiles({CLAUDE_JSON_PATH: claude_json(cache_with_fable())}))
+        self.assertEqual(u.source, "cache")
+        self.assertEqual(u.error, "http_500")
+        self.assertEqual(u.fable.utilization, 40.0)
+
+
+
+class FakeHttpEx:
+    def __init__(self, status=200, body="", retry_after=None):
+        self.status = status
+        self.body = body
+        self.retry_after = retry_after
+        self.calls = []
+
+    def __call__(self, url, headers, timeout):
+        self.calls.append((url, dict(headers), timeout))
+        return HttpResult(self.status, self.body, self.retry_after)
+
+
+def run_ex(fake, read_text=None):
+    return fetch_usage(PROFILE, http_ex=fake, keychain=FakeKeychain(cred_json()),
+                       read_text=read_text or FakeFiles({}), now=lambda: NOW)
+
+
+def http_date(dt):
+    return email.utils.format_datetime(dt, usegmt=True)
+
+
+class ParseRetryAfterTest(unittest.TestCase):
+    def test_delay_seconds(self):
+        self.assertEqual(parse_retry_after("120", NOW), 120.0)
+        self.assertEqual(parse_retry_after(" 120 ", NOW), 120.0)
+        self.assertEqual(parse_retry_after("0", NOW), 0.0)
+        self.assertEqual(parse_retry_after("9" * 10, NOW), 9999999999.0)
+
+    def test_http_date(self):
+        self.assertEqual(parse_retry_after(http_date(NOW + timedelta(seconds=300)), NOW), 300.0)
+        self.assertEqual(parse_retry_after(http_date(NOW - timedelta(days=1)), NOW), 0.0)
+        self.assertEqual(parse_retry_after("Thu, 01 Jan 2026 00:05:00 -0000", NOW), 300.0)
+
+    def test_garbage_none(self):
+        for v in ("soon", "", "   ", "12.5", "-5", "1" * 11, "x" * 65, None, 5, b"120", "Mon, 99 Foo 2026"):
+            with self.subTest(v=repr(v)[:20]):
+                self.assertIsNone(parse_retry_after(v, NOW))
+
+
+class RetryAfterSeamTest(unittest.TestCase):
+    def _err(self, hdrs):
+        return urllib.error.HTTPError(USAGE_URL, 429, "x", hdrs, io.BytesIO(b""))
+
+    def test_ex_seam_reads_header(self):
+        with unittest.mock.patch.object(rotator.usage._NO_REDIRECT_OPENER, "open",
+                                        side_effect=self._err({"Retry-After": "120"})):
+            self.assertEqual(_urllib_http_ex(USAGE_URL, {}, 1.0), HttpResult(429, "", "120"))
+        with unittest.mock.patch.object(rotator.usage._NO_REDIRECT_OPENER, "open",
+                                        side_effect=self._err({"Retry-After": "120"})):
+            self.assertEqual(_urllib_http(USAGE_URL, {}, 1.0), (429, ""))
+
+    def test_ex_seam_header_absent_or_bad(self):
+        for hdrs in (None, {"Retry-After": "1" * 65}, {}):
+            with self.subTest(hdrs=hdrs):
+                with unittest.mock.patch.object(rotator.usage._NO_REDIRECT_OPENER, "open",
+                                                side_effect=self._err(hdrs)):
+                    r = _urllib_http_ex(USAGE_URL, {}, 1.0)
+                self.assertEqual(r.status, 429)
+                self.assertIsNone(r.retry_after)
+
+    def test_ex_seam_success(self):
+        resp = unittest.mock.MagicMock()
+        resp.__enter__.return_value = resp
+        resp.status = 200
+        resp.read.return_value = LIVE_BODY.encode()
+        with unittest.mock.patch.object(rotator.usage._NO_REDIRECT_OPENER, "open", return_value=resp):
+            self.assertEqual(_urllib_http_ex(USAGE_URL, {}, 1.0), HttpResult(200, LIVE_BODY, None))
+
+
+class FetchRetryAfterTest(unittest.TestCase):
+    def test_429_with_cache(self):
+        u = run_ex(FakeHttpEx(429, "", "120"), FakeFiles({CLAUDE_JSON_PATH: claude_json()}))
+        self.assertEqual(u.source, "cache")
+        self.assertEqual(u.error, "http_429")
+        self.assertEqual(u.retry_after_s, 120.0)
+
+    def test_429_without_cache(self):
+        u = run_ex(FakeHttpEx(429, "", "120"))
+        self.assertEqual(u.source, "unavailable")
+        self.assertEqual(u.error, "http_429;cache_missing")
+        self.assertEqual(u.retry_after_s, 120.0)
+
+    def test_429_http_date(self):
+        u = run_ex(FakeHttpEx(429, "", http_date(NOW + timedelta(seconds=300))))
+        self.assertEqual(u.retry_after_s, 300.0)
+
+    def test_429_absent_or_garbage(self):
+        for raw in (None, "soon"):
+            with self.subTest(raw=raw):
+                u = run_ex(FakeHttpEx(429, "", raw))
+                self.assertIsNone(u.retry_after_s)
+                self.assertEqual(u.error, "http_429;cache_missing")
+
+    def test_other_status_ignores_header(self):
+        u = run_ex(FakeHttpEx(503, "", "60"))
+        self.assertIsNone(u.retry_after_s)
+        self.assertEqual(u.error, "http_503;cache_missing")
+        v = run_ex(FakeHttpEx(200, LIVE_BODY, "60"))
+        self.assertEqual(v.source, "live")
+        self.assertIsNone(v.retry_after_s)
+
+    def test_legacy_http_unchanged(self):
+        u = run(http=FakeHttp(429, ""))
+        self.assertIsNone(u.retry_after_s)
+        self.assertEqual(u.error, "http_429;cache_missing")
+
+    def test_both_seams_rejected(self):
+        f, g = FakeHttp(200, LIVE_BODY), FakeHttpEx(200, LIVE_BODY)
+        with self.assertRaises(ValueError):
+            fetch_usage(PROFILE, http=f, http_ex=g, keychain=FakeKeychain(cred_json()),
+                        read_text=FakeFiles({}), now=lambda: NOW)
+        self.assertEqual(f.calls, [])
+        self.assertEqual(g.calls, [])
+
+    def test_header_never_logged(self):
+        with self.assertLogs("rotator.usage", "DEBUG") as cap:
+            run_ex(FakeHttpEx(429, "", "SECRET-RETRY-123"))
+        self.assertTrue(cap.records)
+        self.assertFalse(any("SECRET-RETRY-123" in r.getMessage() for r in cap.records))
 
 
 if __name__ == "__main__":

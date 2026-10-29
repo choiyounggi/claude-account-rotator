@@ -18,7 +18,7 @@ from rotator.accounts import (
     profile_for_config_dir,
     read_credential,
 )
-from rotator.models import Profile, Session
+from rotator.models import MODEL_RE, AccountUsage, Profile, Session, UsageWindow, is_fable_model
 
 ACC1 = "00000000-0000-4000-8000-000000000001"
 ACC2 = "00000000-0000-4000-8000-000000000002"
@@ -453,6 +453,103 @@ class SecretAbsenceTest(unittest.TestCase):
         self.assertIn(str(EXP), repr(cred))
         self.assertIn("<redacted>", str(cred))
 
+
+
+T = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+class AccountUsageFableFieldsTest(unittest.TestCase):
+    def test_positional_construction_unchanged(self):
+        u = AccountUsage("a", "live", T, UsageWindow(10.0), None, None)
+        self.assertIsNone(u.fable)
+        self.assertIsNone(u.retry_after_s)
+
+    def test_fable_only_live_rejected(self):
+        with self.assertRaises(ValueError):
+            AccountUsage(account_id="a", source="live", fetched_at=T, fable=UsageWindow(5.0))
+
+    def test_unavailable_with_fable_rejected(self):
+        with self.assertRaises(ValueError):
+            AccountUsage(account_id="a", source="unavailable", fetched_at=T,
+                         error="http_429;cache_missing", fable=UsageWindow(5.0))
+
+    def test_fable_type_checked(self):
+        with self.assertRaises(ValueError):
+            AccountUsage(account_id="a", source="live", fetched_at=T, five_hour=UsageWindow(1.0),
+                         fable={"utilization": 5})
+
+    def test_retry_after_valid(self):
+        u = AccountUsage(account_id="a", source="cache", fetched_at=T, five_hour=UsageWindow(1.0),
+                         error="http_429", retry_after_s=120)
+        self.assertEqual(u.retry_after_s, 120.0)
+        self.assertIsInstance(u.retry_after_s, float)
+        v = AccountUsage(account_id="a", source="unavailable", fetched_at=T,
+                         error="http_429;cache_missing", retry_after_s=0)
+        self.assertEqual(v.retry_after_s, 0.0)
+        self.assertIsInstance(v.retry_after_s, float)
+
+    def test_retry_after_rejected(self):
+        cases = [("cache", "http_500", 120.0), ("live", None, 1.0)]
+        cases += [("cache", "http_429", bad)
+                  for bad in (-1.0, True, float("nan"), float("inf"), "120", 10 ** 400)]
+        for source, error, value in cases:
+            with self.subTest(error=error, value=repr(value)[:20]):
+                with self.assertRaises(ValueError):
+                    AccountUsage(account_id="a", source=source, fetched_at=T,
+                                 five_hour=UsageWindow(1.0), error=error, retry_after_s=value)
+
+    def _u(self, fable_resets=None):
+        return AccountUsage(account_id="a", source="live", fetched_at=T, five_hour=UsageWindow(40.0),
+                            seven_day=UsageWindow(50.0), fable=UsageWindow(99.0, fable_resets))
+
+    def test_max_utilization_ignores_fable(self):
+        u = self._u()
+        self.assertEqual(u.max_utilization(T), 50.0)
+        self.assertEqual(u.max_utilization(), 50.0)
+
+    def test_max_utilization_fable(self):
+        self.assertEqual(self._u().max_utilization_fable(T), 99.0)
+        self.assertEqual(self._u(fable_resets=T).max_utilization_fable(T), 50.0)
+        only = AccountUsage(account_id="a", source="live", fetched_at=T, five_hour=UsageWindow(10.0),
+                            fable=UsageWindow(30.0))
+        self.assertEqual(only.max_utilization_fable(T), 30.0)
+        with self.assertRaisesRegex(ValueError, r"^now must be timezone-aware$"):
+            self._u().max_utilization_fable(datetime(2026, 1, 1))
+
+
+class SessionModelTest(unittest.TestCase):
+    @staticmethod
+    def mk(**kw):
+        return Session(pid=1, session_id="s1", cwd="/w", status="idle", config_dir="/c", argv=(), **kw)
+
+    def test_default_none(self):
+        self.assertIsNone(self.mk().model)
+
+    def test_measured_ids_accepted(self):
+        for m in ("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-opus-4-8",
+                  "sonnet", "fable", "a" * 64):
+            with self.subTest(m=m[:20]):
+                self.assertEqual(self.mk(model=m).model, m)
+
+    def test_unsafe_rejected(self):
+        for m in ("<synthetic>", "a" * 65, "x\ny", "x y", "claude-fable-5-1\n", "", "-x", "a/b"):
+            with self.subTest(m=repr(m)[:20]):
+                with self.assertRaises(ValueError):
+                    self.mk(model=m)
+        for m in (5, b"x"):
+            with self.subTest(m=repr(m)):
+                with self.assertRaises(TypeError):
+                    self.mk(model=m)
+
+    def test_regex_is_fullmatch_only(self):
+        self.assertIsNone(MODEL_RE.fullmatch("claude-fable-5-1\n"))
+        self.assertIsNotNone(MODEL_RE.match("ok x"))
+
+    def test_is_fable_model(self):
+        for m in ("claude-fable-5-1", "FABLE", "fable"):
+            self.assertTrue(is_fable_model(m), m)
+        for m in ("claude-opus-5-5", None, "", 5):
+            self.assertFalse(is_fable_model(m), repr(m))
 
 if __name__ == "__main__":
     unittest.main()

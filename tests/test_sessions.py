@@ -1,8 +1,12 @@
 import calendar
 import importlib
 import json
+import builtins
 import os
+import re
 import struct
+import tempfile
+import threading
 import unittest
 import unittest.mock
 from datetime import datetime, timezone
@@ -10,12 +14,16 @@ from datetime import datetime, timezone
 import rotator.sessions
 from rotator.sessions import (
     ENV_WHITELIST,
+    TRANSCRIPT_TAIL_BYTES,
     _map_status,
     _parse_proc_start,
     _parse_started_at,
     _scan_registry,
     discover_sessions,
+    discover_sessions_with_model,
+    model_from_argv,
     parse_procargs,
+    read_session_model,
     session_homes,
 )
 from rotator.models import Profile, Session
@@ -335,7 +343,7 @@ DEFAULT_HOME = os.path.normpath(os.path.expanduser("~/.claude"))
 P4242 = "/h/acc1/sessions/4242.json"
 
 
-def run(files, homes=("/h/root", "/h/acc1"), alive=None, proc=None, start=None):
+def run(files, homes=("/h/root", "/h/acc1"), alive=None, proc=None, start=None, **kw):
     dirs = {}
     texts = {}
     pids = set()
@@ -354,6 +362,7 @@ def run(files, homes=("/h/root", "/h/acc1"), alive=None, proc=None, start=None):
         pid_alive=lambda p: p in alive,
         read_proc=proc,
         proc_start=start,
+        **kw,
     )
     return result, fs, proc, start
 
@@ -600,6 +609,274 @@ class SecretAbsenceTest(unittest.TestCase):
         self.assertIn("term_00000000", repr(result))
         self.assertNotIn("SECRET", log_text)
         self.assertIn("skip session", log_text)
+
+
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODEL_BASE = os.path.join(REPO, ".claude", "tmp", "test-sessions-model")
+
+
+def a_line(model):
+    return json.dumps({"type": "assistant",
+                       "message": {"model": model, "content": [{"type": "text", "text": "SECRET-PROMPT-TEXT"}]}})
+
+
+def u_line(text="SECRET-PROMPT-TEXT"):
+    return json.dumps({"type": "user", "message": {"content": text}})
+
+
+class ReadSessionModelTest(unittest.TestCase):
+    cwd = "/work/my proj.v2"
+    sid = "00000000-0000-4000-8000-000000000001"
+
+    @classmethod
+    def setUpClass(cls):
+        os.makedirs(MODEL_BASE, exist_ok=True)
+
+    def setUp(self):
+        td = tempfile.TemporaryDirectory(dir=MODEL_BASE)
+        self.addCleanup(td.cleanup)
+        self.home = os.path.join(td.name, "home")
+        os.makedirs(self.home)
+
+    def write_bytes(self, data, sub=None):
+        d = os.path.join(self.home, "projects", sub or re.sub("[^A-Za-z0-9]", "-", self.cwd))
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, self.sid + ".jsonl")
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def write(self, lines, sub=None):
+        return self.write_bytes(("\n".join(lines) + "\n").encode("utf-8"), sub)
+
+    def read(self, **kw):
+        return read_session_model(self.home, self.cwd, self.sid, **kw)
+
+    def test_model_change_last_wins(self):
+        self.write([a_line("claude-opus-5-5"), u_line(), a_line("claude-fable-5-1")])
+        self.assertEqual(self.read(), "claude-fable-5-1")
+
+    def test_trailing_synthetic_skipped(self):
+        self.write([a_line("claude-opus-5-5"), u_line(), a_line("claude-fable-5-1"), a_line("<synthetic>")])
+        self.assertEqual(self.read(), "claude-fable-5-1")
+
+    def test_cwd_space_and_dot_map_to_dash(self):
+        path = self.write([a_line("claude-opus-5-5")])
+        self.assertEqual(os.path.basename(os.path.dirname(path)), "-work-my-proj-v2")
+        self.assertEqual(self.read(), "claude-opus-5-5")
+
+    def test_glob_fallback_single_hit(self):
+        self.assertIsNone(self.read())
+        self.write([a_line("claude-opus-5-5")], sub="-other-dir")
+        self.assertEqual(self.read(), "claude-opus-5-5")
+        self.write([a_line("claude-opus-5-5")], sub="-third-dir")
+        self.assertIsNone(self.read())
+
+    def test_no_assistant_entry(self):
+        self.write([u_line(), json.dumps({"type": "attachment"})])
+        self.assertIsNone(self.read())
+
+    def test_last_real_model_unsafe_is_none(self):
+        self.write([a_line("claude-opus-5-5"), a_line("x y")])
+        self.assertIsNone(self.read())
+
+    def test_bad_lines_skipped(self):
+        self.write_bytes(a_line("claude-opus-5-5").encode() + b"\n{not json\n\xff\xfe\n"
+                         + '{"type": "user", "message": {"content": "한글 텍스트"}}'.encode("utf-8") + b"\n")
+        self.assertEqual(self.read(), "claude-opus-5-5")
+
+    def _big(self, before_mib, after_kib, model="claude-fable-5-1"):
+        filler = u_line("x" * 1000)
+        n_before = int(before_mib * 1024 * 1024) // (len(filler) + 1) + 1
+        n_after = int(after_kib * 1024) // (len(filler) + 1) + 1
+        return self.write([filler] * n_before + [a_line(model)] + [filler] * n_after)
+
+    def test_bound_found_within_tail(self):
+        self._big(3, 100)
+        self.assertEqual(self.read(), "claude-fable-5-1")
+
+    def test_bound_entry_beyond_tail_not_seen(self):
+        path = self.write([a_line("claude-fable-5-1")] + [u_line("x" * 1000)] * 1160)
+        self.assertGreater(os.path.getsize(path), int(1.1 * 1024 * 1024))
+        self.assertIsNone(self.read())
+        self.assertEqual(self.read(tail_bytes=os.path.getsize(path)), "claude-fable-5-1")
+
+    def test_small_chunks_cross_edges(self):
+        self.write([u_line("a" * 300), a_line("claude-opus-5-5"), u_line("b")])
+        self.assertEqual(self.read(tail_bytes=200, chunk_bytes=64), "claude-opus-5-5")
+        self.assertIsNone(self.read(tail_bytes=40, chunk_bytes=64))
+
+    def test_reads_at_most_tail(self):
+        self._big(3, 100)
+        recorded = []
+
+        class Proxy:
+            def __init__(self, f):
+                self.f = f
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.f.close()
+                return False
+
+            def seek(self, *a):
+                return self.f.seek(*a)
+
+            def read(self, n):
+                recorded.append(n)
+                return self.f.read(n)
+
+        def spy_open(path, mode):
+            return Proxy(builtins.open(path, mode))
+
+        with unittest.mock.patch("rotator.sessions.open", create=True, new=spy_open):
+            self.assertEqual(self.read(), "claude-fable-5-1")
+        self.assertTrue(recorded)
+        self.assertLessEqual(sum(recorded), TRANSCRIPT_TAIL_BYTES)
+
+    def test_bad_session_id(self):
+        self.write([a_line("claude-opus-5-5")])
+        for sid in ("../x", "a/b", ".", "..", "", "a\x00b"):
+            with self.subTest(sid=sid):
+                self.assertIsNone(read_session_model(self.home, self.cwd, sid))
+
+    def test_bad_bounds_raise(self):
+        with self.assertRaises(ValueError):
+            self.read(tail_bytes=0)
+        with self.assertRaises(ValueError):
+            self.read(chunk_bytes=0)
+
+    def test_missing_projects_dir(self):
+        self.assertFalse(os.path.exists(os.path.join(self.home, "projects")))
+        self.assertIsNone(self.read())
+
+    def test_sidechain_entries_skipped(self):
+        side = json.loads(a_line("claude-haiku-5-5"))
+        side["isSidechain"] = True
+        main = json.loads(a_line("claude-fable-5-1"))
+        main["isSidechain"] = False
+        self.write([json.dumps(main), u_line(), json.dumps(side)])
+        self.assertEqual(self.read(), "claude-fable-5-1")
+        self.write([json.dumps(side)])
+        self.assertIsNone(self.read())
+
+    def _read_in_thread(self):
+        out = []
+        t = threading.Thread(target=lambda: out.append(self.read()), daemon=True)
+        t.start()
+        t.join(5)
+        return t.is_alive(), out
+
+    def test_fifo_is_not_read(self):
+        for sub in (re.sub("[^A-Za-z0-9]", "-", self.cwd), "-other-dir"):
+            with self.subTest(sub=sub):
+                d = os.path.join(self.home, "projects", sub)
+                os.makedirs(d)
+                fifo = os.path.join(d, self.sid + ".jsonl")
+                os.mkfifo(fifo)
+                try:
+                    alive, out = self._read_in_thread()
+                finally:
+                    try:  # unblocks a reader stuck in open() if the guard regresses
+                        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+                    except OSError:
+                        pass
+                    os.unlink(fifo)
+                    os.rmdir(d)
+                self.assertFalse(alive, "reader blocked on a FIFO")
+                self.assertEqual(out, [None])
+
+    def test_directory_is_not_read(self):
+        d = os.path.join(self.home, "projects", "-other-dir", self.sid + ".jsonl")
+        os.makedirs(d)
+        self.assertIsNone(self.read())
+
+
+class ModelFromArgvTest(unittest.TestCase):
+    def test_examples(self):
+        cases = [
+            (("claude", "--model", "fable"), "fable"),
+            (("claude", "--model=claude-opus-5-5", "--model", "claude-fable-5-1"), "claude-fable-5-1"),
+            (("claude", "--model", "claude-fable-5-1", "--model=claude-opus-5-5"), "claude-opus-5-5"),
+            (("claude", "--model"), None),
+            (("claude", "--model", "--resume"), None),
+            (("claude",), None),
+            (("claude", "--model", "<synthetic>"), None),
+            (("claude", "--settings", "tok-SECRET-1"), None),
+            (("claude", "--model", "fable[1m]"), "fable"),
+            (("claude", "--model=claude-opus-5-5[1m]"), "claude-opus-5-5"),
+            (("claude", "--model", "[1m]"), None),
+            (("claude", "--model", "fable[1m"), None),
+            (("claude", "--model", "fable[1m][2m]"), None),
+        ]
+        for argv, want in cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(model_from_argv(argv), want)
+
+
+class DiscoverModelTest(unittest.TestCase):
+    def proc(self, argv):
+        return FakeProc({4242: (CLAUDE[0], argv, CLAUDE[2])})
+
+    def one(self, argv=("claude",), **kw):
+        result, _, _, _ = run({P4242: entry(4242)}, proc=self.proc(argv), **kw)
+        self.assertEqual(len(result), 1)
+        return result[0]
+
+    def test_default_off_reads_nothing(self):
+        with unittest.mock.patch("rotator.sessions.read_session_model", unittest.mock.Mock()) as reader, \
+                unittest.mock.patch("rotator.sessions.glob.glob", unittest.mock.Mock()) as g:
+            s = self.one(("claude", "--model", "claude-fable-5-1"))
+        reader.assert_not_called()
+        g.assert_not_called()
+        self.assertIsNone(s.model)
+
+    def test_reader_value_attached(self):
+        calls = []
+        s = self.one(read_model=lambda c, w, i: calls.append((c, w, i)) or "claude-fable-5-1")
+        self.assertEqual(s.model, "claude-fable-5-1")
+        self.assertEqual(calls, [("/h/acc1", "/work/proj", entry(4242)["sessionId"])])
+
+    def test_argv_fallback_when_reader_none(self):
+        argv = ("claude", "--model", "fable")
+        self.assertEqual(self.one(argv, read_model=lambda c, w, i: None).model, "fable")
+        self.assertEqual(self.one(argv, read_model=lambda c, w, i: "claude-opus-5-5").model, "claude-opus-5-5")
+
+    def test_reader_exception_contained(self):
+        def boom(c, w, i):
+            raise RuntimeError("SECRET-PROMPT-TEXT /h/acc1/projects/x.jsonl")
+
+        with self.assertLogs("rotator.sessions", "DEBUG") as cm:
+            s = self.one(read_model=boom)
+        self.assertIsNone(s.model)
+        msgs = [r.getMessage() for r in cm.records]
+        self.assertTrue(any(m.endswith("reader_error") for m in msgs))
+        self.assertFalse(any("SECRET-PROMPT-TEXT" in m or "/projects" in m for m in msgs))
+        self.assertNotIn("SECRET-PROMPT-TEXT", repr(s))
+        self.assertNotIn("/projects", repr(s))
+
+    def test_reader_exception_then_argv(self):
+        def boom(c, w, i):
+            raise RuntimeError("x")
+
+        s = self.one(("claude", "--model", "claude-fable-5-1"), read_model=boom)
+        self.assertEqual(s.model, "claude-fable-5-1")
+
+    def test_invalid_model_kept_session(self):
+        for bad in ("<synthetic>", 5):
+            with self.subTest(bad=bad):
+                with self.assertLogs("rotator.sessions", "DEBUG") as cm:
+                    s = self.one(read_model=lambda c, w, i: bad)
+                self.assertIsNone(s.model)
+                self.assertTrue(any(r.getMessage().endswith("invalid_model") for r in cm.records))
+
+    def test_with_model_delegates(self):
+        with unittest.mock.patch.object(rotator.sessions, "discover_sessions") as m:
+            discover_sessions_with_model(["/h"])
+        m.assert_called_once_with(["/h"], read_model=rotator.sessions.read_session_model)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import email.utils
 import json
 import logging
 import math
@@ -10,10 +11,11 @@ import re
 import socket
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 # Imported by name: fetch_usage's ``http`` parameter shadows any module ``http``.
 from http.client import HTTPException
-from typing import Mapping, Optional, Tuple
+from typing import Callable, Mapping, Optional, Tuple
 
 from rotator.accounts import _read_text_utf8, read_credential
 from rotator.models import USAGE_BETA_HEADER, USAGE_URL, AccountUsage, Http, Keychain, Now, Profile, ReadText, UsageWindow
@@ -24,6 +26,8 @@ log = logging.getLogger("rotator.usage")
 # request; callers must not assume fetch_usage returns within this many seconds.
 USAGE_TIMEOUT_S: float = 10.0
 _MAX_BODY_BYTES = 1_048_576
+RETRY_AFTER_MAX_LEN = 64
+_DELAY_SECONDS_RE = re.compile(r"[0-9]{1,10}")
 
 # Python 3.9 fromisoformat rejects "Z", "+0000" and fractions that are not
 # exactly 3 or 6 digits, so strings are normalised before parsing.
@@ -82,6 +86,64 @@ def parse_windows(obj: object) -> Optional[Tuple[Optional[UsageWindow], Optional
     return (five, seven)
 
 
+def parse_fable(obj: object) -> Optional[UsageWindow]:
+    """The Fable weekly_scoped window from a usage object's limits[]; None when absent or unusable. Never raises."""
+    if not isinstance(obj, dict):
+        return None
+    limits = obj.get("limits")
+    if not isinstance(limits, list):
+        return None
+    best = None
+    for item in limits:
+        if not isinstance(item, dict) or item.get("kind") != "weekly_scoped":
+            continue
+        scope = item.get("scope")
+        if not isinstance(scope, dict):
+            continue
+        model = scope.get("model")
+        if not isinstance(model, dict):
+            continue
+        name = model.get("display_name")
+        if not isinstance(name, str) or name.strip().casefold() != "fable":
+            continue
+        p = item.get("percent")
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            continue
+        try:
+            pf = float(p)
+        except OverflowError:
+            continue
+        if not math.isfinite(pf):
+            continue
+        pf = min(100.0, max(0.0, pf))
+        w = UsageWindow(utilization=pf, resets_at=parse_resets_at(item.get("resets_at")))
+        if best is None or w.utilization > best.utilization:
+            best = w
+    return best
+
+
+def parse_retry_after(value: object, now: datetime) -> Optional[float]:
+    """Seconds to wait from a Retry-After value (RFC 9110 10.2.3: delay-seconds or HTTP-date); None if unusable."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v or len(v) > RETRY_AFTER_MAX_LEN:
+        return None
+    if _DELAY_SECONDS_RE.fullmatch(v):
+        return float(int(v))
+    # An HTTP-date always names a weekday and month; this keeps "12.5" / "-5" away from the date parser.
+    if re.search(r"[A-Za-z]", v) is None:
+        return None
+    try:
+        dt = email.utils.parsedate_to_datetime(v)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if dt.utcoffset() is None:
+        # A "-0000" zone parses as naive on 3.9.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (dt - now).total_seconds())
+
+
 def read_cached_usage(
     profile: Profile, *, read_text: Optional[ReadText] = None
 ) -> Tuple[Optional[AccountUsage], Optional[str]]:
@@ -123,6 +185,7 @@ def read_cached_usage(
             five_hour=windows[0],
             seven_day=windows[1],
             error=None,
+            fable=parse_fable(cache.get("utilization")),
         ),
         None,
     )
@@ -142,7 +205,17 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _urllib_http(url: str, headers: Mapping[str, str], timeout: float) -> Tuple[int, str]:
+@dataclass(frozen=True)
+class HttpResult:
+    status: int
+    body: str
+    retry_after: Optional[str] = None  # raw Retry-After header of an HTTPError response, <= RETRY_AFTER_MAX_LEN chars
+
+
+HttpEx = Callable[[str, Mapping[str, str], float], HttpResult]
+
+
+def _urllib_http_ex(url: str, headers: Mapping[str, str], timeout: float) -> HttpResult:
     req = urllib.request.Request(url, headers=dict(headers), method="GET")
     try:
         with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as resp:
@@ -150,9 +223,21 @@ def _urllib_http(url: str, headers: Mapping[str, str], timeout: float) -> Tuple[
             data = resp.read(_MAX_BODY_BYTES)
     except urllib.error.HTTPError as e:
         code = e.code
+        raw = None
+        try:
+            raw = e.headers.get("Retry-After")
+        except (AttributeError, TypeError):
+            raw = None
+        if not isinstance(raw, str) or len(raw) > RETRY_AFTER_MAX_LEN:
+            raw = None
         e.close()
-        return code, ""
-    return status, data.decode("utf-8", errors="replace")
+        return HttpResult(code, "", raw)
+    return HttpResult(status, data.decode("utf-8", errors="replace"), None)
+
+
+def _urllib_http(url: str, headers: Mapping[str, str], timeout: float) -> Tuple[int, str]:
+    r = _urllib_http_ex(url, headers, timeout)
+    return r.status, r.body
 
 
 def _status_kind(code: object) -> str:
@@ -181,6 +266,7 @@ def fetch_usage(
     read_text: Optional[ReadText] = None,
     now: Optional[Now] = None,
     timeout: float = USAGE_TIMEOUT_S,
+    http_ex: Optional[HttpEx] = None,
 ) -> AccountUsage:
     """Live usage for ``profile``, else its cached usage, else ``source="unavailable"``.
 
@@ -188,15 +274,21 @@ def fetch_usage(
     missing cache) are reported in ``error`` and never raised. One request per
     call, no retry, no redirects, never renews the token. A non-Profile
     argument raises TypeError.
+
+    ``http`` and ``http_ex`` are alternative seams (passing both raises
+    ValueError before any I/O). ``retry_after_s`` is set only for a live 429
+    answered through ``http_ex`` or the default seam.
     """
     if not isinstance(profile, Profile):
         raise TypeError("fetch_usage expects a Profile")
-    http_fn = http if http is not None else _urllib_http
+    if http is not None and http_ex is not None:
+        raise ValueError("pass http or http_ex, not both")
     now_fn = now if now is not None else _utc_now
     ts = now_fn()
     now_ms = int(ts.timestamp() * 1000)
     live_kind = None
     result = None
+    raw_retry: Optional[str] = None
 
     cred = read_credential(profile, keychain=keychain)
     if cred is None:
@@ -211,7 +303,11 @@ def fetch_usage(
         }
         status, body = None, ""
         try:
-            status, body = http_fn(USAGE_URL, headers, timeout)
+            if http is not None:
+                status, body = http(USAGE_URL, headers, timeout)
+            else:
+                r = (http_ex if http_ex is not None else _urllib_http_ex)(USAGE_URL, headers, timeout)
+                status, body, raw_retry = r.status, r.body, r.retry_after
         except (OSError, HTTPException, ValueError, UnicodeError) as exc:
             # Only assign here: anything raised later inside this block would
             # chain exc (which may embed the header) as __context__.
@@ -237,12 +333,14 @@ def fetch_usage(
                             five_hour=windows[0],
                             seven_day=windows[1],
                             error=None,
+                            fable=parse_fable(obj),
                         )
 
+    ra = parse_retry_after(raw_retry, ts) if live_kind == "http_429" else None
     if result is None:
         usage, reason = read_cached_usage(profile, read_text=read_text)
         if usage is not None:
-            result = dataclasses.replace(usage, error=live_kind)
+            result = dataclasses.replace(usage, error=live_kind, retry_after_s=ra)
         else:
             result = AccountUsage(
                 account_id=profile.account_id,
@@ -251,6 +349,7 @@ def fetch_usage(
                 five_hour=None,
                 seven_day=None,
                 error="%s;cache_%s" % (live_kind, reason),
+                retry_after_s=ra,
             )
     log.debug("usage account=%s source=%s error=%s", profile.account_id, result.source, result.error)
     return result

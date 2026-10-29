@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import FrozenSet, Mapping, Optional, Sequence, Tuple
 
 from rotator.accounts import profile_for_config_dir
-from rotator.models import AccountUsage, Profile, Session
+from rotator.models import AccountUsage, Profile, Session, is_fable_model
 
 ACTIONS: FrozenSet[str] = frozenset({"none", "soft", "hard"})
 
@@ -90,17 +90,19 @@ def _require_aware(value: datetime, name: str) -> None:
 
 
 def _usable(usage: Optional[AccountUsage], now: datetime, config: PolicyConfig, *,
-            require_fresh: bool) -> Tuple[Optional[float], str]:
+            require_fresh: bool, fable: bool = False) -> Tuple[Optional[float], str]:
     """(utilization, "") when usable, else (None, cause).
 
     Not fresh = older than stale_max_age or fetched_at beyond clock_skew_tolerance in the
     future. With require_fresh=False such a reading still counts as a lower bound, but only
     when every present window has a reset time: usage only accumulates until resets_at, while
     a window without one may have reset since the fetch and over-state the reading.
+    fable=True scores max(5h,7d,fable) and, with require_fresh, refuses a reading whose fable
+    window is unknown.
     """
     if usage is None:
         return None, "no usage data"
-    u = usage.max_utilization(now)
+    u = usage.max_utilization_fable(now) if fable else usage.max_utilization(now)
     if usage.source == "unavailable" or u is None:
         if usage.error:
             return None, "usage unavailable (%s)" % usage.error
@@ -114,10 +116,14 @@ def _usable(usage: Optional[AccountUsage], now: datetime, config: PolicyConfig, 
         stale_cause = "usage stale: age %ds > max %ds" % (
             int(age.total_seconds()), int(config.stale_max_age.total_seconds()))
     if not stale_cause:
+        if fable and require_fresh and usage.fable is None:
+            return None, "fable unknown"
         return u, ""
     if require_fresh:
         return None, stale_cause
     windows = [w for w in (usage.five_hour, usage.seven_day) if w is not None]
+    if fable and usage.fable is not None:
+        windows.append(usage.fable)
     if any(w.resets_at is None for w in windows):
         return None, stale_cause + "; a window has no reset time, not a lower bound"
     return u, ""
@@ -125,7 +131,7 @@ def _usable(usage: Optional[AccountUsage], now: datetime, config: PolicyConfig, 
 
 def _select_target(exclude_account_id: str, subject: str, own_u: float, line: Optional[float],
                    profiles: Sequence[Profile], usages: Mapping[str, AccountUsage], now: datetime,
-                   config: PolicyConfig) -> Tuple[Optional[Profile], Optional[float], str]:
+                   config: PolicyConfig, *, fable: bool = False) -> Tuple[Optional[Profile], Optional[float], str]:
     """Lowest fresh utilization strictly below own_u (ties by account_id) and, when line is
     not None, at or below line. Returns (target, target_u, "") or (None, None, reason fragment).
     subject names the caller's account in the fragment.
@@ -136,7 +142,7 @@ def _select_target(exclude_account_id: str, subject: str, own_u: float, line: Op
     scored = []
     rejected = []
     for p in others:
-        cu, why = _usable(usages.get(p.account_id), now, config, require_fresh=True)
+        cu, why = _usable(usages.get(p.account_id), now, config, require_fresh=True, fable=fable)
         if cu is not None:
             scored.append((cu, p.account_id, p))
         else:
@@ -170,7 +176,15 @@ def decide(session: Session, profiles: Sequence[Profile], usages: Mapping[str, A
     own = profile_for_config_dir(profiles, session.config_dir)
     if own is None:
         return Decision("none", None, "unmanaged session: config_dir maps to no profile", None)
-    u, cause = _usable(usages.get(own.account_id), now, config, require_fresh=False)
+    fable = is_fable_model(session.model)
+    own_usage = usages.get(own.account_id)
+    u, cause = _usable(own_usage, now, config, require_fresh=False, fable=fable)
+    if not fable:
+        label = "max(5h,7d)"
+    elif own_usage is not None and own_usage.fable is not None:
+        label = "max(5h,7d,fable)"
+    else:
+        label = "max(5h,7d; fable unknown)"
     if session.status not in ("idle", "busy"):
         return Decision("none", None,
                         "session status %s: no running Claude turn to switch" % session.status, u)
@@ -178,9 +192,9 @@ def decide(session: Session, profiles: Sequence[Profile], usages: Mapping[str, A
         return Decision("none", None, "current account %s: %s" % (own.account_id, cause), u)
     if u < config.soft_pct:
         return Decision("none", None,
-                        "max(5h,7d)=%s below soft %s" % (_pct(u), _pct(config.soft_pct)), u)
+                        "%s=%s below soft %s" % (label, _pct(u), _pct(config.soft_pct)), u)
     tier, th = ("hard", config.hard_pct) if u >= config.hard_pct else ("soft", config.soft_pct)
-    head = "max(5h,7d)=%s >= %s %s" % (_pct(u), tier, _pct(th))
+    head = "%s=%s >= %s %s" % (label, _pct(u), tier, _pct(th))
     if last_switch_at is not None and now - last_switch_at < config.cooldown:
         return Decision("none", None, head + "; cooldown: last switch %ds ago < %ds" % (
             int((now - last_switch_at).total_seconds()), int(config.cooldown.total_seconds())), u)
@@ -188,7 +202,7 @@ def decide(session: Session, profiles: Sequence[Profile], usages: Mapping[str, A
         return Decision("none", None, head + "; session busy, waiting for idle", u)
     target, tu, fragment = _select_target(own.account_id, "current account", u,
                                           config.soft_pct - config.target_headroom_pct,
-                                          profiles, usages, now, config)
+                                          profiles, usages, now, config, fable=fable)
     if target is None:
         return Decision("none", None, head + "; session %s; " % session.status + fragment, u)
     return Decision(tier, target, head + "; session %s; target %s at %s" % (

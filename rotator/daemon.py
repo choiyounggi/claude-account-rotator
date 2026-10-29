@@ -270,6 +270,7 @@ def usage_summary(u: AccountUsage) -> dict:
         "fetched_at": _iso(u.fetched_at),
         "five_hour": _window(u.five_hour),
         "seven_day": _window(u.seven_day),
+        "fable": _window(u.fable),
     }
 
 
@@ -289,7 +290,8 @@ def usage_from_summary(d: Mapping[str, Any]) -> Optional[AccountUsage]:
         return AccountUsage(account_id=d["account_id"], source=d["source"], fetched_at=fetched,
                             five_hour=_window_from(d.get("five_hour")),
                             seven_day=_window_from(d.get("seven_day")),
-                            error=d.get("error"))
+                            error=d.get("error"),
+                            fable=_window_from(d.get("fable")))
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
 
@@ -537,6 +539,7 @@ def setup_logging(log_dir: str, stderr_is_tty: bool) -> logging.Logger:
 # --- usage cadence ---------------------------------------------------------------------------------------
 
 USAGE_BACKOFF_MAX_S = 300.0
+RETRY_AFTER_MAX_S = 900.0
 RATE_LIMITED_TOKEN = "http_429"
 
 
@@ -578,8 +581,11 @@ class UsageCache:
                 u = AccountUsage(account_id=p.account_id, source="unavailable", fetched_at=now,
                                  error="request_error;cache_missing")
             if rate_limited(u):
-                prev = entry[1] if entry is not None else self._poll_s
-                interval = max(self._poll_s, min(2 * prev, USAGE_BACKOFF_MAX_S))
+                if u.retry_after_s is not None:
+                    interval = max(self._poll_s, min(RETRY_AFTER_MAX_S, u.retry_after_s))
+                else:
+                    prev = entry[1] if entry is not None else self._poll_s
+                    interval = max(self._poll_s, min(2 * prev, USAGE_BACKOFF_MAX_S))
                 log.warning("event=usage_rate_limited account=%s next_s=%d", p.account_id, int(interval))
             else:
                 interval = self._poll_s
@@ -709,7 +715,8 @@ class Daemon:
     def _basic_row(self, s: Session, own: Optional[Profile]) -> dict:
         return {"pid": s.pid, "session_id": s.session_id, "status": s.status,
                 "account_id": own.account_id if own is not None else None, "decision": None,
-                "would_switch": None, "in_flight": False, "in_flight_pid": None, "stuck": False}
+                "would_switch": None, "in_flight": False, "in_flight_pid": None, "stuck": False,
+                "model": s.model}
 
     def _last_switch_locked(self) -> Dict[str, datetime]:
         out: Dict[str, datetime] = {}
@@ -1046,7 +1053,7 @@ def _make_logger() -> logging.Logger:
 def real_deps(cfg: Config) -> Deps:
     """The only constructor of real seams; building it touches nothing."""
     return Deps(discover_profiles=accounts.discover_profiles, fetch_usage=usage.fetch_usage,
-                discover_sessions=sessions.discover_sessions, switch=switcher.switch_session,
+                discover_sessions=sessions.discover_sessions_with_model, switch=switcher.switch_session,
                 make_driver=switcher.OrcaCliDriver, procs=switcher.OsProcessProbe(),
                 read_pointer=pointer.read_selected_host, write_pointer=pointer.set_selected_host,
                 now=_utc_now, monotonic=time.monotonic, spawn=_spawn, wait_stop=_wait_stop, lock=try_lock,

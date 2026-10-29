@@ -60,9 +60,30 @@ rotator switch --session <pid> --to <account-id> [--soft|--hard] [--dry-run]
   daemon snapshot, records and `selected-host` only every `session_poll_s` (default 10 s); the redraws in
   between re-render the last view with the current time, so the `Ns ago` age (time since that account's usage
   was fetched) and the `in 1h12m` reset countdowns still tick every second.
-- An account answered with HTTP 429 is fetched again only after twice its last interval, doubling up to 300 s.
+- An account answered with HTTP 429 waits for the server's `Retry-After` when the answer carries one (seconds or
+  an HTTP-date, RFC 9110 §10.2.3): next fetch after `max(usage_poll_s, min(900 s, Retry-After))`. Without the
+  header it is fetched again only after twice its last interval, doubling up to 300 s.
   It is shown as `cache (rate_limited)`, or `unavailable (rate_limited;…)` when Claude Code has no cached usage;
   the age then shows how old the cached numbers are. Any other answer returns it to `usage_poll_s`.
+
+## Fable usage
+
+- The usage response's `limits[]` entry with `kind` `weekly_scoped` and model display name `Fable` is shown as the
+  account's `fable` window (percent + reset time), from the live answer or Claude Code's cached copy. An account
+  whose data has no such entry has `fable` unknown.
+- A session is a Fable session when its `model` contains `fable` (any case). For a Fable session both the trigger
+  (85 % soft / 95 % hard) and the target choice use `max(5h, 7d, fable)` (a window past its reset time counts 0),
+  and an account with unknown Fable data is never chosen as its target (`fable unknown` in the reason). Every other
+  session, and the `selected-host` pointer correction, still use `max(5h, 7d)` only.
+- Where `model` comes from: the last assistant entry (ignoring Claude Code's `<synthetic>` error turns and subagent
+  entries marked `isSidechain`) within the last 1 MiB of the session's transcript
+  `<config dir>/projects/<cwd with every non-letter/digit as ->/<session id>.jsonl` (if that file is missing, the
+  single matching `projects/*/<session id>.jsonl`; only a regular file is read); when the transcript has no model
+  yet, the `--model` argument the session was started with, minus a trailing alias suffix such as `[1m]`. Only the
+  model id (letters, digits, `._:@-`, at most 64 characters) is kept; the rest of the tail it reads is discarded, never
+  stored or logged. This transcript layout is observed Claude Code behaviour (2.1.x), not a documented
+  interface: if it changes, `model` becomes unknown and the session is treated as non-Fable.
+- `rotator status` shows `fable <pct> (<reset>, in <countdown>)` per account and `model <id> [fable]` on session rows.
 
 ## Status JSON (schema 1)
 
@@ -73,14 +94,17 @@ rotator switch --session <pid> --to <account-id> [--soft|--hard] [--dry-run]
 | `schema` | `1` |
 | `generated_at` | when the document was built |
 | `daemon` | `{running, pid, snapshot_age_s, flags}` from the daemon's last snapshot |
-| `accounts` | one entry per account: `account_id, source, error, fetched_at, five_hour, seven_day` (each window `{utilization, resets_at}` or null), `pointer`, `sessions` (`[{pid, status}]`) |
+| `accounts` | one entry per account: `account_id, source, error, fetched_at, five_hour, seven_day, fable` (each window `{utilization, resets_at}` or null), `pointer`, `sessions` (`[{pid, status, model}]`) |
 | `pointer_account_id` | the account `selected-host` names, or null |
-| `sessions` | managed live sessions: `pid, session_id, status, account_id, decision, would_switch, in_flight, in_flight_pid, stuck, unswitchable, hard_hold_until, excluded, record_state, last_result, hint, post_verify` |
-| `unmanaged_sessions` | `[{pid, session_id, status}]` |
+| `sessions` | managed live sessions: `pid, session_id, status, account_id, model, decision, would_switch, in_flight, in_flight_pid, stuck, unswitchable, hard_hold_until, excluded, record_state, last_result, hint, post_verify` |
+| `unmanaged_sessions` | `[{pid, session_id, status, model}]` |
 | `attention` | `[{pid, session_id, updated_at, record_state, last_result, hint}]`: touched, not-ok switches of gone processes from the last 24 h |
 
 Times are ISO-8601 UTC strings. `relaunch_command` appears only inside `last_result`. No email, account UUID,
-organization, token, argv or environment value is included. Changes within schema 1 are additive only.
+organization, token or environment value is included. The only argv or transcript value included is a session's
+model id (`model`, from the transcript or its `--model` argument, validated as above). Changes within schema 1 are
+additive only.
+`model` is the session's model id or null.
 
 ## Configuration
 
