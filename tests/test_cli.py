@@ -2,15 +2,22 @@ import contextlib
 import copy
 import dataclasses
 import io
+import itertools
 import json
 import logging
 import os
 import plistlib
+import pty
 import re
+import select
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import termios
+import threading
+import time
 import unittest
 from unittest import mock
 from datetime import datetime, timedelta, timezone
@@ -652,7 +659,7 @@ class TestBuildStatus(StatusBase):
         self.assertEqual(doc["schema"], 1)
         self.assertEqual(set(doc["daemon"]), {"running", "pid", "snapshot_age_s", "flags"})
         self.assertEqual(set(doc["accounts"][0]), {"account_id", "source", "error", "fetched_at", "five_hour",
-                                                   "seven_day", "fable", "pointer", "sessions"})
+                                                   "seven_day", "fable", "label", "plan", "pointer", "sessions"})
         self.assertEqual(set(doc["sessions"][0]), {
             "pid", "session_id", "status", "account_id", "decision", "would_switch", "in_flight", "in_flight_pid",
             "stuck", "unswitchable", "hard_hold_until", "excluded", "record_state", "last_result", "hint",
@@ -681,6 +688,21 @@ class TestBuildStatus(StatusBase):
         doc = self.doc()
         self.assertIs(doc["daemon"]["running"], False)
         self.assertEqual(len(self.env.fetches()), 3)
+
+    def test_non_finite_snapshot_utilization_renders_as_unknown(self):
+        self.env.alive_pids = {4242}
+        snap = json.loads(snapshot_doc(self.env, T0 - timedelta(seconds=5)))
+        snap["accounts"][0]["five_hour"]["utilization"] = float("nan")
+        snap["accounts"][0]["seven_day"]["utilization"] = float("inf")
+        text = json.dumps(snap)
+        self.assertIn("NaN", text)  # json.loads accepts the literal, so the snapshot can carry it
+        self.env.files[self.state_path] = text
+        doc = self.doc()
+        lines = render(doc, T0, TZ9, 200)
+        shown = [tuple(cells(l)[3:5]) for l in account_rows(lines)]
+        self.assertEqual(shown.count(("-", "-")), 1, shown)  # the other accounts keep their numbers
+        self.assertTrue(all("33%" in five for five, _ in shown if five != "-"), shown)
+        self.assertEqual(len({cli.display_width(l) for l in tables(lines)[0]}), 1)
 
     def test_partial_snapshot_fetches_only_missing(self):
         self.env.alive_pids = {4242}
@@ -849,6 +871,19 @@ class TestBuildStatus(StatusBase):
         with self.assertRaises(RuntimeError):
             self.doc()
 
+    def test_plan_on_every_account(self):
+        self.env.profiles = [dataclasses.replace(prof(ACC_A), rate_limit_tier="default_claude_max_5x"),
+                             dataclasses.replace(prof(ACC_B), rate_limit_tier="default_raven"), prof(ACC_C)]
+        doc = self.doc()
+        self.assertEqual([a["plan"] for a in doc["accounts"]], ["Max5x", "Team", None])
+        self.assertEqual([a["label"] for a in doc["accounts"]], ["user"] * 3)  # the label itself never carries plan
+
+    def test_label_on_every_account(self):
+        self.env.profiles = [prof(ACC_A), dataclasses.replace(prof(ACC_B), email=None, display_name="홍길동"),
+                             dataclasses.replace(prof(ACC_C), email=None, display_name=None)]
+        doc = self.doc()
+        self.assertEqual([a["label"] for a in doc["accounts"]], ["user", "홍길동", "00000000"])
+
     def test_no_secrets(self):
         self.env.sessions = [sess(101, ACC_A)]
         self.env.pointer_text = prof(ACC_A).home
@@ -856,6 +891,143 @@ class TestBuildStatus(StatusBase):
         for secret in SECRETS:
             self.assertNotIn(secret, text)
         self.assertIn(ACC_A, text)
+
+
+# --- dashboard cells -------------------------------------------------------------------------------------
+
+
+class TestWidth(unittest.TestCase):
+    def test_display_width(self):
+        self.assertEqual(cli.display_width(""), 0)
+        self.assertEqual(cli.display_width("abc"), 3)
+        self.assertEqual(cli.display_width("홍길동"), 6)
+        self.assertEqual(cli.display_width("ｶ"), 1)  # halfwidth katakana is narrow
+        self.assertEqual(cli.display_width("Ａ"), 2)  # fullwidth latin
+        self.assertEqual(cli.display_width("é"), 1)  # combining acute adds no column
+        self.assertEqual(cli.display_width("a​b"), 2)  # zero-width space (Cf)
+
+    def test_ambiguous_flag(self):
+        for glyph in ("─", "│", "┼", "█", "▒", "…", "·", "≥"):
+            with self.subTest(glyph=glyph):
+                self.assertEqual(cli.display_width(glyph), 1)
+                self.assertEqual(cli.display_width(glyph, ambiguous_wide=True), 2)
+        for glyph in ("↻", "-", "|", "#", "."):
+            with self.subTest(glyph=glyph):
+                self.assertEqual(cli.display_width(glyph, ambiguous_wide=True), 1)
+
+    def test_fit_pads_and_cuts_by_columns(self):
+        self.assertEqual(cli.fit("ab", 4), "ab  ")
+        self.assertEqual(cli.fit("ab", 4, align="right"), "  ab")
+        self.assertEqual(cli.fit("abcd", 4), "abcd")
+        self.assertEqual(cli.fit("abcdef", 4), "abc…")
+        self.assertEqual(cli.fit("홍길동", 6), "홍길동")
+        self.assertEqual(cli.fit("홍길동", 5), "홍길…")
+        self.assertEqual(cli.fit("홍길동", 4), "홍… ")  # a wide char never straddles the edge
+        self.assertEqual(cli.fit("abcdef", 4, ell="~"), "abc~")
+        self.assertEqual(cli.fit("abcdef", 4, amb=True), "ab…")
+        self.assertEqual(cli.display_width(cli.fit("abcdef", 4, amb=True), ambiguous_wide=True), 4)
+
+    def test_fit_edges(self):
+        self.assertEqual(cli.fit("", 3), "   ")
+        self.assertEqual(cli.fit("abc", 0), "")
+        self.assertEqual(cli.fit("abc", -2), "")
+        self.assertEqual(cli.fit("홍", 1), "…")
+        self.assertEqual(cli.fit("홍", 1, ell=""), " ")
+        self.assertEqual(cli.fit("ab", 1), "…")
+        self.assertEqual(cli.fit("ab", 1, amb=True), "a")  # a 2-column ellipsis cannot fit in one column
+        self.assertEqual(cli.clip("abcdef", 3, ell=""), "abc")
+        self.assertEqual(cli.clip("ab", 5), "ab")
+
+    def test_fit_width_property(self):
+        samples = ("", "a", "홍길동 user", "─│█▒…", "éé", "가a나b다c")
+        for s in samples:
+            for w in range(0, 12):
+                for amb in (False, True):
+                    with self.subTest(s=s, w=w, amb=amb):
+                        self.assertEqual(cli.display_width(cli.fit(s, w, amb=amb), ambiguous_wide=amb), w)
+
+
+class TestLabel(unittest.TestCase):
+    def test_fallback_chain(self):
+        p = prof(ACC_A)
+        self.assertEqual(cli.account_label(p), "user")
+        self.assertEqual(cli.account_label(dataclasses.replace(p, email=None, display_name="홍길동")), "홍길동")
+        self.assertEqual(cli.account_label(dataclasses.replace(p, email="", display_name="홍길동")), "홍길동")
+        self.assertEqual(cli.account_label(dataclasses.replace(p, email="@example.com", display_name="Kim")), "Kim")
+        self.assertEqual(cli.account_label(dataclasses.replace(p, email=None, display_name=None)), "00000000")
+        self.assertEqual(cli.account_label(dataclasses.replace(p, email=None, display_name="  ")), "00000000")
+
+    def test_local_part_only(self):
+        p = dataclasses.replace(prof(ACC_A), email="first.last+tag@example.com")
+        self.assertEqual(cli.account_label(p), "first.last+tag")
+        self.assertEqual(cli.account_label(dataclasses.replace(p, email="a@b@example.com")), "a")
+
+    def test_control_chars_removed(self):
+        p = dataclasses.replace(prof(ACC_A), email="us\x1b[31mer\n@example.com")
+        self.assertEqual(cli.account_label(p), "us[31mer")
+        q = dataclasses.replace(prof(ACC_A), email=None, display_name="\x07‎")
+        self.assertEqual(cli.account_label(q), "00000000")
+
+
+class TestCells(unittest.TestCase):
+    def test_remaining_text(self):
+        cases = [(-5, "<1m"), (0, "<1m"), (59.9, "<1m"), (60, "1m"), (3599, "59m"), (3600, "1h"), (4860, "1h21m"),
+                 (4890, "1h21m"), (86399, "23h59m"), (86400, "1d"), (90000, "1d1h"), (6 * 86400 + 86399, "6d23h")]
+        for secs, want in cases:
+            with self.subTest(secs=secs):
+                self.assertEqual(cli.remaining_text(secs), want)
+
+    def test_age_text(self):
+        cases = [(-3, "0초 전"), (0, "0초 전"), (59.9, "59초 전"), (60, "1분 전"), (3599, "59분 전"),
+                 (3600, "1시간 전"), (86399, "23시간 전"), (86400, "1일 전"), (3 * 86400 + 5, "3일 전")]
+        for secs, want in cases:
+            with self.subTest(secs=secs):
+                self.assertEqual(cli.age_text(secs), want)
+
+    def test_reason_text(self):
+        cases = [("token_expired;cache_missing", "토큰 만료·캐시 없음"), ("request_error;cache_missing", "요청 실패·캐시 없음"),
+                 ("http_429", "호출 제한"), ("http_429;cache_missing", "호출 제한·캐시 없음"), ("http_500", "HTTP 500"),
+                 ("token_missing", "토큰 없음"), ("network;cache_bad_json", "연결 실패·캐시 손상"),
+                 ("timeout", "연결 실패"), ("bad_shape", "응답 이상"), ("weird_thing", "확인 불가"),
+                 ("network;timeout", "연결 실패"), ("", ""), (None, "")]
+        for err, want in cases:
+            with self.subTest(err=err):
+                self.assertEqual(cli.reason_text(err), want)
+        self.assertEqual(cli.reason_text("token_expired;cache_missing", "/"), "토큰 만료/캐시 없음")
+
+    def test_bar_proportional_and_capped(self):
+        g = cli.GLYPHS_UNICODE
+        cases = [(0, "▒" * 9), (10.9, "▒" * 9), (11.2, "█" + "▒" * 8), (45, "████▒▒▒▒▒"), (89.4, "████████▒"),
+                 (99.9, "████████▒"), (100, "█" * 9), (104, "█" * 9), (-3, "▒" * 9)]
+        for util, want in cases:
+            with self.subTest(util=util):
+                self.assertEqual(cli._bar(util, 9, g), want)
+        self.assertEqual(cli._bar(50, 4, cli.GLYPHS_ASCII), "##..")
+
+    def test_bar_width_same_for_any_fill(self):
+        for g in (cli.GLYPHS_UNICODE, cli.GLYPHS_ASCII):
+            for amb in (False, True):
+                widths = {cli.display_width(cli._bar(u, 9, g), ambiguous_wide=amb) for u in (0, 50, 100)}
+                self.assertEqual(len(widths), 1, (g.fill, amb))
+                self.assertEqual(cli.display_width(g.fill, ambiguous_wide=amb),
+                                 cli.display_width(g.empty, ambiguous_wide=amb))
+
+    def test_pct_text(self):
+        for util, want in ((0, "  0%"), (5.99, "  5%"), (89.4, " 89%"), (100, "100%"), (-1, "  0%")):
+            with self.subTest(util=util):
+                self.assertEqual(cli._pct_text(util), want)
+
+    def test_window_state(self):
+        w = {"utilization": 42.0, "resets_at": (T0 + timedelta(hours=1)).isoformat()}
+        self.assertEqual(cli._window_state(w, T0), (42.0, 3600.0))
+        self.assertEqual(cli._window_state(w, T0 + timedelta(hours=1)), (0.0, None))  # reset passed: 0%, no ↻
+        self.assertEqual(cli._window_state(dict(w, resets_at=None), T0), (42.0, None))
+        self.assertEqual(cli._window_state(dict(w, resets_at="garbage"), T0), (42.0, None))
+        self.assertIsNone(cli._window_state(None, T0))
+        self.assertIsNone(cli._window_state({"utilization": "x"}, T0))
+        self.assertIsNone(cli._window_state({"utilization": True}, T0))
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            self.assertIsNone(cli._window_state(dict(w, utilization=bad), T0), bad)
 
 
 # --- Task 12 ---------------------------------------------------------------------------------------------
@@ -868,12 +1040,12 @@ def render_doc():
         "schema": 1, "generated_at": T0_ISO,
         "daemon": {"running": True, "pid": 4242, "snapshot_age_s": 3.0, "flags": {"dry_run": False}},
         "accounts": [
-            {"account_id": ACC_A, "source": "live", "error": None,
+            {"account_id": ACC_A, "label": "alice", "source": "live", "error": None,
              "fetched_at": (T0 - timedelta(seconds=12)).isoformat(),
              "five_hour": {"utilization": 42.0, "resets_at": "2026-10-28T03:00:00+00:00"},
              "seven_day": {"utilization": 10.0, "resets_at": (T0 + timedelta(hours=1, minutes=12)).isoformat()},
              "pointer": True, "sessions": [{"pid": 101, "status": "idle"}]},
-            {"account_id": ACC_B, "source": "unavailable", "error": "token_expired;cache_missing",
+            {"account_id": ACC_B, "label": "bob", "source": "unavailable", "error": "token_expired;cache_missing",
              "fetched_at": T0_ISO, "five_hour": None, "seven_day": None, "pointer": False, "sessions": []},
         ],
         "pointer_account_id": ACC_A,
@@ -891,157 +1063,513 @@ def render_doc():
     }
 
 
+def win(pct, delta):
+    return {"utilization": pct, "resets_at": (T0 + delta).isoformat()}
+
+
+RELAUNCH_LINES = {"cd /x && claude --resume y", "cd /y && claude"}  # render_doc's commands: printed whole
+
+
+def dashboard_doc():
+    """Every row kind the table draws: 89% / 100% live, cache, unavailable, Korean and over-long labels."""
+    doc = render_doc()
+    acc = lambda n: "00000000-0000-0000-0000-0000000000%02d" % n  # noqa: E731
+    doc["accounts"] = [
+        {"account_id": acc(1), "label": "alice", "plan": "Max5x", "source": "live", "error": None,
+         "fetched_at": (T0 - timedelta(seconds=3)).isoformat(), "five_hour": win(89.4, timedelta(hours=1, minutes=21)),
+         "seven_day": win(45.0, timedelta(days=6)), "fable": win(25.0, timedelta(days=6)), "pointer": True,
+         "sessions": [{"pid": n, "status": "idle"} for n in range(9)]},
+        {"account_id": acc(2), "label": "bob", "plan": "Team", "source": "live", "error": None,
+         "fetched_at": (T0 - timedelta(seconds=3)).isoformat(), "five_hour": win(100.0, timedelta(minutes=21)),
+         "seven_day": win(37.0, timedelta(days=6)), "fable": None, "pointer": False, "sessions": []},
+        {"account_id": acc(3), "label": "carol", "source": "cache", "error": "http_429",
+         "fetched_at": (T0 - timedelta(days=3)).isoformat(), "five_hour": win(70.0, timedelta(hours=-2)),
+         "seven_day": win(28.0, timedelta(days=2)), "fable": None, "pointer": False, "sessions": []},
+        {"account_id": acc(4), "label": "dave", "source": "unavailable", "error": "token_expired;cache_missing",
+         "fetched_at": T0_ISO, "five_hour": None, "seven_day": None, "fable": None, "pointer": False, "sessions": []},
+        {"account_id": acc(5), "label": "홍길동", "source": "live", "error": None,
+         "fetched_at": (T0 - timedelta(minutes=2)).isoformat(), "five_hour": win(0.0, timedelta(hours=4)),
+         "seven_day": win(96.0, timedelta(days=1)), "fable": win(100.0, timedelta(days=1)), "pointer": False,
+         "sessions": []},
+        {"account_id": acc(6), "label": "a-very-long-account-name-indeed", "source": "live", "error": None,
+         "fetched_at": (T0 - timedelta(seconds=40)).isoformat(), "five_hour": win(12.0, timedelta(hours=2)),
+         "seven_day": win(3.0, timedelta(days=3)), "fable": None, "pointer": False, "sessions": []},
+    ]
+    return doc
+
+
+BORDERS = {False: set("│┌┬┐├┼┤└┴┘"), True: set("|+")}
+SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def tables(lines, ascii=False):
+    """Consecutive runs of boxed lines (the accounts table, then the sessions table)."""
+    out, cur = [], []
+    for line in lines:
+        if line[:1] in BORDERS[ascii]:
+            cur.append(line)
+        elif cur:
+            out.append(cur)
+            cur = []
+    if cur:
+        out.append(cur)
+    return out
+
+
+def border_cols(line, amb, ascii=False):
+    cols, col = [], 0
+    for ch in SGR.sub("", line):
+        if ch in BORDERS[ascii]:
+            cols.append(col)
+        col += cli.display_width(ch, ambiguous_wide=amb)
+    return cols
+
+
+def cells(line, ascii=False):
+    return [c.strip() for c in SGR.sub("", line).split("|" if ascii else "│")[1:-1]]
+
+
+def account_rows(lines, ascii=False):
+    """Data rows of the accounts table, in document order."""
+    return tables(lines, ascii)[0][3:-1]
+
+
 class TestRender(unittest.TestCase):
-    def lines(self, doc=None, now=T0, width=200):
-        return render(render_doc() if doc is None else doc, now, TZ9, width)
+    def lines(self, doc=None, now=T0, width=200, **kw):
+        return render(render_doc() if doc is None else doc, now, TZ9, width, **kw)
 
-    def line_for(self, lines, aid):
-        return next(l for l in lines if aid in l and l[1] == " " and l[2:].startswith(aid))
+    def row(self, lines, label):
+        return next(cells(l) for l in account_rows(lines) if cells(l)[1] == label)
 
-    def test_local_time(self):
-        self.assertTrue(any("10-28 12:00" in l for l in self.lines()))
+    def session_row(self, lines, pid):
+        return next(cells(l) for l in tables(lines)[1][3:-1] if cells(l)[0] == str(pid))
+
+    def test_title_line(self):
+        first = self.lines()[0]
+        self.assertTrue(first.startswith("Claude 계정 사용량"))
+        self.assertTrue(first.endswith("21:00:00  데몬: 켜짐 (pid 4242)"), first)
+        doc = render_doc()
+        doc["daemon"]["flags"] = {"dry_run": True}
+        self.assertTrue(self.lines(doc)[0].endswith("데몬: 켜짐 (pid 4242) 드라이런"))
+        doc["daemon"] = {"running": False, "pid": None, "snapshot_age_s": None, "flags": None}
+        self.assertTrue(self.lines(doc)[0].endswith("21:00:00  데몬: 꺼짐"))
+        top = tables(self.lines())[0][0]
+        self.assertEqual(cli.display_width(first), cli.display_width(top))  # the clock sits at the table's edge
+
+    def test_header_and_legend(self):
+        lines = self.lines()
+        self.assertEqual(cells(tables(lines)[0][1]), ["", "계정", "플랜", "5시간", "주간", "페이블", "세션", "갱신"])
+        self.assertEqual(cells(tables(lines)[1][1]), ["PID", "계정", "상태", "모델", "최근 전환 결과"])
+        self.assertIn("* = Orca 선택 계정   노랑 ≥85%  빨강 ≥95%", lines)
+        self.assertIn("* = Orca 선택 계정   노랑 ≥70%  빨강 ≥90.5%", self.lines(soft_pct=70.0, hard_pct=90.5))
 
     def test_pointer_marker_only_on_pointer(self):
         lines = self.lines()
-        self.assertTrue(self.line_for(lines, ACC_A).startswith("* "))
-        self.assertTrue(self.line_for(lines, ACC_B).startswith("  "))
+        self.assertEqual(self.row(lines, "alice")[0], "*")
+        self.assertEqual(self.row(lines, "bob")[0], "")
+
+    def test_label_fallback_in_render(self):
+        doc = render_doc()
+        del doc["accounts"][1]["label"]
+        self.assertEqual([cells(l)[1] for l in account_rows(self.lines(doc))], ["00000000", "alice"])  # sorted by label
+        doc["accounts"][0]["label"] = "a\x1b[31mlice"
+        self.assertNotIn("\x1b", "".join(self.lines(doc)))
+
+    def test_label_truncated_to_18(self):
+        doc = render_doc()
+        doc["accounts"][0]["label"] = "a-very-long-account-name-indeed"
+        self.assertEqual(self.row(self.lines(doc), "a-very-long-accou…")[1], "a-very-long-accou…")
+        self.assertEqual(cli.display_width("a-very-long-accou…"), 18)
 
     def test_unavailable_with_error(self):
-        self.assertIn("unavailable (token_expired;cache_missing)", self.line_for(self.lines(), ACC_B))
+        row = self.row(self.lines(), "bob")
+        self.assertEqual(row[2:], ["-", "-  (토큰 만료·캐시 없음)", "-", "-", "0", "-"])
 
-    def test_header_count(self):
-        first = self.lines()[0]
-        self.assertTrue(first.startswith("accounts: 2"))
-        self.assertIn("running (pid 4242)", first)
-        self.assertIn("at 21:00:00", first)
+    def test_live_cell_bar_percent_remaining(self):
+        doc = render_doc()
+        doc["accounts"][0]["five_hour"] = win(89.4, timedelta(hours=1, minutes=21, seconds=30))
+        doc["accounts"][0]["fable"] = win(25.0, timedelta(days=5))
+        row = self.row(self.lines(doc), "alice")
+        self.assertEqual(row[3], "████████▒  89% ↻1h21m")
+        self.assertEqual(row[4], "▒▒▒▒▒▒▒▒▒  10% ↻1h12m")
+        self.assertEqual(row[5], "█▒▒▒  25%")  # the fable cell never shows a reset
+        self.assertEqual(row[6], "1")
+
+    def test_countdown(self):
+        row = self.row(self.lines(), "alice")
+        self.assertEqual(row[3], "▒▒▒▒▒▒▒▒▒   0%")  # the 5h window reset at 03:00 UTC: 0% and no ↻
+        doc = render_doc()
+        doc["accounts"][0]["five_hour"]["resets_at"] = None
+        self.assertEqual(self.row(self.lines(doc), "alice")[3], "███▒▒▒▒▒▒  42%")  # floor(42 * 9 / 100) = 3 cells
+        at = self.row(self.lines(now=T0 + timedelta(hours=1, minutes=12)), "alice")
+        self.assertEqual(at[4], "▒▒▒▒▒▒▒▒▒   0%")
+        early = self.row(self.lines(now=T0 + timedelta(hours=1, minutes=11, seconds=30)), "alice")
+        self.assertEqual(early[4], "▒▒▒▒▒▒▒▒▒  10% ↻<1m")
+
+    def test_age_from_now(self):
+        self.assertEqual(self.row(self.lines(), "alice")[7], "12초 전")
+        later = self.lines(now=T0 + timedelta(seconds=5))
+        self.assertEqual(self.row(later, "alice")[7], "17초 전")
+        self.assertEqual(self.row(later, "bob")[7], "-")
+        doc = render_doc()
+        doc["accounts"][0]["fetched_at"] = (T0 + timedelta(seconds=3)).isoformat()
+        self.assertEqual(self.row(self.lines(doc), "alice")[7], "0초 전")
+        doc["accounts"][0]["fetched_at"] = None
+        self.assertEqual(self.row(self.lines(doc), "alice")[7], "-")
+
+    def test_rate_limited_label(self):
+        cases = [({"source": "cache", "error": "http_429", "fetched_at": (T0 - timedelta(minutes=10)).isoformat(),
+                   "five_hour": win(50.0, timedelta(hours=1))},
+                  "(캐시)     50% ↻1h", "10분 전 (호출 제한)"),
+                 ({"source": "unavailable", "error": "http_429;cache_missing"}, "-  (호출 제한·캐시 없음)", "-"),
+                 ({"source": "cache", "error": "http_500", "fetched_at": T0_ISO, "five_hour": win(5.0, timedelta(0))},
+                  "(캐시)      0%", "0초 전 (HTTP 500)")]
+        for patch, five, age in cases:
+            with self.subTest(patch=patch):
+                doc = render_doc()
+                doc["accounts"][1].update(patch)
+                row = self.row(self.lines(doc), "bob")
+                self.assertEqual((row[3], row[7]), (five, age))
+
+    def test_fable_column(self):
+        doc = render_doc()
+        doc["accounts"][0]["fable"] = win(100.0, timedelta(days=5))
+        lines = self.lines(doc)
+        self.assertEqual(self.row(lines, "alice")[5], "████ 100%")
+        self.assertEqual(self.row(lines, "bob")[5], "-")
+        doc["accounts"][1]["fable"] = None
+        self.assertEqual(self.row(self.lines(doc), "bob")[5], "-")
 
     def test_blocks_and_relaunch(self):
         lines = self.lines()
-        for block in ("unmanaged:", "sessions:", "attention:"):
-            self.assertIn(block, lines)
-        self.assertIn("    relaunch: cd /x && claude --resume y", lines)
-        self.assertIn("    relaunch: cd /y && claude", lines)
-        self.assertTrue(any(l.startswith("    hint: ") for l in lines))
-        self.assertTrue(any("decision hard -> " + ACC_B in l and "last wait_exit/exit_timeout/exited" in l
-                            for l in lines))
+        self.assertEqual(self.session_row(lines, 101),
+                         ["101", "alice", "idle", "-", "decision hard -> bob, last wait_exit/exit_timeout/exited"])
+        self.assertEqual(self.session_row(lines, 555), ["555", "(관리 밖)", "busy", "-", "-"])
+        self.assertEqual(lines[lines.index("  pid 101 재실행:") + 1], "cd /x && claude --resume y")
+        self.assertIn("주의 (최근 24시간 실패한 전환)", lines)
+        self.assertIn("  pid 777 final exited", lines)
+        self.assertIn("  pid 777 힌트: look", lines)
+        self.assertEqual(lines[lines.index("  pid 777 재실행:") + 1], "cd /y && claude")
+        self.assertTrue(any(l.startswith("  pid 101 힌트: Claude Code exited") for l in lines))
+
+    def test_long_detail_lines_wrap_not_cut(self):
+        hint = STATE_HINTS["exited"]
+        lines = self.lines(width=60)
+        start = next(i for i, l in enumerate(lines) if l.startswith("  pid 101 힌트: "))
+        block = [lines[start]] + list(itertools.takewhile(lambda l: l.startswith("      "), lines[start + 1:]))
+        self.assertGreater(len(block), 1)
+        for l in block:
+            self.assertLessEqual(cli.display_width(l), 60)
+        joined = block[0][len("  pid 101 힌트: "):] + "".join(l[6:] for l in block[1:])
+        self.assertEqual(joined, hint)
+        self.assertEqual(lines[lines.index("  pid 101 재실행:") + 1], "cd /x && claude --resume y")
+
+    def test_relaunch_command_is_one_unbroken_line(self):
+        cmd = ("cd '/Users/user/work/한글 폴더' && env CLAUDE_CONFIG_DIR='/Users/user/.orca/profiles/"
+               "00000000-0000-0000-0000-000000000001' claude --resume 00000000-0000-0000-0000-00000000abcd")
+        doc = render_doc()
+        doc["sessions"][0]["last_result"]["relaunch_command"] = cmd
+        for width in (120, 60, 20, 1):
+            with self.subTest(width=width):
+                lines = self.lines(doc, width=width)
+                self.assertGreater(cli.display_width(cmd), width)
+                self.assertEqual(lines.count(cmd), 1)  # whole, not wrapped, indented or cut
+                self.assertFalse(any(l.startswith("      ") and l.strip() in cmd for l in lines), lines)
+                for l in lines:
+                    if l != cmd and l not in RELAUNCH_LINES:
+                        self.assertLessEqual(cli.display_width(l), max(1, width), l)
+
+    def test_no_sessions_no_sessions_table(self):
+        doc = render_doc()
+        doc["sessions"], doc["unmanaged_sessions"], doc["attention"] = [], [], []
+        lines = self.lines(doc)
+        self.assertEqual(len(tables(lines)), 1)
+        self.assertNotIn("주의 (최근 24시간 실패한 전환)", lines)
 
     def test_session_flags(self):
         doc = render_doc()
         doc["sessions"][0].update(in_flight=True, in_flight_pid=101, stuck=True, unswitchable="no_argv",
                                   hard_hold_until="2026-10-28T12:05:00+00:00", record_state="in_progress",
                                   would_switch={"action": "soft", "target_account_id": ACC_C}, post_verify="ok")
-        line = next(l for l in self.lines(doc, width=1000) if l.startswith("  pid 101"))
+        res = self.session_row(self.lines(doc, width=1000), 101)[4]
         for part in ("in flight (pid 101)", "STUCK", "unswitchable (no_argv)", "hard hold until 21:05",
-                     "switch in progress", "would soft -> " + ACC_C, "verify ok"):
-            self.assertIn(part, line)
+                     "switch in progress", "would soft -> 00000000", "verify ok", "decision hard -> bob"):
+            self.assertIn(part, res)
+
+    def test_model_parts(self):
+        doc = render_doc()
+        doc["sessions"][0]["model"] = "claude-fable-5-1"
+        doc["unmanaged_sessions"][0]["model"] = "claude-opus-5-5"
+        lines = self.lines(doc)
+        self.assertEqual(self.session_row(lines, 101)[3], "claude-fable-5-1")
+        self.assertEqual(self.session_row(lines, 555)[3], "claude-opus-5-5")
+        doc["sessions"][0]["model"] = None
+        self.assertEqual(self.session_row(self.lines(doc), 101)[3], "-")
 
     def test_width_boundary(self):
-        for width in (60, 1, 0):
+        for width in (60, 20, 1, 0, -5):
             with self.subTest(width=width):
-                lines = self.lines(width=width)
+                lines = self.lines(dashboard_doc(), width=width)
                 self.assertTrue(lines)
                 for l in lines:
-                    self.assertLessEqual(len(l), max(1, width))
+                    if l not in RELAUNCH_LINES:
+                        self.assertLessEqual(cli.display_width(l), max(1, width), l)
+                self.assertTrue(RELAUNCH_LINES <= set(lines))
 
     def test_empty(self):
         for doc in (None, dict(render_doc(), accounts=[])):
             lines = render(doc, T0, TZ9, 200)
-            self.assertTrue(lines[0].startswith("accounts: 0"))
-            self.assertTrue(any("no accounts" in l for l in lines))
+            self.assertTrue(lines[0].startswith("Claude 계정 사용량"))
+            self.assertIn("계정 없음 (Orca 프로필 폴더 설정과 데몬 실행 여부를 확인하세요)", lines)
+            self.assertEqual(len(lines), 2)
 
     def test_pure(self):
-        doc = render_doc()
+        doc = dashboard_doc()
         before = copy.deepcopy(doc)
-        self.assertEqual(render(doc, T0, TZ9, 200), render(doc, T0, TZ9, 200))
+        for kw in ({}, {"color": True}, {"ascii": True, "ambiguous_wide": True}):
+            self.assertEqual(render(doc, T0, TZ9, 200, **kw), render(doc, T0, TZ9, 200, **kw))
         self.assertEqual(doc, before)
 
-    def test_age_from_now(self):
-        self.assertIn("live 12s ago", self.line_for(self.lines(), ACC_A))
-        later = self.lines(now=T0 + timedelta(seconds=5))
-        self.assertIn("live 17s ago", self.line_for(later, ACC_A))
-        self.assertNotIn("ago", self.line_for(later, ACC_B))
+    def test_ascii_mode(self):
+        lines = self.lines(dashboard_doc(), ascii=True)
+        for l in lines:
+            self.assertTrue(all(ch.isascii() or "가" <= ch <= "힣" for ch in l), l)
+        row = next(cells(l, ascii=True) for l in account_rows(lines, ascii=True) if cells(l, ascii=True)[1] == "alice")
+        self.assertEqual(row[3], "########.  89% (1h21m)")
+        self.assertIn("노랑 >=85%", "\n".join(lines))
+        self.assertTrue(any("(토큰 만료/캐시 없음)" in l for l in lines))
 
-    def test_countdown(self):
-        a = self.line_for(self.lines(), ACC_A)
-        self.assertIn("5h 42.0% (10-28 12:00, due)", a)
-        self.assertIn("7d 10.0% (10-28 22:12, in 1h12m)", a)
-        doc = render_doc()
-        doc["accounts"][0]["five_hour"]["resets_at"] = None
-        self.assertIn("42.0% (-, -)", self.line_for(self.lines(doc), ACC_A))
-        at = self.line_for(self.lines(now=T0 + timedelta(hours=1, minutes=12)), ACC_A)
-        self.assertIn("(10-28 22:12, due)", at)
 
-    def test_dur_boundaries(self):
-        cases = [(0, "0s"), (59.9, "59s"), (60, "1m00s"), (3599, "59m59s"), (3600, "1h00m"), (86399, "23h59m"),
-                 (86400, "1d00h"), (-5, "0s")]
-        for secs, want in cases:
-            self.assertEqual(cli._dur(secs), want, secs)
-        doc = render_doc()
-        doc["accounts"][0]["fetched_at"] = (T0 + timedelta(seconds=3)).isoformat()
-        self.assertIn("live 0s ago", self.line_for(self.lines(doc), ACC_A))
+class TestAlignment(unittest.TestCase):
+    def check(self, lines, amb, ascii, width):
+        blocks = tables(lines, ascii)
+        self.assertEqual(len(blocks), 2)
+        for block in blocks:
+            hard_cut = block[0][-1] not in "┐+"
+            if width >= 120:
+                self.assertFalse(hard_cut, "\n".join(block))
+            if hard_cut:
+                continue
+            widths = {cli.display_width(SGR.sub("", l), ambiguous_wide=amb) for l in block}
+            self.assertEqual(len(widths), 1, "\n".join(block))
+            self.assertLessEqual(widths.pop(), width)
+            cols = {tuple(border_cols(l, amb, ascii)) for l in block}
+            self.assertEqual(len(cols), 1, "\n".join(block))
+        for l in lines:
+            self.assertLessEqual(cli.display_width(SGR.sub("", l), ambiguous_wide=amb), width, l)
 
-    def test_rate_limited_label(self):
-        cases = [({"source": "cache", "error": "http_429", "fetched_at": (T0 - timedelta(minutes=10)).isoformat()},
-                  "cache (rate_limited) 10m00s ago", True),
-                 ({"source": "unavailable", "error": "http_429;cache_missing"},
-                  "unavailable (rate_limited;cache_missing)", False),
-                 ({"source": "cache", "error": "http_500"}, "cache (http_500)", True)]
-        for patch, want, has_age in cases:
-            with self.subTest(patch=patch):
+    def test_every_line_same_width_and_borders(self):
+        for amb in (False, True):
+            for ascii in (False, True):
+                for width in (200, 160, 120, 105, 100, 80, 65, 50):
+                    for color in (False, True):
+                        with self.subTest(amb=amb, ascii=ascii, width=width, color=color):
+                            lines = render(dashboard_doc(), T0, TZ9, width, ambiguous_wide=amb, ascii=ascii,
+                                           color=color)
+                            self.check(lines, amb, ascii, width)
+
+    def test_rule_glyphs_fill_cells_exactly_when_wide(self):
+        lines = render(dashboard_doc(), T0, TZ9, 300, ambiguous_wide=True)
+        top, header = tables(lines)[0][:2]
+        self.assertEqual(border_cols(top, True), border_cols(header, True))
+        self.assertEqual(cli.display_width(top, ambiguous_wide=True) % 2, 0)
+
+
+class TestFallback(unittest.TestCase):
+    def level(self, lines):
+        block = tables(lines)[0]
+        head = cells(block[1])
+        rows = "".join(block[3:-1])
+        if "█" in rows or "▒" in rows:
+            return 0
+        if "플랜" in head:
+            return 1
+        if "페이블" in head:
+            return 2
+        if "갱신" in head:
+            return 3
+        return 4
+
+    def test_degradation_order(self):
+        doc = dashboard_doc()
+        cases = [(130, 0), (115, 1), (105, 2), (100, 3), (80, 4), (65, 4)]
+        for width, want in cases:
+            with self.subTest(width=width):
+                lines = render(doc, T0, TZ9, width)
+                self.assertEqual(self.level(lines), want)
+                for l in lines:
+                    self.assertLessEqual(cli.display_width(l), width)
+
+    def test_level_never_decreases_as_width_shrinks(self):
+        doc = dashboard_doc()
+        levels = [self.level(render(doc, T0, TZ9, w)) for w in range(160, 39, -1)]
+        self.assertEqual(levels, sorted(levels))
+        self.assertEqual((levels[0], levels[-1]), (0, 4))
+
+    def test_full_table_kept_when_it_fits_exactly(self):
+        doc = dashboard_doc()
+        full = cli.display_width(tables(render(doc, T0, TZ9, 500))[0][0])
+        self.assertEqual(self.level(render(doc, T0, TZ9, full)), 0)
+        self.assertEqual(self.level(render(doc, T0, TZ9, full - 1)), 1)
+
+    def test_label_shrinks_after_columns_are_gone(self):
+        doc = dashboard_doc()
+        lines = render(doc, T0, TZ9, 65)
+        self.assertEqual(self.level(lines), 4)
+        labels = [cells(l)[1] for l in account_rows(lines)]
+        self.assertTrue(any(lab.endswith("…") for lab in labels), labels)
+        self.assertIn("alice", labels)
+        widths = {cli.display_width(l) for l in tables(lines)[0]}
+        self.assertEqual(len(widths), 1)
+
+    def test_hard_cut_when_nothing_fits(self):
+        lines = render(dashboard_doc(), T0, TZ9, 20)
+        for l in set(lines) - RELAUNCH_LINES:
+            self.assertLessEqual(cli.display_width(l), 20)
+        self.assertTrue(all(l.startswith("│") or l.startswith("┌") or l.startswith("├") or l.startswith("└")
+                            for l in tables(lines)[0]))
+
+    def test_sessions_result_shrinks(self):
+        lines = render(render_doc(), T0, TZ9, 60)
+        res = cells(tables(lines)[1][3])[4]
+        self.assertTrue(res.endswith("…"), res)
+        self.assertEqual(len({cli.display_width(l) for l in tables(lines)[1]}), 1)
+
+
+ID_A1 = "aaaa1111-0000-0000-0000-000000000000"
+ID_B2 = "bbbb2222-0000-0000-0000-000000000000"
+ID_C3 = "cccc3333-0000-0000-0000-000000000000"
+
+
+def plan_doc(rows):
+    """Accounts (account_id, label, plan, pointer) with the same live numbers; one session per account."""
+    doc = render_doc()
+    doc["accounts"] = [
+        {"account_id": aid, "label": label, "plan": plan, "source": "live", "error": None,
+         "fetched_at": T0_ISO, "five_hour": win(30.0, timedelta(hours=2)), "seven_day": win(20.0, timedelta(days=2)),
+         "fable": None, "pointer": False, "sessions": []} for aid, label, plan in rows]
+    doc["sessions"] = [dict(doc["sessions"][0], pid=100 + i, account_id=aid,
+                            decision={"action": "soft", "target_account_id": rows[-1 - i][0]}, last_result=None)
+                       for i, (aid, _, _) in enumerate(rows)]
+    doc["unmanaged_sessions"], doc["attention"] = [], []
+    return doc
+
+
+class TestPlan(unittest.TestCase):
+    def rows(self, doc, width=200, **kw):
+        return [cells(l, kw.get("ascii", False)) for l in account_rows(render(doc, T0, TZ9, width, **kw),
+                                                                         kw.get("ascii", False))]
+
+    def test_plan_tag(self):
+        cases = [("default_claude_max_5x", "Max5x"), ("default_claude_max_20x", "Max20x"), ("default_raven", "Team"),
+                 ("default_enterprise_plus", "enterpri"), ("pro", "pro"), ("default_", None), ("", None),
+                 (None, None), (7, None), ("\x1b[1mdefault_raven", "[1mdefau")]
+        for tier, want in cases:
+            with self.subTest(tier=tier):
+                self.assertEqual(cli.plan_tag(tier), want)
+
+    def test_duplicate_email_two_tiers_distinct_rows(self):
+        rows = self.rows(plan_doc([(ID_A1, "user", "Max5x"), (ID_B2, "user", "Team")]))
+        self.assertEqual([r[1:3] for r in rows], [["user", "Max5x"], ["user", "Team"]])
+
+    def test_same_label_and_plan_gets_id_prefix(self):
+        rows = self.rows(plan_doc([(ID_B2, "user", "Team"), (ID_A1, "user", "Team"), (ID_C3, "user", "Max5x")]))
+        self.assertEqual([r[1:3] for r in rows], [["user", "Max5x"], ["user #aaaa", "Team"], ["user #bbbb", "Team"]])
+
+    def test_sort_by_label_then_plan_then_id(self):
+        doc = plan_doc([(ID_C3, "zed", None), (ID_B2, "amy", "Team"), (ID_A1, "amy", "Max5x"),
+                        ("00000000-0000-0000-0000-000000000009", "홍길동", None), (ID_C3[:-1] + "1", "amy", "Team")])
+        self.assertEqual([r[1:3] for r in self.rows(doc)],
+                         [["amy", "Max5x"], ["amy #bbbb", "Team"], ["amy #cccc", "Team"], ["zed", "-"], ["홍길동", "-"]])
+        before = copy.deepcopy(doc)
+        render(doc, T0, TZ9, 200)
+        self.assertEqual(doc, before)  # sorting never reorders the caller's document
+
+    def test_plan_moves_into_label_when_column_dropped(self):
+        doc = plan_doc([(ID_A1, "user", "Max5x"), (ID_B2, "user", "Team"), (ID_C3, "user", "Team"),
+                        ("00000000-0000-0000-0000-000000000009", "solo", "Team")])
+        lines = render(doc, T0, TZ9, 70)
+        self.assertNotIn("플랜", cells(tables(lines)[0][1]))
+        self.assertEqual([r[1] for r in self.rows(doc, 70)],
+                         ["solo", "user Max5x", "user Team #bbbb", "user Team #cccc"])
+
+    def test_sessions_table_tells_duplicates_apart(self):
+        doc = plan_doc([(ID_A1, "user", "Max5x"), (ID_B2, "user", "Team")])
+        lines = render(doc, T0, TZ9, 200)
+        body = [cells(l) for l in tables(lines)[1][3:-1]]
+        self.assertEqual([(r[0], r[1], r[4]) for r in body],
+                         [("100", "user Max5x", "decision soft -> user Team"),
+                          ("101", "user Team", "decision soft -> user Max5x")])
+
+    def test_suffix_survives_label_cut(self):
+        long = "a-very-long-account-name-indeed"
+        rows = self.rows(plan_doc([(ID_A1, long, "Team"), (ID_B2, long, "Team")]))
+        self.assertEqual([r[1] for r in rows], ["a-very-long… #aaaa", "a-very-long… #bbbb"])
+        self.assertTrue(all(cli.display_width(r[1]) <= 18 for r in rows))
+
+    def test_alignment_with_plan_column(self):
+        doc = plan_doc([(ID_A1, "user", "Max5x"), (ID_B2, "user", "Team"), (ID_C3, "홍길동", "Max20x")])
+        for amb in (False, True):
+            for ascii in (False, True):
+                for width in (200, 90, 70, 60):
+                    with self.subTest(amb=amb, ascii=ascii, width=width):
+                        lines = render(doc, T0, TZ9, width, ambiguous_wide=amb, ascii=ascii)
+                        for block in tables(lines, ascii):
+                            self.assertEqual(len({cli.display_width(l, ambiguous_wide=amb) for l in block}), 1)
+                            self.assertEqual(len({tuple(border_cols(l, amb, ascii)) for l in block}), 1)
+                            for l in block:
+                                self.assertLessEqual(cli.display_width(l, ambiguous_wide=amb), width)
+
+    def test_missing_plan_shows_dash(self):
+        doc = plan_doc([(ID_A1, "user", None)])
+        del doc["accounts"][0]["plan"]
+        self.assertEqual(self.rows(doc)[0][2], "-")
+
+
+class TestColor(unittest.TestCase):
+    def cell_styles(self, line):
+        return [m.group(1) if m else None for m in
+                (re.match(r"\x1b\[([0-9;]*)m", c.lstrip(" ")) for c in line.split("│")[1:-1])]
+
+    def test_no_color_has_no_escapes(self):
+        for ascii in (False, True):
+            for l in render(dashboard_doc(), T0, TZ9, 200, ascii=ascii):
+                self.assertNotIn("\x1b", l)
+
+    def test_stripped_color_equals_plain(self):
+        for width in (200, 105, 80):
+            with self.subTest(width=width):
+                plain = render(dashboard_doc(), T0, TZ9, width)
+                colored = render(dashboard_doc(), T0, TZ9, width, color=True)
+                self.assertNotEqual(plain, colored)
+                self.assertEqual([SGR.sub("", l) for l in colored], plain)
+
+    def test_threshold_colors(self):
+        lines = render(dashboard_doc(), T0, TZ9, 200, color=True)
+        rows = account_rows(lines)
+        styles = {cells(l)[1]: self.cell_styles(l) for l in rows}
+        self.assertEqual(styles["alice"][3:6], ["33", None, None])  # 89.4 >= 85 yellow
+        self.assertEqual(styles["bob"][3:6], ["31", None, None])  # 100 >= 95 red
+        self.assertEqual(styles["carol"], ["2"] * 8)  # cache rows dim every cell
+        self.assertEqual(styles["dave"], [None] * 8)
+        self.assertEqual(styles["홍길동"][3:6], [None, "31", "31"])
+
+    def test_threshold_boundaries(self):
+        for util, want in ((84.9, None), (85.0, "33"), (94.9, "33"), (95.0, "31")):
+            with self.subTest(util=util):
                 doc = render_doc()
-                doc["accounts"][1].update(patch)
-                line = self.line_for(self.lines(doc), ACC_B)
-                self.assertIn(want, line)
-                self.assertEqual("ago" in line, has_age)
+                doc["accounts"][0]["seven_day"]["utilization"] = util
+                row = next(l for l in account_rows(render(doc, T0, TZ9, 200, color=True)) if cells(l)[1] == "alice")
+                self.assertEqual(self.cell_styles(row)[4], want)
+        doc = render_doc()
+        doc["accounts"][0]["seven_day"]["utilization"] = 60.0
+        row = account_rows(render(doc, T0, TZ9, 200, color=True, soft_pct=50.0, hard_pct=70.0))[0]
+        self.assertEqual(self.cell_styles(row)[4], "33")
 
-    def test_ascii_only(self):
-        for l in self.lines():
-            self.assertTrue(l.isascii(), l)
-
-
-# --- Task 13 ---------------------------------------------------------------------------------------------
-
-    def fable_doc(self):
-        doc = copy.deepcopy(render_doc())
-        doc["accounts"][0]["fable"] = {"utilization": 25.0, "resets_at": (T0 + timedelta(days=5)).isoformat()}
-        doc["sessions"][0]["model"] = "claude-fable-5-1"
-        doc["unmanaged_sessions"][0]["model"] = "claude-fable-5-1"
-        return doc
-
-    def test_fable_column(self):
-        doc = self.fable_doc()
-        lines = self.lines(doc)
-        a = self.line_for(lines, ACC_A)
-        self.assertIn("fable 25.0% (", a)
-        self.assertIn("in 5d00h)", a)
-        self.assertIn("fable -", self.line_for(lines, ACC_B))
-        doc["accounts"][1]["fable"] = None
-        self.assertIn("fable -", self.line_for(self.lines(doc), ACC_B))
-
-    def test_model_parts(self):
-        def row(model, absent=False):
-            doc = copy.deepcopy(render_doc())
-            if not absent:
-                doc["sessions"][0]["model"] = model
-            return next(l for l in self.lines(doc) if l.startswith("  pid 101 "))
-
-        self.assertIn("model claude-fable-5-1 [fable]", row("claude-fable-5-1"))
-        opus = row("claude-opus-5-5")
-        self.assertIn("model claude-opus-5-5", opus)
-        self.assertNotIn("[fable]", opus)
-        self.assertNotIn("model ", row(None))
-        self.assertNotIn("model ", row(None, absent=True))
-        um = next(l for l in self.lines(self.fable_doc()) if l.startswith("  pid 555 "))
-        self.assertTrue(um.endswith("model claude-fable-5-1 [fable]"), um)
-        plain_um = next(l for l in self.lines(copy.deepcopy(render_doc())) if l.startswith("  pid 555 "))
-        self.assertEqual(plain_um, "  pid 555 busy")
-
-    def test_width_with_fable(self):
-        doc = self.fable_doc()
-        for line in self.lines(doc, width=40):
-            self.assertLessEqual(len(line), 40)
-        for line in self.lines(doc, width=400):
-            self.assertTrue(line.isascii(), line)
+    def test_sessions_and_rules_never_colored(self):
+        lines = render(dashboard_doc(), T0, TZ9, 200, color=True)
+        for l in tables(lines)[1] + [tables(lines)[0][i] for i in (0, 1, 2, -1)]:
+            self.assertNotIn("\x1b", l)
 
 
 class MainBase(unittest.TestCase):
@@ -1124,7 +1652,10 @@ class TestStatusCommand(MainBase):
 
     def test_status_table(self):
         self.assertEqual(self.main("status"), 0)
-        self.assertTrue(self.out.getvalue().splitlines()[0].startswith("accounts: 3"))
+        lines = self.out.getvalue().splitlines()
+        self.assertTrue(lines[0].startswith("Claude 계정 사용량"))
+        self.assertEqual([cells(l)[1] for l in account_rows(lines)], ["user #0000"] * 3)  # same label+plan: id prefix
+        self.assertNotIn("\x1b", self.out.getvalue())  # not a terminal: no color, no screen control
 
     def test_status_watch(self):
         self.env.wait_hook = lambda n: (_ for _ in ()).throw(KeyboardInterrupt()) if n == 2 else None
@@ -1150,10 +1681,10 @@ class TestStatusCommand(MainBase):
         self.stop_after(61)
         self.main("status", "--watch")
         frames = self.frames()
-        a1 = next(l for l in frames[0].splitlines() if ACC_A in l)
-        a6 = next(l for l in frames[5].splitlines() if ACC_A in l)
-        self.assertIn("live 0s ago", a1)
-        self.assertIn("live 5s ago", a6)
+        a1 = cells(account_rows(frames[0].splitlines())[0])
+        a6 = cells(account_rows(frames[5].splitlines())[0])
+        self.assertEqual(a1[7], "0초 전")
+        self.assertEqual(a6[7], "5초 전")
 
     def _watch_with_snapshot(self, alive):
         self.env.alive_pids = {4242} if alive else set()
@@ -1196,11 +1727,9 @@ class TestStatusCommand(MainBase):
         state = os.path.join(self.state_dir, "state.json")
         self.assertEqual(self.env.calls.count(("read", state)), 3)
         self.assertEqual(len(self.env.fetches()), 3)
-        ages = [next(l for l in f.splitlines() if ACC_A in l) for f in frames[:12]]
-        self.assertIn("live 0s ago", ages[0])
-        self.assertIn("live 9s ago", ages[9])
-        self.assertIn("live 11s ago", ages[11])
-        self.assertIn("at 12:00:09", frames[9].splitlines()[0])
+        ages = [cells(account_rows(f.splitlines())[0])[7] for f in frames[:12]]
+        self.assertEqual((ages[0], ages[9], ages[11]), ("0초 전", "9초 전", "11초 전"))
+        self.assertIn("12:00:09  데몬: 꺼짐", frames[9].splitlines()[0])
 
     def test_watch_custom_session_poll(self):
         self.write_cfg({"session_poll_s": 4})
@@ -1216,13 +1745,388 @@ class TestStatusCommand(MainBase):
         self.assertEqual(f.count(("fetch", ACC_B)), 2)
         self.assertEqual(f.count(("fetch", ACC_A)), 5)
         self.assertEqual(f.count(("fetch", ACC_C)), 5)
-        last = self.frames()[-1]
-        self.assertIn("cache (rate_limited)", next(l for l in last.splitlines() if ACC_B in l))
+        b = cells(account_rows(self.frames()[-1].splitlines())[1])
+        self.assertTrue(b[3].startswith("(캐시)"), b)
+        self.assertTrue(b[7].endswith("(호출 제한)"), b)
 
     def test_status_discovery_failure(self):
         self.env.profiles_raise = True
         self.assertEqual(self.main("status"), 1)
         self.assertIn("status failed: RuntimeError", self.err.getvalue())
+
+
+class TtyIO(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class FakeTerm:
+    """TermCtl stand-in: records the calls in order and never touches a real terminal."""
+
+    def __init__(self, wide=False, probe_raises=False):
+        self.calls: List[str] = []
+        self.wide = wide
+        self.probe_raises = probe_raises
+
+    def enter_alt(self):
+        self.calls.append("enter_alt")
+
+    def leave_alt(self):
+        self.calls.append("leave_alt")
+
+    def hide_cursor(self):
+        self.calls.append("hide_cursor")
+
+    def show_cursor(self):
+        self.calls.append("show_cursor")
+
+    def probe_ambiguous_wide(self):
+        self.calls.append("probe")
+        if self.probe_raises:
+            raise OSError("no reply")
+        return self.wide
+
+
+class Keys:
+    """read_key stand-in: returns the scripted keys one per call, advancing the fake clock like a wait."""
+
+    def __init__(self, env, keys):
+        self.env, self.keys, self.timeouts = env, list(keys), []
+
+    def __call__(self, timeout):
+        self.timeouts.append(timeout)
+        self.env.advance(timeout)
+        k = self.keys.pop(0) if self.keys else None
+        if isinstance(k, BaseException) or (isinstance(k, type) and issubclass(k, BaseException)):
+            raise k
+        if callable(k):
+            return k()
+        return k
+
+
+class TestWatchTerminal(MainBase):
+    def run_main(self, *argv, term=None, keys=None, out=None):
+        self.out = out if out is not None else io.StringIO()
+        self.err = io.StringIO()
+        return main(["--config", self.cfg_path] + list(argv), make_deps=self.make_deps, launchctl=FakeRunner(),
+                    uid=lambda: 501, stdout=self.out, stderr=self.err, tz=timezone.utc, term_ctl=term,
+                    read_key=keys)
+
+    def term_frames(self):
+        return [f for f in self.out.getvalue().split("\x1b[H\x1b[2J") if f]
+
+    def test_q_quits_and_restores(self):
+        term, keys = FakeTerm(), Keys(self.env, [None, None, "q"])
+        self.assertEqual(self.run_main("status", "--watch", term=term, keys=keys), 0)
+        self.assertEqual(term.calls, ["hide_cursor", "enter_alt", "probe", "show_cursor", "leave_alt"])
+        self.assertEqual(len(self.term_frames()), 3)
+        self.assertEqual(keys.timeouts, [1.0, 1.0, 1.0])
+        self.assertEqual(self.env.waits, [])  # the key reader is the frame clock; wait_stop is not used
+        self.assertNotIn("---", self.out.getvalue())
+        self.assertIn("q 또는 Ctrl-C 종료", self.term_frames()[0].splitlines())
+
+    def test_other_keys_do_not_quit(self):
+        for quit_key, frames in (("Q", 4), ("x\x1b[Aq", 4)):
+            with self.subTest(quit_key=quit_key):
+                term, keys = FakeTerm(), Keys(self.env, ["x", " ", "\x1b[A", quit_key])
+                self.assertEqual(self.run_main("status", "--watch", term=term, keys=keys), 0)
+                self.assertEqual(len(self.term_frames()), frames)
+
+    def test_interval_passed_to_key_reader(self):
+        keys = Keys(self.env, [None, "q"])
+        self.assertEqual(self.run_main("status", "--watch", "--interval", "2.5", term=FakeTerm(), keys=keys), 0)
+        self.assertEqual(keys.timeouts, [2.5, 2.5])
+
+    def test_ctrl_c_restores(self):
+        term = FakeTerm()
+        self.assertEqual(self.run_main("status", "--watch", term=term, keys=Keys(self.env, [None, KeyboardInterrupt])), 0)
+        self.assertEqual(term.calls[-2:], ["show_cursor", "leave_alt"])
+        self.assertEqual(len(self.term_frames()), 2)
+
+    def test_exception_restores(self):
+        term = FakeTerm()
+        self.assertEqual(self.run_main("status", "--watch", term=term, keys=Keys(self.env, [RuntimeError("x")])), 1)
+        self.assertEqual(term.calls, ["hide_cursor", "enter_alt", "probe", "show_cursor", "leave_alt"])
+        self.assertIn("status failed: RuntimeError", self.err.getvalue())
+        self.env.profiles_raise = True
+        term = FakeTerm()
+        self.assertEqual(self.run_main("status", "--watch", term=term, keys=Keys(self.env, [])), 1)
+        self.assertEqual(term.calls[-2:], ["show_cursor", "leave_alt"])
+
+    def test_sigterm_restores_and_handler_put_back(self):
+        before = signal.getsignal(signal.SIGTERM)
+
+        def deliver():
+            handler = signal.getsignal(signal.SIGTERM)
+            self.assertNotEqual(handler, before)
+            handler(signal.SIGTERM, None)
+
+        term = FakeTerm()
+        self.assertEqual(self.run_main("status", "--watch", term=term, keys=Keys(self.env, [None, deliver])), 0)
+        self.assertEqual(term.calls[-2:], ["show_cursor", "leave_alt"])
+        self.assertEqual(signal.getsignal(signal.SIGTERM), before)
+
+    def test_sigterm_default_when_no_python_handler(self):
+        before = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, before)
+        real, seen = signal.signal, []
+
+        def fake(sig, handler):
+            prev = real(sig, handler)
+            seen.append((sig, handler))
+            return None if len(seen) == 1 else prev  # the previous handler was not installed from Python
+
+        with mock.patch.object(cli.signal, "signal", side_effect=fake):
+            self.assertEqual(self.run_main("status", "--watch", term=FakeTerm(), keys=Keys(self.env, ["q"])), 0)
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[-1], (signal.SIGTERM, signal.SIG_DFL))
+        self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
+    def test_term_without_key_reader_uses_wait_stop(self):
+        self.stop_after(2)
+        term = FakeTerm()
+        self.assertEqual(self.run_main("status", "--watch", term=term), 0)
+        self.assertEqual(self.env.waits, [1.0, 1.0])
+        self.assertEqual(term.calls[-2:], ["show_cursor", "leave_alt"])
+        self.assertIn("Ctrl-C 종료", self.term_frames()[0].splitlines())
+
+    def test_probe_feeds_render(self):
+        for wide, ascii_flag, probes in ((True, False, 1), (False, False, 1), (True, True, 0)):
+            with self.subTest(wide=wide, ascii=ascii_flag):
+                term = FakeTerm(wide=wide)
+                argv = ["status", "--watch"] + (["--ascii"] if ascii_flag else [])
+                with mock.patch.object(cli, "render", wraps=cli.render) as r:
+                    self.assertEqual(self.run_main(*argv, term=term, keys=Keys(self.env, [None, "q"])), 0)
+                self.assertEqual(term.calls.count("probe"), probes)
+                self.assertEqual(r.call_count, 2)
+                for c in r.call_args_list:
+                    self.assertEqual(c.kwargs["ambiguous_wide"], wide and not ascii_flag)
+                    self.assertEqual(c.kwargs["ascii"], ascii_flag)
+                    self.assertEqual((c.kwargs["soft_pct"], c.kwargs["hard_pct"]), (85.0, 95.0))
+
+    def test_probe_failure_means_narrow(self):
+        term = FakeTerm(wide=True, probe_raises=True)
+        with mock.patch.object(cli, "render", wraps=cli.render) as r:
+            self.assertEqual(self.run_main("status", "--watch", term=term, keys=Keys(self.env, ["q"])), 0)
+        self.assertFalse(r.call_args.kwargs["ambiguous_wide"])
+        self.assertEqual(term.calls[-2:], ["show_cursor", "leave_alt"])
+
+    def test_one_shot_probes_without_alt_screen(self):
+        term = FakeTerm(wide=True)
+        with mock.patch.object(cli, "render", wraps=cli.render) as r:
+            self.assertEqual(self.run_main("status", term=term), 0)
+        self.assertEqual(term.calls, ["probe"])
+        self.assertTrue(r.call_args.kwargs["ambiguous_wide"])
+        self.assertNotIn("\x1b[?1049h", self.out.getvalue())
+
+    def test_non_finite_utilization_keeps_status_running(self):
+        doc = json.loads('{"accounts": [{"account_id": "00000000-0000-0000-0000-000000000001", "label": "user",'
+                         ' "source": "live", "five_hour": {"utilization": NaN, "resets_at": null},'
+                         ' "seven_day": {"utilization": Infinity, "resets_at": null}}]}')
+        with mock.patch.object(cli, "build_status", return_value=doc):
+            self.assertEqual(self.run_main("status"), 0)
+            self.assertEqual([c[3:5] for c in map(cells, account_rows(self.out.getvalue().splitlines()))],
+                             [["-", "-"]])
+            term = FakeTerm()
+            self.assertEqual(self.run_main("status", "--watch", term=term, keys=Keys(self.env, [None, "q"])), 0)
+            self.assertEqual(len(self.term_frames()), 2)
+            self.assertEqual(term.calls[-2:], ["show_cursor", "leave_alt"])
+
+    def test_bad_interval_before_any_probe(self):
+        term = FakeTerm()
+        self.assertEqual(self.run_main("status", "--watch", "--interval", "0", term=term), 2)
+        self.assertEqual(term.calls, [])
+        self.assertEqual(self.out.getvalue(), "")
+
+    def test_json_never_probes(self):
+        term = FakeTerm()
+        self.assertEqual(self.run_main("status", "--json", term=term), 0)
+        self.assertEqual(term.calls, [])
+        self.assertIn('"label": "user"', self.out.getvalue())
+
+    def test_thresholds_from_config(self):
+        self.write_cfg({"soft_pct": 70, "hard_pct": 90})
+        with mock.patch.object(cli, "render", wraps=cli.render) as r:
+            self.assertEqual(self.run_main("status"), 0)
+        self.assertEqual((r.call_args.kwargs["soft_pct"], r.call_args.kwargs["hard_pct"]), (70.0, 90.0))
+        self.assertIn("노랑 ≥70%  빨강 ≥90%", self.out.getvalue())
+
+    def test_color_only_on_tty_without_no_color(self):
+        self.env.usages[ACC_A] = live(ACC_A, 90.0)
+        cases = [(io.StringIO(), {}, False), (TtyIO(), {}, True), (TtyIO(), {"NO_COLOR": "1"}, False),
+                 (TtyIO(), {"NO_COLOR": ""}, True)]
+        for out, env, colored in cases:
+            with self.subTest(tty=out.isatty(), env=env):
+                with mock.patch.dict(os.environ, env):
+                    if "NO_COLOR" not in env:
+                        os.environ.pop("NO_COLOR", None)
+                    self.assertEqual(self.run_main("status", out=out), 0)
+                self.assertEqual("\x1b[33m" in self.out.getvalue(), colored)
+
+    def test_real_tty_watch_uses_alt_screen(self):
+        self.stop_after(2)
+        os.environ.pop("NO_COLOR", None)
+        out = TtyIO()
+        self.assertEqual(self.run_main("status", "--watch", out=out), 0)
+        text = out.getvalue()
+        self.assertTrue(text.startswith("\x1b[?25l\x1b[?1049h"), repr(text[:20]))
+        self.assertTrue(text.endswith("\x1b[?25h\x1b[?1049l"), repr(text[-20:]))
+        self.assertEqual(self.env.waits, [1.0, 1.0])  # stdin is not a terminal here: Ctrl-C only
+
+    def pty_stdin(self):
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        return os.fdopen(slave, "rb", buffering=0, closefd=False)
+
+    def test_tty_stdin_wires_real_key_reader(self):
+        os.environ.pop("NO_COLOR", None)
+        stdin = self.pty_stdin()
+        self.stop_after(3)  # if wait_stop paced the frames instead, stop there and fail the waits assertion
+        with mock.patch.object(cli.RealTerm, "read_key", autospec=True, side_effect=[None, "q"]) as rk:
+            rc = main(["--config", self.cfg_path, "status", "--watch", "--interval", "2"], make_deps=self.make_deps,
+                      stdout=TtyIO(), stderr=io.StringIO(), tz=timezone.utc, stdin=stdin)
+        self.assertEqual(rc, 0)
+        self.assertEqual([c.args[1] for c in rk.call_args_list], [2.0, 2.0])
+        self.assertIs(rk.call_args.args[0].inp, stdin)
+        self.assertEqual(self.env.waits, [])  # keys, not wait_stop, pace the frames
+
+    def test_stdin_defaults_to_sys_stdin_only_without_injected_stdout(self):
+        stdin = self.pty_stdin()
+        out = TtyIO()
+        self.stop_after(3)
+        with mock.patch.object(cli.sys, "stdin", stdin), mock.patch.object(cli.sys, "stdout", out), \
+                mock.patch.object(cli.RealTerm, "read_key", autospec=True, side_effect=["q"]) as rk:
+            rc = main(["--config", self.cfg_path, "status", "--watch"], make_deps=self.make_deps,
+                      stderr=io.StringIO(), tz=timezone.utc)
+        self.assertEqual(rc, 0)
+        self.assertEqual(rk.call_count, 1)
+        self.assertIs(rk.call_args.args[0].inp, stdin)
+        self.assertEqual(self.env.waits, [])
+        self.stop_after(1)
+        self.env.waits.clear()
+        with mock.patch.object(cli.sys, "stdin", stdin), \
+                mock.patch.object(cli.RealTerm, "read_key", autospec=True, side_effect=["q"]) as rk:
+            self.assertEqual(self.run_main("status", "--watch", out=TtyIO()), 0)
+        rk.assert_not_called()  # an injected stdout owns the terminal: the real stdin is never read
+        self.assertEqual(self.env.waits, [1.0])
+
+    def test_ascii_flag_output(self):
+        self.assertEqual(self.run_main("status", "--ascii"), 0)
+        lines = self.out.getvalue().splitlines()
+        self.assertTrue(any(l.startswith("+--+------------+------+") for l in lines), lines)
+        self.assertFalse(any("│" in l or "─" in l for l in lines))
+
+    def test_help_lists_ascii(self):
+        self.assertEqual(self.run_main("status", "--help"), 0)
+        self.assertIn("--ascii", self.out.getvalue())
+
+
+class TestRealTerm(unittest.TestCase):
+    def setUp(self):
+        self.master, self.slave = pty.openpty()
+        self.addCleanup(self._close)
+        self.inp = os.fdopen(self.slave, "rb", buffering=0, closefd=False)
+        self.out = io.TextIOWrapper(os.fdopen(self.slave, "wb", buffering=0, closefd=False), encoding="utf-8",
+                                    write_through=True)
+
+    def _close(self):
+        for fd in (self.master, self.slave):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def attrs(self):
+        a = termios.tcgetattr(self.slave)
+        a[3] &= ~termios.PENDIN  # the kernel sets PENDIN on its own when the line discipline changes
+        return a
+
+    def read_master(self, until, timeout=2.0):
+        buf, deadline = b"", time.monotonic() + timeout
+        while until not in buf and time.monotonic() < deadline:
+            r, _, _ = select.select([self.master], [], [], 0.05)
+            if r:
+                buf += os.read(self.master, 1024)
+        return buf
+
+    def test_alt_screen_cursor_and_cbreak_restored(self):
+        before = self.attrs()
+        t = cli.RealTerm(self.out, self.inp)
+        t.hide_cursor()
+        t.enter_alt()
+        self.assertEqual(termios.tcgetattr(self.slave)[3] & termios.ICANON, 0)  # cbreak while running
+        t.show_cursor()
+        t.leave_alt()
+        self.assertEqual(self.attrs(), before)
+        self.assertEqual(self.read_master(b"\x1b[?1049l"), b"\x1b[?25l\x1b[?1049h\x1b[?25h\x1b[?1049l")
+
+    def test_read_key(self):
+        t = cli.RealTerm(self.out, self.inp)
+        t.enter_alt()
+        try:
+            self.assertIsNone(t.read_key(0.05))
+            os.write(self.master, b"q")
+            self.assertEqual(t.read_key(1.0), "q")
+        finally:
+            t.leave_alt()
+
+    def test_read_key_without_terminal_sleeps(self):
+        t = cli.RealTerm(io.StringIO(), io.BytesIO())
+        with mock.patch.object(cli.time, "sleep") as sleep:
+            self.assertIsNone(t.read_key(0.3))
+        sleep.assert_called_once_with(0.3)
+
+    def test_read_key_eof_does_not_spin(self):
+        t = cli.RealTerm(self.out, self.inp)
+        with mock.patch.object(cli.os, "read", side_effect=OSError(5, "EIO")), \
+                mock.patch.object(cli.select, "select", return_value=([self.slave], [], [])), \
+                mock.patch.object(cli.time, "sleep") as sleep:
+            self.assertIsNone(t.read_key(0.4))
+        sleep.assert_called_once_with(0.4)
+        with mock.patch.object(cli.os, "read", return_value=b""), \
+                mock.patch.object(cli.select, "select", return_value=([self.slave], [], [])), \
+                mock.patch.object(cli.time, "sleep") as sleep:
+            self.assertIsNone(t.read_key(0.4))
+        sleep.assert_called_once_with(0.4)
+
+    def probe_with_reply(self, reply, timeout=2.0):
+        def answer():
+            if self.read_master(b"\x1b[6n").endswith(b"\x1b[6n") and reply is not None:
+                os.write(self.master, reply)
+
+        before = self.attrs()
+        th = threading.Thread(target=answer)
+        th.start()
+        try:
+            return cli.RealTerm(self.out, self.inp).probe_ambiguous_wide(timeout)
+        finally:
+            th.join()
+            self.assertEqual(self.attrs(), before)
+
+    def test_probe_wide_narrow_and_silent(self):
+        self.assertTrue(self.probe_with_reply(b"\x1b[24;3R"))
+        self.assertFalse(self.probe_with_reply(b"\x1b[24;2R"))
+        self.assertFalse(self.probe_with_reply(b"garbage", 0.3))
+        started = time.monotonic()
+        self.assertFalse(cli.RealTerm(self.out, self.inp).probe_ambiguous_wide())  # nobody answers: 0.2 s default
+        self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_probe_writes_query_and_clears_line(self):
+        def answer():
+            self.seen = self.read_master(b"\x1b[6n")
+            os.write(self.master, b"\x1b[1;2R")
+
+        th = threading.Thread(target=answer)
+        th.start()
+        cli.RealTerm(self.out, self.inp).probe_ambiguous_wide()
+        th.join()
+        self.assertTrue(self.seen.endswith("\r─\x1b[6n".encode("utf-8")), self.seen)
+        self.assertIn(b"\r\x1b[2K", self.read_master(b"\x1b[2K"))
+
+    def test_probe_needs_terminals(self):
+        self.assertFalse(cli.RealTerm(io.StringIO(), self.inp).probe_ambiguous_wide())
+        self.assertFalse(cli.RealTerm(self.out, None).probe_ambiguous_wide())
 
 
 class TestDaemonCommand(MainBase):
@@ -1484,6 +2388,17 @@ class TestReadme(unittest.TestCase):
         cadence = self.section("### Live usage cadence")
         self.assertIn(str(int(USAGE_BACKOFF_MAX_S)), cadence)
         self.assertIn("%g" % cli.WATCH_INTERVAL_S, cadence)
+
+    def test_dashboard_documented(self):
+        for needle in ("Claude 계정 사용량", "--ascii", "NO_COLOR", "q 또는 Ctrl-C 종료", "(캐시)", "토큰 만료", "↻",
+                       "`label`", "alternate screen", "플랜", "`plan`", "Max5x", "` #`"):
+            self.assertIn(needle, self.text)
+        block = self.text[self.text.index("```text\nClaude 계정 사용량"):]
+        block = block[len("```text\n"):block.index("\n```", 8)].splitlines()
+        for table in tables(block):
+            self.assertEqual(len({cli.display_width(l) for l in table}), 1, "\n".join(table))
+            self.assertEqual(len({tuple(border_cols(l, False)) for l in table}), 1)
+        self.assertNotIn("in 1h12m", self.text)  # the old countdown wording is gone
 
     def test_residual_risks_listed(self):
         section = self.section("## Known residual risks")

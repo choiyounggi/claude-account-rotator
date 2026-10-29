@@ -34,18 +34,63 @@ bin/rotator uninstall    # stops it and removes the plist
 ## Usage
 
 ```sh
-rotator status                       # one table
-rotator status --watch [--interval S]
+rotator status [--ascii]             # one table
+rotator status --watch [--interval S] [--ascii]
 rotator status --json
 rotator daemon [--dry-run]           # foreground
 rotator switch --session <pid> --to <account-id> [--soft|--hard] [--dry-run]
 ```
 
-- `status` shows, per account, the 5h and 7d utilization with the reset time in local time and a countdown,
-  the usage source (`live`, `cache`, `unavailable`) with its error token, the age of the numbers, and the
-  sessions on it; `*` marks the account `selected-host` points to. Then unmanaged sessions (their
-  `CLAUDE_CONFIG_DIR` is not an Orca account folder: shown, never switched), per-session decision, last switch
-  result, hint and relaunch line, and an attention list of recent touched switches whose process is gone.
+- `status` draws one table of accounts and one of sessions (synthetic example):
+
+```text
+Claude 계정 사용량                                                                       21:00:00  데몬: 꺼짐
+┌───┬───────┬───────┬──────────────────────────┬────────────────────┬───────────┬──────┬────────────────────┐
+│   │ 계정  │ 플랜  │ 5시간                    │ 주간               │ 페이블    │ 세션 │ 갱신               │
+├───┼───────┼───────┼──────────────────────────┼────────────────────┼───────────┼──────┼────────────────────┤
+│ * │ alice │ Max5x │ ████████▒  89% ↻1h21m    │ ████▒▒▒▒▒  45% ↻6d │ █▒▒▒  25% │    1 │ 3초 전             │
+│   │ bob   │ Team  │ █████████ 100% ↻21m      │ ███▒▒▒▒▒▒  37% ↻6d │ -         │    0 │ 3초 전             │
+│   │ carol │ -     │ (캐시)      0%           │ (캐시)     28% ↻2d │ -         │    0 │ 3일 전 (호출 제한) │
+│   │ dave  │ -     │ -  (토큰 만료·캐시 없음) │ -                  │ -         │    0 │ -                  │
+└───┴───────┴───────┴──────────────────────────┴────────────────────┴───────────┴──────┴────────────────────┘
+* = Orca 선택 계정   노랑 ≥85%  빨강 ≥95%
+
+┌──────┬───────────┬──────┬─────────────────┬──────────────────────┐
+│ PID  │ 계정      │ 상태 │ 모델            │ 최근 전환 결과       │
+├──────┼───────────┼──────┼─────────────────┼──────────────────────┤
+│ 4101 │ alice     │ busy │ claude-opus-5-5 │ decision soft -> bob │
+│ 4202 │ (관리 밖) │ idle │ -               │ -                    │
+└──────┴───────────┴──────┴─────────────────┴──────────────────────┘
+q 또는 Ctrl-C 종료
+```
+
+- Accounts are named by their label: the local part of the account's email (before `@`), else its display name,
+  else the first 8 characters of the account folder id, cut with `…` at 18 columns. `*` marks the account
+  `selected-host` points to.
+- 플랜 is the seat tier Orca stored for the profile (`rateLimitTier`): `Max5x`, `Max20x`, `Team` (`default_raven`),
+  any other tier without its `default_` prefix cut to 8 characters, `-` when unknown. The same email logged in
+  under two profiles shows as two rows told apart by 플랜; rows whose label and plan are both equal get ` #` and
+  the first 4 characters of their account folder id. Rows are sorted by label, then plan, then folder id.
+- Each usage cell is a 9-cell bar (4 for 페이블), the percent rounded down, and `↻` with the time left until the
+  window resets (`21m`, `1h21m`, `6d`). A window already past its reset shows 0 % and no `↻`. `(캐시)` replaces
+  the bar when the numbers come from Claude Code's cached copy; an `unavailable` account shows `-` and the reason
+  (토큰 만료, 토큰 없음, 요청 실패, 호출 제한, 연결 실패, 캐시 없음, …). 세션 counts the account's live sessions,
+  갱신 is how long ago its usage was fetched.
+- Colours (only when stdout is a terminal and `NO_COLOR` is unset or empty): yellow at `soft_pct`, red at
+  `hard_pct`, cache rows dimmed. Without colour the layout is the same.
+- Every line is measured in terminal columns (Hangul counts 2). When the table does not fit the terminal it drops
+  the bars, then the 플랜 column (accounts sharing a label then show their plan after it), then 페이블, then 갱신,
+  then narrows 계정; rows are never wrapped. Hint lines below the sessions table wrap instead of being cut. A
+  relaunch command gets a line of its own, printed whole and never wrapped by `status` (the terminal soft-wraps it),
+  so copying the line gives the exact command.
+- Box glyphs and `█▒` are "ambiguous width": terminals set to draw them double width (common in Korean setups)
+  would break the borders. On a terminal `status` asks the terminal once (cursor-position report, 0.2 s) and
+  measures them accordingly; `--ascii` draws with `+ - |` and `# .` instead and fits any terminal.
+- Sessions table: unmanaged sessions (their `CLAUDE_CONFIG_DIR` is not an Orca account folder: shown as
+  `(관리 밖)`, never switched), per-session decision and last switch result; under it each session's hint and
+  relaunch line, then an attention list (주의) of recent touched switches whose process is gone.
+- `status --watch` uses the terminal's alternate screen with the cursor hidden and restores both on exit, also
+  after an error or SIGTERM. `q` or Ctrl-C quits (`q` needs stdin to be a terminal; otherwise Ctrl-C only).
 - `switch` is a manual one-shot switch with the same checks and the same per-session lock as the daemon.
   `--dry-run` prints the policy verdict and the relaunch line and sends nothing. It ignores `auto_switch` and
   honours `dry_run`.
@@ -58,13 +103,13 @@ rotator switch --session <pid> --to <account-id> [--soft|--hard] [--dry-run]
   it runs, otherwise by `status --watch` itself with the same per-account cache, never once per redraw.
 - `status --watch` redraws every `--interval` seconds (default 1). It re-discovers sessions and re-reads the
   daemon snapshot, records and `selected-host` only every `session_poll_s` (default 10 s); the redraws in
-  between re-render the last view with the current time, so the `Ns ago` age (time since that account's usage
-  was fetched) and the `in 1h12m` reset countdowns still tick every second.
+  between re-render the last view with the current time, so the 갱신 age (`N초 전`, i.e. N seconds ago, since
+  that account's usage was fetched) and the `↻1h12m` reset countdowns still tick every second.
 - An account answered with HTTP 429 waits for the server's `Retry-After` when the answer carries one (seconds or
   an HTTP-date, RFC 9110 §10.2.3): next fetch after `max(usage_poll_s, min(900 s, Retry-After))`. Without the
   header it is fetched again only after twice its last interval, doubling up to 300 s.
-  It is shown as `cache (rate_limited)`, or `unavailable (rate_limited;…)` when Claude Code has no cached usage;
-  the age then shows how old the cached numbers are. Any other answer returns it to `usage_poll_s`.
+  It is shown as `(캐시)` with `(호출 제한)` after the age (rate_limited), or `-  (호출 제한·캐시 없음)` when Claude
+  Code has no cached usage; the age then shows how old the cached numbers are. Any other answer returns it to `usage_poll_s`.
 
 ## Fable usage
 
@@ -83,7 +128,7 @@ rotator switch --session <pid> --to <account-id> [--soft|--hard] [--dry-run]
   model id (letters, digits, `._:@-`, at most 64 characters) is kept; the rest of the tail it reads is discarded, never
   stored or logged. This transcript layout is observed Claude Code behaviour (2.1.x), not a documented
   interface: if it changes, `model` becomes unknown and the session is treated as non-Fable.
-- `rotator status` shows `fable <pct> (<reset>, in <countdown>)` per account and `model <id> [fable]` on session rows.
+- `rotator status` shows the `fable` window in the 페이블 column and each session's model id in the 모델 column.
 
 ## Status JSON (schema 1)
 
@@ -94,13 +139,15 @@ rotator switch --session <pid> --to <account-id> [--soft|--hard] [--dry-run]
 | `schema` | `1` |
 | `generated_at` | when the document was built |
 | `daemon` | `{running, pid, snapshot_age_s, flags}` from the daemon's last snapshot |
-| `accounts` | one entry per account: `account_id, source, error, fetched_at, five_hour, seven_day, fable` (each window `{utilization, resets_at}` or null), `pointer`, `sessions` (`[{pid, status, model}]`) |
+| `accounts` | one entry per account: `account_id, label, plan, source, error, fetched_at, five_hour, seven_day, fable` (each window `{utilization, resets_at}` or null), `pointer`, `sessions` (`[{pid, status, model}]`) |
 | `pointer_account_id` | the account `selected-host` names, or null |
 | `sessions` | managed live sessions: `pid, session_id, status, account_id, model, decision, would_switch, in_flight, in_flight_pid, stuck, unswitchable, hard_hold_until, excluded, record_state, last_result, hint, post_verify` |
 | `unmanaged_sessions` | `[{pid, session_id, status, model}]` |
 | `attention` | `[{pid, session_id, updated_at, record_state, last_result, hint}]`: touched, not-ok switches of gone processes from the last 24 h |
 
-Times are ISO-8601 UTC strings. `relaunch_command` appears only inside `last_result`. No email, account UUID,
+Times are ISO-8601 UTC strings. `relaunch_command` appears only inside `last_result`. `label` is the short account name shown in
+the table (email local part, else display name, else folder id prefix) and `plan` its seat tier tag (or null);
+no full email address, account UUID,
 organization, token or environment value is included. The only argv or transcript value included is a session's
 model id (`model`, from the transcript or its `--model` argument, validated as above). Changes within schema 1 are
 additive only.
