@@ -143,8 +143,10 @@ Code's scope rule), and writes the new tokens back to the same Keychain item Cla
 JSON (subscription, rate-limit tier, MCP OAuth entries and anything unknown).
 
 **When.** The access token is expired or has less than 5 minutes left; at most once per usage poll per account; at
-most one account's network refresh per daemon tick, after that tick's switch decisions; never for the source or
-target of an in-flight switch; never in dry-run (`--dry-run` or `"dry_run": true`, shown as "드라이런"); not while
+most one account's network refresh per daemon tick, after that tick's switch decisions; not for the source or a
+target of a switch in flight when phase 2 starts (phase 2 is this refresh step; its skip set is read once, so a
+worker that retargets to an account whose refresh section is already running is protected only by Claude Code's
+own refresh lock, see risk 14); never in dry-run (`--dry-run` or `"dry_run": true`, shown as "드라이런"); not while
 the daemon is stopping. `rotator status`, `status --json`, `status --watch` and `rotator switch` never refresh:
 with the daemon running they show its records; with it stopped the status JSON records say `daemon_off`
 ("데몬 꺼짐", which the table shows only in its header) and usage falls back to the cache. After a
@@ -343,7 +345,11 @@ Numbers must be finite and not `true`/`false`.
     fail.
 15. While a write-failed token set is held, a Claude Code session refreshing that account posts the dead refresh
     token; the server's refresh-token reuse detection may then revoke the whole token family, and the account
-    needs a re-login in Orca.
+    needs a re-login in Orca. The daemon itself never sends a session there: an account holding such a set is
+    left out of switch targets (including a worker's retarget) and selected-host pointer targets, logged once as
+    `event=target_excluded … reason=token_held` and shown in the session's decision reason as
+    `excluded <ids>: token_held`; if the held list cannot be read, no target is chosen (`held_unknown`). A
+    session the user starts on that account by hand is still exposed.
 16. `security` exit code 44 ("item not found") cannot be told apart from an item that exists in a keychain
     missing from the search list; the rotator drops a held token set as "item gone" only after two consecutive
     code-44 lookups.
@@ -356,3 +362,8 @@ Numbers must be finite and not `true`/`false`.
     lookup, which the urllib timeout does not bound) lets Claude Code treat the lock as stale and refresh the
     same account at the same time; on release the rotator then leaves any lock dir that is no longer its own
     (different inode or birth time) in place.
+20. Session records are reloaded from disk at the start of each tick's session step, outside the daemon lock. A
+    switch worker that ends in that window with an untouched final record (a hard-mode hold or an excluded
+    target) can have it replaced in memory by the older disk copy, so that tick may dispatch the session once
+    more without the hold or the exclusion. Touched sessions are unaffected (the in-memory touched set and
+    `run_switch`'s on-disk re-check still block them).

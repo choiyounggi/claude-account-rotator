@@ -623,7 +623,7 @@ class TestLaunchd(unittest.TestCase):
             else:
                 self.assertEqual(argv[2], "gui/501/" + LABEL)
             for part in argv:
-                for bad in ("*", "com.apple", "com.rsquare"):
+                for bad in ("*", "com.apple", "com.example"):
                     self.assertNotIn(bad, part)
 
     def test_exit_timeout_tracks_timeouts(self):
@@ -2195,7 +2195,9 @@ class TestCrossConfigContention(MainBase):
             handler[0]()
 
         env.wait_hook = hook
-        daemon_deps = env.deps(spawn=spawn, switch=switch, install_signals=lambda h: handler.__setitem__(0, h))
+        # The daemon asks for held-token accounts before dispatching; the cli fake raises (fails closed).
+        daemon_deps = env.deps(spawn=spawn, switch=switch, install_signals=lambda h: handler.__setitem__(0, h),
+                               refresh_held=lambda due_only=False: [])
         out, err = io.StringIO(), io.StringIO()
         rc = main(["--config", self.cfg_path, "daemon"], make_deps=lambda cfg: daemon_deps, launchctl=FakeRunner(),
                   uid=lambda: 501, stdout=out, stderr=err, tz=timezone.utc)

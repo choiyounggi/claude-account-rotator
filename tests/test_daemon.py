@@ -1,4 +1,5 @@
 import dataclasses
+import inspect
 import json
 import logging
 import logging.handlers
@@ -2056,6 +2057,190 @@ class TestRealDeps(unittest.TestCase):
         self.assertIs(t.daemon, True)
         self.assertEqual(t.name, "t")
         t.join()
+
+
+class TestHeldTargets(DispatchBase):
+    """An account holding an unwritten token set is never a switch target; the session's own account is."""
+
+    def excluded_logs(self):
+        return self.env.logs("target_excluded")
+
+    def test_held_target_skipped_for_next_best(self):
+        self.env.held_ids = [ACC_B]
+        self.env.results = [result("continued", None, ok=True, step="continue_prompt")]
+        self.d.tick()
+        decision = self.row(101)["decision"]
+        self.assertEqual((decision["action"], decision["target_account_id"]), ("hard", ACC_C))
+        self.assertIn("excluded %s: token_held" % ACC_B, decision["reason"])
+        self.env.run_worker(0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_C, "hard")])
+        self.assertEqual(self.excluded_logs(),
+                         ["event=target_excluded pid=101 account=%s reason=token_held" % ACC_B])
+
+    def test_all_targets_held_no_dispatch(self):
+        self.env.held_ids = [ACC_B, ACC_C]
+        self.d.tick()
+        self.tick_after(10)
+        self.assertEqual(self.spawns(), [])
+        decision = self.row(101)["decision"]
+        self.assertEqual((decision["action"], decision["target_account_id"]), ("none", None))
+        self.assertIn("excluded %s,%s: token_held" % (ACC_B, ACC_C), decision["reason"])
+        self.assertEqual(len(self.excluded_logs()), 1)
+
+    def test_dry_run_would_switch_skips_held(self):
+        self.make(make_cfg(dry_run=True))
+        self.env.held_ids = [ACC_B]
+        self.d.tick()
+        self.assertEqual(self.spawns(), [])
+        self.assertEqual(self.row(101)["would_switch"], {"action": "hard", "target_account_id": ACC_C})
+
+    def test_non_held_and_own_held_unchanged(self):
+        for held in ([], [ACC_C], [ACC_A]):
+            with self.subTest(held=held):
+                self.setUp()
+                self.env.held_ids = list(held)
+                self.d.tick()
+                decision = self.row(101)["decision"]
+                self.assertEqual((decision["action"], decision["target_account_id"]), ("hard", ACC_B))
+                self.assertNotIn("token_held", decision["reason"])
+                self.assertEqual(self.excluded_logs(), [])
+                self.assertEqual(len(self.spawns()), 1)
+
+    def test_own_and_target_held_keeps_own(self):
+        self.env.held_ids = [ACC_A, ACC_B]
+        self.env.results = [result("continued", None, ok=True, step="continue_prompt")]
+        self.d.tick()
+        decision = self.row(101)["decision"]
+        self.assertEqual((decision["action"], decision["target_account_id"]), ("hard", ACC_C))
+        self.assertTrue(decision["reason"].endswith("; excluded %s: token_held" % ACC_B))
+        self.assertNotIn(ACC_A + ",", decision["reason"])
+        self.env.run_worker(0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_C, "hard")])
+
+    def test_held_query_error_fails_closed(self):
+        self.env.held_raises = True
+        # Phase 2 also queries held ids; only the decision path is under test here.
+        with unittest.mock.patch.object(self.d._usage, "refresh_one", return_value=None):
+            self.d.tick()
+        self.assertEqual(self.spawns(), [])
+        decision = self.row(101)["decision"]
+        self.assertEqual(decision["action"], "none")
+        self.assertTrue(decision["reason"].endswith("; excluded %s,%s: held_unknown" % (ACC_B, ACC_C)))
+        self.assertIn("no target", decision["reason"])
+        self.assertNotIn("unmanaged", decision["reason"])
+        self.assertGreaterEqual(len(self.env.logs("held_error")), 1)
+
+    def test_retarget_skips_held(self):
+        self.env.results = [result("untouched", "target_untrusted"),
+                            result("continued", None, ok=True, step="continue_prompt")]
+        self.d.tick()
+        self.env.held_ids = [ACC_C]
+        self.env.run_worker(0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_B, "hard")])
+        self.assertEqual(self.excluded_logs(),
+                         ["event=target_excluded pid=101 account=%s reason=token_held" % ACC_C])
+        self.assertEqual(self.d._inflight, {})
+
+    def test_retarget_held_error_fails_closed(self):
+        self.env.results = [result("untouched", "target_untrusted"),
+                            result("continued", None, ok=True, step="continue_prompt")]
+        self.d.tick()
+        self.env.held_raises = True
+        self.env.run_worker(0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_B, "hard")])
+        self.assertGreaterEqual(len(self.env.logs("held_error")), 1)
+
+    def test_retarget_non_held_unchanged(self):
+        self.env.results = [result("untouched", "target_untrusted"),
+                            result("continued", None, ok=True, step="continue_prompt")]
+        self.d.tick()
+        self.env.held_ids = [ACC_B]
+        self.env.run_worker(0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_B, "hard"), ("switch", 101, ACC_C, "hard")])
+        self.assertEqual(self.excluded_logs(), [])
+
+
+class TestHeldPointer(TickBase):
+    """The selected-host pointer is never moved to an account holding an unwritten token set."""
+
+    def setUp(self):
+        super().setUp()
+        self.env.pointer_text = prof(ACC_A).home
+        self.env.usages = {ACC_A: live(ACC_A, 90.0), ACC_B: live(ACC_B, 20.0), ACC_C: live(ACC_C, 50.0)}
+
+    def pointer_writes(self):
+        return [c for c in self.env.calls if c[0] == "write_pointer"]
+
+    def test_held_target_skipped_for_next_best(self):
+        self.env.held_ids = [ACC_B]
+        self.d.tick()
+        self.assertEqual(self.pointer_writes(), [("write_pointer", ACC_C)])
+        self.assertEqual(self.snap()["pointer_target_account_id"], ACC_C)
+        self.assertEqual(self.env.logs("target_excluded"),
+                         ["event=target_excluded what=pointer account=%s reason=token_held" % ACC_B])
+
+    def test_all_held_no_write_logged_once(self):
+        self.env.held_ids = [ACC_B, ACC_C]
+        self.d.tick()
+        self.d.tick()
+        self.assertEqual(self.pointer_writes(), [])
+        self.assertIsNone(self.snap()["pointer_target_account_id"])
+        self.assertEqual(self.snap()["pointer_account_id"], ACC_A)
+        self.assertEqual(len(self.env.logs("target_excluded")), 1)
+
+    def test_held_query_error_no_write(self):
+        self.env.held_raises = True
+        with unittest.mock.patch.object(self.d._usage, "refresh_one", return_value=None):
+            self.d.tick()
+        self.assertEqual(self.pointer_writes(), [])
+        self.assertIsNone(self.snap()["pointer_target_account_id"])
+        self.assertGreaterEqual(len(self.env.logs("held_error")), 1)
+
+    def test_non_held_and_pointer_held_unchanged(self):
+        for held in ([], [ACC_C], [ACC_A]):
+            with self.subTest(held=held):
+                self.setUp()
+                self.env.held_ids = list(held)
+                self.d.tick()
+                self.assertEqual(self.pointer_writes(), [("write_pointer", ACC_B)])
+                self.assertEqual(self.env.logs("target_excluded"), [])
+
+
+class TestSwitchSignature(RunSwitchBase):
+    """run_switch's deps.switch call must bind to the real switcher.switch_session signature."""
+
+    def capture(self):
+        seen = []
+
+        def switch(*args, **kw):
+            seen.append((args, kw))
+            return result("continued", None, ok=True, step="continue_prompt")
+        return seen, self.env.deps(switch=switch)
+
+    def test_call_binds_real_signature(self):
+        seen, deps = self.capture()
+        self.run_switch(deps=deps)
+        self.assertEqual(len(seen), 1)
+        args, kw = seen[0]
+        bound = inspect.signature(switcher.switch_session).bind(*args, **kw)
+        self.assertIs(bound.arguments["session"], self.s)
+        self.assertEqual(bound.arguments["target"].account_id, ACC_B)
+        self.assertEqual(bound.arguments["mode"], "soft")
+        self.assertIs(bound.arguments["timeouts"], self.cfg.timeouts)
+        self.assertEqual(bound.arguments["profiles_root"], ROOT)
+        self.assertEqual(bound.arguments["continue_prompt"], self.cfg.continue_prompt)
+
+    def test_bind_rejects_drift(self):
+        seen, deps = self.capture()
+        self.run_switch(deps=deps)
+        args, kw = seen[0]
+        sig = inspect.signature(switcher.switch_session)
+        with self.assertRaises(TypeError):
+            sig.bind(*args, **dict(kw, not_a_parameter=1))
+        with self.assertRaises(TypeError):
+            sig.bind(*args, **{k: v for k, v in kw.items() if k != "driver"})
+        with self.assertRaises(TypeError):
+            sig.bind(*args[:2], **kw)
 
 
 if __name__ == "__main__":

@@ -713,6 +713,7 @@ class Daemon:
         self._orphans_logged: Set[Identity] = set()
         self._hold_logged: Dict[str, str] = {}
         self._would: Dict[str, Tuple[str, str]] = {}
+        self._excluded_logged: Dict[str, Tuple[str, str]] = {}
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -766,7 +767,14 @@ class Daemon:
         try:
             text = deps.read_pointer(cfg.profiles_root)
             pp = profile_for_config_dir(profiles, text) if text else None
-            pd = decide_pointer(pp, profiles, usages, now, config=cfg.policy_config())
+            pc = cfg.policy_config()
+            pd = decide_pointer(pp, profiles, usages, now, config=pc)
+            excl = self._held_filter(profiles, pd.target.account_id, None) if pd.target is not None else None
+            if excl is None:
+                self._excluded_logged.pop("pointer", None)
+            else:
+                self._note_excluded("pointer", "what=pointer", pd.target.account_id, excl[0])
+                pd = decide_pointer(pp, excl[2], usages, now, config=pc)
             with self._lock:
                 self._pointer = (pp.account_id if pp else None, pd.target.account_id if pd.target else None)
             if pd.target is not None and self._may_write_pointer():
@@ -860,9 +868,18 @@ class Daemon:
         candidates = [p for p in profiles if p.account_id == own.account_id or p.account_id not in excluded]
         ls = last_switch.get(s.session_id)
         d = decide(s, candidates, usages, now, config=pc, last_switch_at=ls)
+        reason = d.reason
+        excl = self._held_filter(candidates, d.target.account_id, own.account_id) if d.target is not None else None
+        if excl is None:
+            self._excluded_logged.pop("session:" + s.session_id, None)
+        else:
+            why, gone, candidates = excl
+            self._note_excluded("session:" + s.session_id, "pid=%d" % s.pid, d.target.account_id, why)
+            d = decide(s, candidates, usages, now, config=pc, last_switch_at=ls)
+            reason = "%s; excluded %s: %s" % (d.reason, ",".join(gone), why)
         row["decision"] = {"action": d.action,
                            "target_account_id": d.target.account_id if d.target is not None else None,
-                           "reason": d.reason}
+                           "reason": reason}
         if d.action == "none" or d.target is None:
             self._would.pop(s.session_id, None)
             return row
@@ -882,6 +899,30 @@ class Daemon:
         if self._dispatch_locked(s, own, d.action, d.target, profiles, usages, pc, ls, mono):
             row.update(in_flight=True, in_flight_pid=s.pid)
         return row
+
+    def _held_filter(self, candidates: Sequence[Profile], target_id: str,
+                     keep_id: Optional[str]) -> Optional[Tuple[str, List[str], List[Profile]]]:
+        """None when target_id holds no unwritten token set; else (reason, removed ids, candidates without the
+        held accounts). keep_id (the session's own account) always stays. A failing held query removes every
+        other candidate (reason held_unknown): Claude Code started there would post a dead refresh token.
+        Callers re-decide on the returned candidates; decide picks the lowest candidate, so that equals
+        filtering up front while querying held ids only when a target was chosen."""
+        try:
+            held = frozenset(str(a) for a in self._deps.refresh_held())
+            reason = "token_held"
+        except Exception as e:
+            self._log.error("event=held_error exc=%s", type(e).__name__)
+            held = frozenset(p.account_id for p in candidates)
+            reason = "held_unknown"
+        if target_id not in held:
+            return None
+        gone = sorted(p.account_id for p in candidates if p.account_id != keep_id and p.account_id in held)
+        return reason, gone, [p for p in candidates if p.account_id == keep_id or p.account_id not in held]
+
+    def _note_excluded(self, key: str, subject: str, account_id: str, reason: str) -> None:
+        if self._excluded_logged.get(key) != (account_id, reason):
+            self._excluded_logged[key] = (account_id, reason)
+            self._log.warning("event=target_excluded %s account=%s reason=%s", subject, account_id, reason)
 
     def _dispatch_locked(self, s: Session, own: Profile, mode: str, target: Profile,
                          profiles: Sequence[Profile], usages: Mapping[str, AccountUsage], pc: PolicyConfig,
@@ -947,6 +988,11 @@ class Daemon:
                 cands = [p for p in profiles if p.account_id == own.account_id or p.account_id not in excluded]
                 # The dispatching decide's last_switch_at: this worker's own intent must not cool down its retry.
                 d2 = decide(s, cands, usages, deps.now(), config=pc, last_switch_at=ls)
+                excl = self._held_filter(cands, d2.target.account_id, own.account_id) if d2.target else None
+                if excl is not None:
+                    log.warning("event=target_excluded pid=%d account=%s reason=%s",
+                                s.pid, d2.target.account_id, excl[0])
+                    d2 = decide(s, excl[2], usages, deps.now(), config=pc, last_switch_at=ls)
             except Exception as e:
                 log.error("event=decide_error pid=%d exc=%s", s.pid, type(e).__name__)
                 return None
