@@ -388,5 +388,11 @@ def fetch_usage(
                 error="%s;cache_%s" % (live_kind, reason),
                 retry_after_s=ra,
             )
+    if cred is not None:  # the expiry time alone (never the token): status shows a token about to expire
+        try:
+            expires = datetime.fromtimestamp(cred.expires_at_ms / 1000.0, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            expires = None
+        result = dataclasses.replace(result, token_expires_at=expires)
     log.debug("usage account=%s source=%s error=%s", profile.account_id, result.source, result.error)
     return result

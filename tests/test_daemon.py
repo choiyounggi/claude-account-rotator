@@ -461,9 +461,23 @@ class TestFileLock(unittest.TestCase):
 
 
 class TestSerializers(unittest.TestCase):
+    def test_token_expires_at_round_trip(self):
+        u = dataclasses.replace(live(ACC_A, 42.0), token_expires_at=T0 + timedelta(minutes=4))
+        d = usage_summary(u)
+        self.assertEqual(d["token_expires_at"], "2026-10-28T12:04:00+00:00")
+        self.assertEqual(usage_from_summary(d).token_expires_at, T0 + timedelta(minutes=4))
+        self.assertIsNone(usage_summary(live(ACC_A, 1.0))["token_expires_at"])
+        self.assertIsNone(usage_from_summary(dict(d, token_expires_at=None)).token_expires_at)
+        self.assertIsNone(usage_from_summary({k: v for k, v in d.items() if k != "token_expires_at"}).token_expires_at)
+        good, _ = shown_usage(AccountUsage(account_id=ACC_A, source="unavailable", fetched_at=T0,
+                                           error="network;cache_missing", token_expires_at=T0 + timedelta(hours=8)),
+                              live(ACC_A, 30.0))
+        self.assertEqual(good.token_expires_at, T0 + timedelta(hours=8))  # the current token's, not the old one's
+
     def test_usage_summary_keys(self):
         s = usage_summary(live(ACC_A, 42.0))
-        self.assertEqual(set(s), {"account_id", "source", "error", "fetched_at", "five_hour", "seven_day", "fable"})
+        self.assertEqual(set(s), {"account_id", "source", "error", "fetched_at", "five_hour", "seven_day", "fable",
+                                  "token_expires_at"})
         self.assertEqual(s["fetched_at"], "2026-10-28T12:00:00+00:00")
         self.assertEqual(set(s["five_hour"]), {"utilization", "resets_at"})
         self.assertIsNone(s["fable"])

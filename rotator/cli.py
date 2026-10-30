@@ -6,6 +6,7 @@ import argparse
 import collections
 import contextlib
 import dataclasses
+import functools
 import json
 import logging
 import math
@@ -64,6 +65,7 @@ def _parse_iso(value: object) -> Optional[datetime]:
 # --- display width and cells -----------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=4096)
 def _char_width(c: str, amb: bool) -> int:
     if unicodedata.combining(c) or unicodedata.category(c) in ("Mn", "Me", "Cf"):
         return 0
@@ -108,6 +110,11 @@ def _printable(value: object) -> str:
     # a stray ESC can never restyle the terminal or shift the columns.
     if not isinstance(value, str):
         return ""
+    return _printable_str(value)
+
+
+@functools.lru_cache(maxsize=4096)
+def _printable_str(value: str) -> str:
     return "".join(c for c in value if not unicodedata.category(c).startswith("C"))
 
 
@@ -409,6 +416,7 @@ _LABEL_CAP = 18
 _AGE_CAP = 20
 _REASON_CAP, _REASON_CAP_NO_BARS = 24, 14
 _GROUP_CAP = 10
+_SESSION_LABEL_CAP = 26  # the sessions table's 계정: an 18-column label plus a short group and plan
 _DIM, _YELLOW, _RED = "2", "33", "31"
 
 
@@ -468,8 +476,9 @@ def _row_plan(a: dict) -> str:
     return _clean(a.get("plan")) or "-"
 
 
-def _row_group(a: dict, ctx: _Ctx) -> str:
-    return clip(_clean(a.get("group")), _GROUP_CAP, ctx.amb, ctx.g.ell) or "-"
+def _row_group(a: dict, ctx: _Ctx, cap: Optional[int] = None) -> str:
+    group = _clean(a.get("group"))
+    return (clip(group, cap, ctx.amb, ctx.g.ell) if cap is not None else group) or "-"
 
 
 def _row_key(a: dict) -> Tuple[str, str, str, str]:
@@ -480,31 +489,81 @@ def _has_groups(accounts: List[dict]) -> bool:
     return any(_clean(a.get("group")) for a in accounts)
 
 
-def _label_suffixes(accounts: List[dict], ctx: _Ctx, plan_visible: bool, group_visible: bool) -> Dict[str, str]:
-    """Per account id, what tells rows with the same label apart: the group and the plan when their columns
-    are not shown, then ``#`` and the account id's first 4 when label, group and plan all collide."""
+def _label_texts(accounts: List[dict], ctx: _Ctx, cap: Optional[int], plan_visible: bool, group_visible: bool,
+                 group_cap: Optional[int] = None) -> Dict[str, str]:
+    """Per account id, the 계정 cell: the label, then what tells rows with the same label apart — the group and
+    the plan when their columns are not shown, and ``#`` with the account id's first 4 when the row would still
+    repeat another.
+
+    Within ``cap`` columns the suffix gives way before the label: the group is cut, then left out, then the plan
+    is left out (``#id4`` takes over whenever the row would repeat another); only then is the label cut."""
+    amb, ell = ctx.amb, ctx.g.ell
+    min_label = display_width(ell, amb)  # a cut label keeps at least one character before its ellipsis
+    ids = {_clean(a.get("account_id")): a for a in accounts}
     labels = collections.Counter(_row_label(a) for a in accounts)
-    triples = collections.Counter((_row_label(a), _row_group(a, ctx), _row_plan(a)) for a in accounts)
+
+    def pieces(a: dict, group: Optional[str], keep_plan: bool) -> List[Optional[str]]:
+        shared = labels[_row_label(a)] > 1
+        g = group if (not group_visible and shared and group not in (None, "-")) else None
+        p = _row_plan(a) if (not plan_visible and shared and keep_plan) else None
+        return [g, p]
+
+    def key(a: dict, group: Optional[str], keep_plan: bool) -> Tuple[Any, ...]:
+        # what the row shows: its label, its visible 그룹/플랜 cells and its suffix pieces
+        g, p = pieces(a, group, keep_plan)
+        return (_row_label(a), _clean(a.get("group")) if group_visible else g,
+                _row_plan(a) if plan_visible else p)
+
+    def full_group(a: dict) -> str:
+        return _row_group(a, ctx, group_cap)
+
+    kinds = [("full", True), ("nogroup", True), ("bare", False)]
+    counts = {kind: collections.Counter(key(a, full_group(a) if kind == "full" else None, keep)
+                                        for a in accounts) for kind, keep in kinds}
     out: Dict[str, str] = {}
-    for a in accounts:
-        label, group, plan = _row_label(a), _row_group(a, ctx), _row_plan(a)
-        suffix = ""
-        if labels[label] > 1:
-            if not group_visible and group != "-":
-                suffix += " " + group
-            if not plan_visible:
-                suffix += " " + plan
-        if triples[(label, group, plan)] > 1:
-            suffix += " #" + _clean(a.get("account_id"))[:4]
-        out[_clean(a.get("account_id"))] = suffix
+    for aid, a in ids.items():
+        label, idt = _row_label(a), "#" + aid[:4]
+
+        def text(parts: List[Optional[str]], kind: str, keep: bool, group: Optional[str]) -> str:
+            need_id = counts[kind][key(a, group, keep)] > 1
+            return " ".join([label] + [x for x in parts if x] + ([idt] if need_id else []))
+
+        g = full_group(a)
+        full = text(pieces(a, g, True), "full", True, g)
+        if cap is None or display_width(full, amb) <= cap:
+            out[aid] = full
+            continue
+        options = []
+        gp, pp = pieces(a, g, True)
+        if gp:  # the group cut to the room left, never below 3 columns
+            rest = display_width(text([None, pp], "full", True, g), amb)
+            room = cap - rest - 1
+            if room >= 3:
+                options.append(text([clip(gp, room, amb, ell), pp], "full", True, g))
+        options.append(text(pieces(a, None, True), "nogroup", True, None))
+        bare = text(pieces(a, None, False), "bare", False, None)
+        options.append(bare)
+        pick = next((o for o in options if display_width(o, amb) <= cap), None)
+        if pick is None:
+            suffix = bare[len(label):]
+            room = cap - display_width(suffix, amb)
+            pick = clip(label, room, amb, ell) + suffix if room > min_label else clip(label, cap, amb, ell)
+        out[aid] = pick
+    # A cut group (or a cut label) can make two rows read the same: those rows show "#id4" after the label.
+    def shown(aid: str) -> Tuple[Any, ...]:
+        a = ids[aid]
+        return (out[aid], _clean(a.get("group")) if group_visible else None, _row_plan(a) if plan_visible else None)
+
+    seen = collections.Counter(shown(aid) for aid in out)
+    for aid in [x for x in out if seen[shown(x)] > 1]:
+        label, suffix = _row_label(ids[aid]), " #" + aid[:4]
+        if cap is None:
+            out[aid] = label + suffix
+            continue
+        room = cap - display_width(suffix, amb)
+        if room > min_label:  # else the label could not keep a character of its own: leave it as it is
+            out[aid] = clip(label, room, amb, ell) + suffix
     return out
-
-
-def _label_cell(a: dict, suffixes: Dict[str, str], cap: Optional[int], ctx: _Ctx) -> str:
-    suffix = suffixes.get(_clean(a.get("account_id")), "")
-    if cap is None:
-        return _row_label(a) + suffix
-    return clip(_row_label(a), cap - display_width(suffix, ctx.amb), ctx.amb, ctx.g.ell) + suffix
 
 
 def _reason_tokens(a: dict) -> str:
@@ -526,18 +585,26 @@ NEEDS_REFRESH, WAITING_REFRESH, SESSION_REFRESHES, RELOGIN = "갱신 필요", "�
 _EVERY_ACCOUNT_REASONS = ("daemon_off", "disabled", "dry_run")  # recorded for every account, due or not
 
 
-def _token_state(a: dict, daemon_running: bool) -> Optional[str]:
+def _expiring(a: dict, now: Optional[datetime]) -> bool:
+    """The access token expires within the refresh margin (or already has), by the time the usage fetch read."""
+    t = _parse_iso(a.get("token_expires_at"))
+    return now is not None and t is not None and (t - now).total_seconds() * 1000 <= refresh.EXPIRY_MARGIN_MS
+
+
+def _token_state(a: dict, daemon_running: bool, now: Optional[datetime] = None) -> Optional[str]:
     """What a row whose token is not usable needs, in Korean; None for a usable token (a live reading whose
     latest fetch succeeded).
 
-    The refresh record decides first; an expired token the record says nothing about reads 세션이 갱신 when a
-    Claude session runs on the account, else 갱신 필요 with the daemon off and 갱신 대기 while it runs.
+    The refresh record decides first; an expired token — or one expiring within the refresh margin, which the
+    daemon refreshes too — the record says nothing about reads 세션이 갱신 when a Claude session runs on the
+    account, else 갱신 필요 with the daemon off and 갱신 대기 while it runs.
     """
     err = a.get("error")
-    if a.get("source") == "live" and not err:
+    expiring = _expiring(a, now)
+    if a.get("source") == "live" and not err and not expiring:
         return None
     toks = {t.strip() for t in err.split(";")} if isinstance(err, str) else set()
-    expired = "token_expired" in toks
+    expired = "token_expired" in toks or expiring
     rec = a.get("refresh") if isinstance(a.get("refresh"), dict) else {}
     state = rec.get("state")
     reason = rec.get("reason") if isinstance(rec.get("reason"), str) else None
@@ -566,6 +633,7 @@ class _Layout:
     label_cap: Optional[int] = None
     age_cap: Optional[int] = None
     reason_cap: Optional[int] = None
+    group_cap: Optional[int] = None
 
 
 _LEVELS = 7
@@ -593,7 +661,7 @@ def _usage_cell(a: dict, key: str, now: datetime, ctx: _Ctx, *, bars: bool, cell
 def _age_text(a: dict, now: datetime, ctx: _Ctx, daemon_running: bool) -> str:
     """The 갱신 cell, uncut: the token state first (so a cut never hides it), the numbers' age, 캐시 for Claude
     Code's cached copy, then why the latest fetch failed when no token state says more."""
-    state = _token_state(a, daemon_running)
+    state = _token_state(a, daemon_running, now)
     if a.get("source") == "unavailable":
         return state or "-"
     fetched = _parse_iso(a.get("fetched_at"))
@@ -622,12 +690,12 @@ def _accounts_table(accounts: List[dict], now: datetime, ctx: _Ctx, daemon_runni
         windows.append(("fable", 4, False, False))
     rows: List[List[str]] = []
     styles: List[List[Optional[str]]] = []
-    suffixes = _label_suffixes(accounts, ctx, plan, group)
+    texts = _label_texts(accounts, ctx, lay.label_cap, plan, group, lay.group_cap)
     for a in accounts:
-        cells = ["*" if a.get("pointer") is True else "", _label_cell(a, suffixes, lay.label_cap, ctx)]
+        cells = ["*" if a.get("pointer") is True else "", texts[_clean(a.get("account_id"))]]
         st: List[Optional[str]] = [None, None]
         if group:
-            cells.append(_row_group(a, ctx))
+            cells.append(_row_group(a, ctx, lay.group_cap))
             st.append(None)
         if plan:
             cells.append(_row_plan(a))
@@ -648,21 +716,31 @@ def _accounts_table(accounts: List[dict], now: datetime, ctx: _Ctx, daemon_runni
     return _table(headers, aligns, rows, ctx, styles)
 
 
-def _layouts(accounts: List[dict], now: datetime, ctx: _Ctx, daemon_running: bool) -> List[_Layout]:
-    """Layouts from widest to narrowest: nothing cut; the flexible cells cut step by step down to their caps;
-    then the columns dropped in order (bars, 플랜, 그룹, 페이블, 갱신, reset text); then the label narrowed."""
-    suffixes = _label_suffixes(accounts, ctx, True, True)
-    label_w = max(display_width(_label_cell(a, suffixes, None, ctx), ctx.amb) for a in accounts)
-    age_w = max(display_width(_age_text(a, now, ctx, daemon_running), ctx.amb) for a in accounts)
-    reason_w = max(display_width(reason_text(_reason_tokens(a), ctx.g.join), ctx.amb) for a in accounts)
-    out = [_Layout(0)]
-    for k in range(1, max(label_w - _LABEL_CAP, age_w - _AGE_CAP, reason_w - _REASON_CAP, 0) + 1):
-        out.append(_Layout(0, max(_LABEL_CAP, label_w - k), max(_AGE_CAP, age_w - k),
-                           max(_REASON_CAP, reason_w - k)))
-    out.append(_Layout(0, _LABEL_CAP, _AGE_CAP, _REASON_CAP))
-    out += [_Layout(level, _LABEL_CAP, _AGE_CAP, _REASON_CAP_NO_BARS) for level in range(1, _LEVELS)]
-    out += [_Layout(_LEVELS - 1, cap, _AGE_CAP, _REASON_CAP_NO_BARS) for cap in range(_LABEL_CAP - 1, 3, -1)]
-    return out
+def _natural_widths(accounts: List[dict], now: datetime, ctx: _Ctx, daemon_running: bool) -> Tuple[int, int, int, int]:
+    """Uncut widths of the flexible cells: label (with its suffix), 갱신, unavailable reason, group."""
+    texts = _label_texts(accounts, ctx, None, True, True)
+    return (max(display_width(t, ctx.amb) for t in texts.values()),
+            max(display_width(_age_text(a, now, ctx, daemon_running), ctx.amb) for a in accounts),
+            max(display_width(reason_text(_reason_tokens(a), ctx.g.join), ctx.amb) for a in accounts),
+            max(display_width(_clean(a.get("group")), ctx.amb) for a in accounts))
+
+
+def _layouts(accounts: List[dict], now: datetime, ctx: _Ctx, daemon_running: bool) -> List[List[_Layout]]:
+    """Layouts from widest to narrowest, in phases: nothing cut; the flexible cells cut step by step down to
+    their caps; the columns dropped in order (bars, 플랜, 그룹, 페이블, 갱신, reset text); the unavailable
+    reason cut to 4 columns; the label narrowed.
+    Within the shrinking phases every step is at most as wide as the one before."""
+    label_w, age_w, reason_w, group_w = _natural_widths(accounts, now, ctx, daemon_running)
+    over = max(label_w - _LABEL_CAP, age_w - _AGE_CAP, reason_w - _REASON_CAP, group_w - _GROUP_CAP, 0)
+    shrink = [_Layout(0, max(_LABEL_CAP, label_w - k), max(_AGE_CAP, age_w - k), max(_REASON_CAP, reason_w - k),
+                      max(_GROUP_CAP, group_w - k)) for k in range(1, over + 1)]
+    capped = dict(age_cap=_AGE_CAP, group_cap=_GROUP_CAP)
+    shrink.append(_Layout(0, _LABEL_CAP, reason_cap=_REASON_CAP, **capped))
+    drops = [[_Layout(level, _LABEL_CAP, reason_cap=_REASON_CAP_NO_BARS, **capped)] for level in range(1, _LEVELS)]
+    # Last, the unavailable reason gives way before the label does, so rows stay told apart.
+    reason = [_Layout(_LEVELS - 1, _LABEL_CAP, reason_cap=cap, **capped) for cap in range(_REASON_CAP_NO_BARS - 1, 3, -1)]
+    narrow = [_Layout(_LEVELS - 1, cap, reason_cap=4, **capped) for cap in range(_LABEL_CAP - 1, 3, -1)]
+    return [[_Layout(0)], shrink] + drops + [reason, narrow]
 
 
 def _fit_accounts(accounts: List[dict], now: datetime, ctx: _Ctx, width: int, daemon_running: bool,
@@ -671,12 +749,25 @@ def _fit_accounts(accounts: List[dict], now: datetime, ctx: _Ctx, width: int, da
     label, plan and account id."""
     accounts = sorted(accounts, key=_row_key)
     plain = dataclasses.replace(ctx, color=False)
-    layouts = _layouts(accounts, now, ctx, daemon_running)
-    for lay in layouts:
-        if _max_width(_accounts_table(accounts, now, plain, daemon_running, lay, soft_pct, hard_pct), ctx.amb) <= width:
-            return _accounts_table(accounts, now, ctx, daemon_running, lay, soft_pct, hard_pct)
+
+    def fits(lay: _Layout) -> bool:
+        return _max_width(_accounts_table(accounts, now, plain, daemon_running, lay, soft_pct, hard_pct),
+                          ctx.amb) <= width
+
+    phases = _layouts(accounts, now, ctx, daemon_running)
+    for phase in phases:
+        if not fits(phase[-1]):
+            continue
+        lo, hi = 0, len(phase) - 1  # the first (widest) step of this phase that fits
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if fits(phase[mid]):
+                hi = mid
+            else:
+                lo = mid + 1
+        return _accounts_table(accounts, now, ctx, daemon_running, phase[lo], soft_pct, hard_pct)
     return [clip(line, width, ctx.amb, "")
-            for line in _accounts_table(accounts, now, plain, daemon_running, layouts[-1], soft_pct, hard_pct)]
+            for line in _accounts_table(accounts, now, plain, daemon_running, phases[-1][-1], soft_pct, hard_pct)]
 
 
 def _result_text(r: dict, label_of: Callable[[object], str], tz: tzinfo) -> str:
@@ -706,50 +797,72 @@ def _result_text(r: dict, label_of: Callable[[object], str], tz: tzinfo) -> str:
     return _clean(", ".join(parts)) or "-"
 
 
-def _sessions_table(d: dict, label_of: Callable[[object], str], tz: tzinfo, ctx: _Ctx, width: int) -> List[str]:
-    entries = []
-    for r in d.get("sessions") or []:
-        if isinstance(r, dict):
-            entries.append((r, label_of(r.get("account_id")), _result_text(r, label_of, tz)))
-    for u in d.get("unmanaged_sessions") or []:
-        if isinstance(u, dict):
-            entries.append((u, "(관리 밖)", "-"))
-    if not entries:
-        return []
+def _sessions_table(d: dict, labels_at: Callable[[int], Callable[[object], str]], tz: tzinfo, ctx: _Ctx,
+                    width: int) -> List[str]:
+    """Fits ``width`` by cutting the 최근 전환 결과 text down to 4 columns, then the 계정 cell down to 4; when
+    even that does not fit, the lines are cut with the 계정 cells as at the start."""
 
-    def build(cap: Optional[int]) -> List[str]:
+    def entries(label_of: Callable[[object], str]) -> List[Tuple[dict, str, str]]:
+        out = []
+        for r in d.get("sessions") or []:
+            if isinstance(r, dict):
+                out.append((r, label_of(r.get("account_id")), _result_text(r, label_of, tz)))
+        for u in d.get("unmanaged_sessions") or []:
+            if isinstance(u, dict):
+                out.append((u, "(관리 밖)", "-"))
+        return out
+
+    def build(rows_in: List[Tuple[dict, str, str]], cap: Optional[int]) -> List[str]:
         rows = [[str(r.get("pid")), lab, _clean(r.get("status")) or "-",
                  _clean(r.get("model")) or "-", res if cap is None else clip(res, cap, ctx.amb, ctx.g.ell)]
-                for r, lab, res in entries]
+                for r, lab, res in rows_in]
         return _table(["PID", "계정", "상태", "모델", "최근 전환 결과"], ["right", "left", "left", "left", "left"],
                       rows, ctx)
 
-    table = build(None)
+    rows = entries(labels_at(_SESSION_LABEL_CAP))
+    if not rows:
+        return []
+    table = build(rows, None)
     if _max_width(table, ctx.amb) <= width:
         return table
-    for cap in range(max(display_width(res, ctx.amb) for _, _, res in entries) - 1, 3, -1):
-        table = build(cap)
+    for cap in range(max(display_width(res, ctx.amb) for _, _, res in rows) - 1, 3, -1):
+        table = build(rows, cap)
         if _max_width(table, ctx.amb) <= width:
             return table
-    return [clip(line, width, ctx.amb, "") for line in build(4)]
+    for label_cap in range(_SESSION_LABEL_CAP - 1, 3, -1):
+        table = build(entries(labels_at(label_cap)), 4)
+        if _max_width(table, ctx.amb) <= width:
+            return table
+    # Nothing fits (the 모델 column is never cut): cut the lines, with the 계정 cells left readable.
+    return [clip(line, width, ctx.amb, "") for line in build(rows, 4)]
 
 
 _WRAP_INDENT = "      "
 
 
 def _wrap(line: str, w: int, amb: bool, ell: str) -> List[str]:
-    """Hint lines are wrapped, never cut."""
+    """Hint lines are wrapped at spaces, never cut; a word longer than a whole line is split. The space a line
+    breaks at ends the line when it fits, else starts the next one, so the text reads back unchanged."""
     if display_width(line, amb) <= w or w <= len(_WRAP_INDENT) + 4:
         return [clip(line, w, amb, ell)]
     out: List[str] = []
-    cur, used, room = "", 0, w
-    for c in line:
-        cw = _char_width(c, amb)
-        if used + cw > room:
+    cur, used = "", 0
+    for i, word in enumerate(line.split(" ")):
+        lead = "" if i == 0 else " "
+        need = display_width(lead + word, amb)
+        if i and used + need > w and cur.strip():
+            if used + 1 <= w:
+                cur, lead = cur + " ", ""
             out.append(cur)
-            cur, used, room = _WRAP_INDENT, len(_WRAP_INDENT), w
-        cur += c
-        used += cw
+            cur, used = _WRAP_INDENT, len(_WRAP_INDENT)
+            need = display_width(lead + word, amb)
+        for c in lead + word:  # a word wider than the room left on a fresh line is split
+            cw = _char_width(c, amb)
+            if used + cw > w:
+                out.append(cur)
+                cur, used = _WRAP_INDENT, len(_WRAP_INDENT)
+            cur += c
+            used += cw
     out.append(cur)
     return out
 
@@ -794,26 +907,17 @@ def render(doc: Optional[dict], now: datetime, tz: tzinfo, width: int, *, color:
     table = _fit_accounts(accounts, now, ctx, w, running, soft_pct, hard_pct)
     legend = "* = Orca 선택 계정   노랑 %s%g%%  빨강 %s%g%%" % (g.ge, soft_pct, g.ge, hard_pct)
     lines = [title(display_width(table[0], amb))] + table + [clip(legend, w, amb, g.ell)]
-    if not running and any(_token_state(a, running) == NEEDS_REFRESH for a in accounts):
+    if not running and any(_token_state(a, running, now) == NEEDS_REFRESH for a in accounts):
         lines += _wrap(REFRESH_FOOTER, w, amb, g.ell)
 
-    triples = collections.Counter((_row_label(a), _row_group(a, ctx), _row_plan(a)) for a in accounts)
+    def labels_at(cap: int) -> Callable[[object], str]:
+        # The sessions table has no 그룹 or 플랜 column: its 계정 cell is the accounts table's narrow form.
+        texts = _label_texts(accounts, ctx, cap, False, False, _GROUP_CAP)
+        return lambda aid: texts.get(_clean(aid)) or _clean(aid)[:8] or "-"
 
-    def session_label(a: dict) -> str:
-        # The sessions table has no 그룹 or 플랜 column: "<label> <group> <plan>", each part only when known.
-        label, group, plan = _row_label(a), _row_group(a, ctx), _row_plan(a)
-        parts = [clip(label, _LABEL_CAP, amb, g.ell)] + [x for x in (group, plan) if x != "-"]
-        if triples[(label, group, plan)] > 1:
-            parts.append("#" + _clean(a.get("account_id"))[:4])
-        return " ".join(parts)
-
-    labels = {a.get("account_id"): session_label(a) for a in accounts}
-
-    def label_of(aid: object) -> str:
-        return labels.get(aid) or _clean(aid)[:8] or "-"
-
+    label_of = labels_at(_SESSION_LABEL_CAP)
     free: List[Tuple[str, bool]] = []
-    sessions = _sessions_table(d, label_of, tz, dataclasses.replace(ctx, color=False), w)
+    sessions = _sessions_table(d, labels_at, tz, dataclasses.replace(ctx, color=False), w)
     if sessions:
         lines += [""] + sessions
         for r in d.get("sessions") or []:

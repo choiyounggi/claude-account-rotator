@@ -372,6 +372,28 @@ class FetchUsageTest(unittest.TestCase):
                 result = run(http=FakeHttp(code, ""))
                 self.assertEqual(result.error, "network;cache_missing")
 
+    def test_token_expiry_time_is_reported(self):
+        exp_ms = int((NOW.timestamp() + 240) * 1000)
+        for kw, source in (({"http": FakeHttp(200, LIVE_BODY)}, "live"),
+                           ({"http": FakeHttp(429, "x"), "read_text": FakeFiles({CLAUDE_JSON_PATH: claude_json()})},
+                            "cache"),
+                           ({"http": FakeHttp(503, "")}, "unavailable")):
+            with self.subTest(source=source):
+                result = run(keychain=FakeKeychain(cred_json(exp_ms)), **kw)
+                self.assertEqual(result.source, source)
+                self.assertEqual(result.token_expires_at, datetime.fromtimestamp(exp_ms / 1000.0, UTC))
+        self.assertIsNone(run(http=FakeHttp(200, LIVE_BODY), keychain=FakeKeychain(None)).token_expires_at)
+
+    def test_token_expiry_out_of_range_is_dropped(self):
+        result = run(http=FakeHttp(200, LIVE_BODY), keychain=FakeKeychain(cred_json(10 ** 18)))
+        self.assertEqual(result.source, "live")
+        self.assertIsNone(result.token_expires_at)
+
+    def test_token_expires_at_must_be_aware(self):
+        with self.assertRaises(ValueError):
+            AccountUsage(account_id=ACC1, source="live", fetched_at=NOW, five_hour=UsageWindow(1.0, None),
+                         token_expires_at=datetime(2026, 1, 1))
+
     def test_http_called_once_on_failure(self):
         h = FakeHttp(503, "")
         run(http=h)

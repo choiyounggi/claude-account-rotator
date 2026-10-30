@@ -277,6 +277,7 @@ def usage_summary(u: AccountUsage) -> dict:
         "five_hour": _window(u.five_hour),
         "seven_day": _window(u.seven_day),
         "fable": _window(u.fable),
+        "token_expires_at": _iso(u.token_expires_at) if u.token_expires_at is not None else None,
     }
 
 
@@ -297,7 +298,9 @@ def usage_from_summary(d: Mapping[str, Any]) -> Optional[AccountUsage]:
                             five_hour=_window_from(d.get("five_hour")),
                             seven_day=_window_from(d.get("seven_day")),
                             error=d.get("error"),
-                            fable=_window_from(d.get("fable")))
+                            fable=_window_from(d.get("fable")),
+                            token_expires_at=(_parse_iso(d["token_expires_at"])
+                                              if d.get("token_expires_at") is not None else None))
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
 
@@ -573,7 +576,8 @@ def shown_usage(latest: AccountUsage, last_good: Optional[AccountUsage]) -> Tupl
         return latest, False
     return AccountUsage(account_id=last_good.account_id, source="cache", fetched_at=last_good.fetched_at,
                         five_hour=last_good.five_hour, seven_day=last_good.seven_day,
-                        error=_live_kind(latest) or "request_error", fable=last_good.fable), True
+                        error=_live_kind(latest) or "request_error", fable=last_good.fable,
+                        token_expires_at=latest.token_expires_at), True
 
 
 @dataclass(frozen=True)

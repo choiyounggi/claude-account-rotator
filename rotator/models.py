@@ -106,6 +106,7 @@ class AccountUsage:
     error: Optional[str] = None  # None, or USAGE_ERROR_RE.fullmatch(error) is not None
     fable: Optional[UsageWindow] = None  # Fable weekly_scoped window; not a 5h/7d window for the validity rules
     retry_after_s: Optional[float] = None  # server delay of a live HTTP 429, seconds
+    token_expires_at: Optional[datetime] = None  # aware; when the account's access token expires, if read
 
     def __post_init__(self) -> None:
         if self.source not in USAGE_SOURCES:
@@ -140,6 +141,9 @@ class AccountUsage:
             if not (isinstance(e, str) and (e == "http_429" or e.startswith("http_429;"))):
                 raise ValueError("AccountUsage.retry_after_s needs an http_429 error")
             object.__setattr__(self, "retry_after_s", rf)
+        t = self.token_expires_at
+        if t is not None and not (isinstance(t, datetime) and t.utcoffset() is not None):
+            raise ValueError("AccountUsage.token_expires_at must be timezone-aware or None")
 
     def max_utilization(self, now: Optional[datetime] = None) -> Optional[float]:
         """Max utilization over present windows; None when both are absent.

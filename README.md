@@ -69,13 +69,16 @@ q 또는 Ctrl-C 종료
   else the first 8 characters of the account folder id. `*` marks the account `selected-host` points to.
 - 그룹 is the organization the profile is logged in to (`oauthAccount.organizationName`). When two or more
   different names all start with the same word(s), that shared start is left out (`Example Org TEAM 1` shows as
-  `TEAM 1`; a name is never cut down to a bare number). It is cut with `…` at 10 columns, `-` when unknown, and
-  the column is left out when no account has one.
+  `TEAM 1`; a name is never cut down to a bare number). It is shown whole while the table fits and cut with `…`
+  at 10 columns only when it does not; `-` when unknown; the column is left out when no account has one.
 - 플랜 is the seat tier Orca stored for the profile (`rateLimitTier`): `Max5x`, `Max20x`, `Team` (`default_raven`),
   any other tier without its `default_` prefix cut to 8 characters, `-` when unknown. The same email logged in
   under several profiles shows as several rows told apart by 그룹 and 플랜; rows whose label, group and plan are
   all equal get ` #` and the first 4 characters of their account folder id. Rows are sorted by group, then label,
-  then plan, then folder id. The sessions table's 계정 shows `<label> <group> <plan>`.
+  then plan, then folder id. The sessions table's 계정 shows `<label> <group> <plan>` (26 columns at most).
+- In a narrow 계정 cell the label is kept and what follows it gives way first: the group is cut, then the group
+  and then the plan are left out, with ` #<id4>` taking over whenever the row would otherwise read like another;
+  only then is the label itself cut (`team.membe… #a001`).
 - Each usage cell is a 9-cell bar (4 for 페이블), the percent rounded down, and the time left until the window
   resets, rounded down: `· 1분 안`, `· 21분 뒤`, `· 1시간 21분 뒤`, `· 6일 2시간 뒤` (zero parts are left out:
   `· 1시간 뒤`, `· 6일 뒤`). A window already past its reset shows 0 % and no reset time. Cached numbers (Claude
@@ -83,8 +86,8 @@ q 또는 Ctrl-C 종료
   and the reason (토큰 만료, 토큰 없음, 요청 실패, 호출 제한, 연결 실패, 캐시 없음, …). 세션 counts the account's
   live sessions.
 - 갱신 is how long ago the usage was fetched, followed by `· 캐시` for cached numbers. An account whose token is
-  not usable shows what it needs first: `갱신 필요` (expired, the daemon is off), `갱신 대기` (expired, the daemon
-  will refresh it), `세션이 갱신` (a Claude session runs on the account; Claude Code refreshes the token on that
+  not usable shows what it needs first: `갱신 필요` (expired or expiring within 5 minutes, the daemon is off),
+  `갱신 대기` (the same, the daemon will refresh it), `세션이 갱신` (a Claude session runs on the account; Claude Code refreshes the token on that
   session's next request and the rotator leaves it alone), `재로그인 필요` (the server refused the refresh token,
   or the daemon stopped trying until the Keychain item changes), `키체인 저장 실패`, or another refresh reason
   below. A cached row without a token problem shows its usage error there instead (`10분 전 · 캐시 · 호출 제한`).
@@ -96,8 +99,10 @@ q 또는 Ctrl-C 종료
   a wide enough terminal nothing is cut. When the table does not fit, the label, the 갱신 text and the
   unavailable reason are cut step by step down to 18, 20 and 24 columns; then it drops the bars, then the 플랜
   column, then 그룹 (accounts sharing a label then show their group and plan after it), then 페이블, then 갱신,
-  then the reset times, then narrows 계정; rows are never wrapped. `status --watch` measures the terminal on every
-  redraw, so resizing it widens or narrows the table within a second. Hint lines below the sessions table wrap instead of being cut. A
+  then the reset times, then cuts an unavailable account's reason down to 4 columns, then narrows 계정; rows are
+  never wrapped. `status --watch` measures the terminal on every redraw, so resizing it widens or narrows the
+  table within a second. The sessions table cuts its 최근 전환 결과 text first, then its 계정 cell. Hint lines and
+  the footer wrap at spaces instead of being cut. A
   relaunch command gets a line of its own, printed whole and never wrapped by `status` (the terminal soft-wraps it),
   so copying the line gives the exact command.
 - Box glyphs and `█▒` are "ambiguous width": terminals set to draw them double width (common in Korean setups)
@@ -264,7 +269,7 @@ updates.
 | `schema` | `1` |
 | `generated_at` | when the document was built |
 | `daemon` | `{running, pid, snapshot_age_s, flags}` from the daemon's last snapshot |
-| `accounts` | one entry per account (a `live` entry with an `error` is the last good reading after a failed fetch): `account_id, label, group, plan, source, error, fetched_at, five_hour, seven_day, fable` (each window `{utilization, resets_at}` or null), `pointer`, `sessions` (`[{pid, status, model}]`) |
+| `accounts` | one entry per account (a `live` entry with an `error` is the last good reading after a failed fetch): `account_id, label, group, plan, token_expires_at` (when the account's access token expires, as last read; never the token), `source, error, fetched_at, five_hour, seven_day, fable` (each window `{utilization, resets_at}` or null), `pointer`, `sessions` (`[{pid, status, model}]`) |
 | `pointer_account_id` | the account `selected-host` names, or null |
 | `sessions` | managed live sessions: `pid, session_id, status, account_id, model, decision, would_switch, in_flight, in_flight_pid, stuck, unswitchable, hard_hold_until, excluded, record_state, last_result, hint, post_verify` |
 | `unmanaged_sessions` | `[{pid, session_id, status, model}]` |

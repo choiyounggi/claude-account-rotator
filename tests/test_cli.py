@@ -674,7 +674,8 @@ class TestBuildStatus(StatusBase):
         self.assertEqual(doc["schema"], 1)
         self.assertEqual(set(doc["daemon"]), {"running", "pid", "snapshot_age_s", "flags"})
         self.assertEqual(set(doc["accounts"][0]), {"account_id", "source", "error", "fetched_at", "five_hour",
-                                                   "seven_day", "fable", "label", "group", "plan", "pointer",
+                                                   "seven_day", "fable", "token_expires_at", "label", "group",
+                                                   "plan", "pointer",
                                                    "sessions",
                                                    "refresh"})
         self.assertEqual(set(doc["sessions"][0]), {
@@ -1611,7 +1612,7 @@ class TestPlan(unittest.TestCase):
         doc = plan_doc([(ID_A1, long, "Team"), (ID_B2, long, "Team")])
         self.assertEqual([r[1] for r in self.rows(doc)], [long + " #aaaa", long + " #bbbb"])  # wide: uncut
         rows = self.rows(doc, width=70)
-        self.assertEqual([r[1] for r in rows], ["a-very… Team #aaaa", "a-very… Team #bbbb"])
+        self.assertEqual([r[1] for r in rows], ["a-very-long… #aaaa", "a-very-long… #bbbb"])  # suffix gives way
         self.assertTrue(all(cli.display_width(r[1]) <= 18 for r in rows))
 
     def test_alignment_with_plan_column(self):
@@ -1703,9 +1704,14 @@ class TestGroup(unittest.TestCase):
     def test_group_truncated_to_10(self):
         doc = plan_doc([(ID_A1, "user", "Max5x")])
         doc["accounts"][0]["group"] = "A Very Long Group Name"
-        self.assertEqual(self.rows(doc)[0][2], "A Very Lo…")
-        self.assertEqual(cli.display_width(self.rows(doc)[0][2]), 10)
-        self.assertEqual(self.rows(doc, ascii=True)[0][2], "A Very Lo~")
+        self.assertEqual(self.rows(doc)[0][2], "A Very Long Group Name")  # the table fits: never cut
+        narrow = next(w for w in range(200, 40, -1) if "…" in self.rows(doc, width=w)[0][2])
+        self.assertEqual(self.rows(doc, width=narrow)[0][2][-1], "…")
+        self.assertGreaterEqual(cli.display_width(self.rows(doc, width=narrow)[0][2]), 10)
+        self.assertEqual(self.rows(doc, width=narrow, ascii=True)[0][2][-1], "~")
+        cut = [w for w in range(200, 40, -1) if "그룹" in cells(tables(render(doc, T0, TZ9, w))[0][1])
+               and self.rows(doc, width=w)[0][2] == "A Very Lo…"]
+        self.assertTrue(cut)  # the shrink phase cuts it down to 10 columns before 그룹 is dropped
 
     def test_dropped_group_joins_the_label(self):
         doc = plan_doc([(ID_A1, "user", "Max5x"), (ID_B2, "user", "Max5x")])
@@ -1717,10 +1723,12 @@ class TestGroup(unittest.TestCase):
             labels = [cells(l)[1] for l in account_rows(lines)]
             if "플랜" in head:
                 self.assertIn("그룹", head)  # 그룹 is dropped only after 플랜
-            if "그룹" not in head and "플랜" not in head and all(lab.startswith("user ") for lab in labels):
-                self.assertEqual(labels, ["user TEAM 1 Max5x", "user TEAM 2 Max5x"])
-                seen.add(width)
-        self.assertTrue(seen)
+            self.assertTrue(all(lab.startswith("user") for lab in labels), (width, labels))  # never eaten
+            if "그룹" not in head and "플랜" not in head:
+                self.assertEqual(len(set(labels)), 2, (width, labels))  # the rows stay apart
+                seen.add(tuple(labels))
+        # the group and plan join the label while they fit; narrower, "#id4" alone keeps the rows apart
+        self.assertEqual(seen, {("user TEAM 1 Max5x", "user TEAM 2 Max5x"), ("user #aaaa", "user #bbbb")})
 
     def test_sessions_label_has_group_and_plan(self):
         doc = plan_doc([(ID_A1, "user", "Max5x"), (ID_B2, "user", "Max5x")])
@@ -1811,8 +1819,212 @@ class TestLastGood(StatusBase):
         doc = daemon_off(doc)
         self.assertEqual(TestRender.row(self, render(doc, T0, TZ9, 200), "alice")[-1], "갱신 필요 · 5분 전")
 
+    def test_near_expiry_needs_refresh(self):
+        def row_last(doc, aid="alice"):
+            return TestRender.row(self, render(doc, T0, TZ9, 200), aid)[-1]
+        doc = render_doc()
+        doc["accounts"] = doc["accounts"][:1]  # alice only: bob's expired token would bring the footer anyway
+        doc["accounts"][0]["sessions"] = []
+        doc["accounts"][0]["token_expires_at"] = (T0 + timedelta(minutes=4)).isoformat()  # inside the 5 min margin
+        self.assertEqual(row_last(doc), "갱신 대기 · 12초 전")  # live reading, daemon on
+        self.assertEqual(row_last(daemon_off(doc)), "갱신 필요 · 12초 전")
+        self.assertIn(cli.REFRESH_FOOTER, render(daemon_off(doc), T0, TZ9, 200))
+        doc["accounts"][0]["token_expires_at"] = (T0 + timedelta(minutes=5)).isoformat()  # exactly the margin
+        self.assertEqual(row_last(daemon_off(doc)), "갱신 필요 · 12초 전")
+        doc["accounts"][0]["token_expires_at"] = (T0 + timedelta(minutes=5, seconds=1)).isoformat()
+        self.assertEqual(row_last(daemon_off(doc)), "12초 전")
+        self.assertNotIn(cli.REFRESH_FOOTER, render(daemon_off(doc), T0, TZ9, 200))
+        for bad in (None, "soon", 7):
+            doc["accounts"][0]["token_expires_at"] = bad
+            self.assertEqual(row_last(daemon_off(doc)), "12초 전")
+
+    def test_near_expiry_states(self):
+        soon = (T0 + timedelta(minutes=2)).isoformat()
+        cases = [
+            ({"source": "live", "error": None, "sessions": [{"pid": 1}]}, True, "세션이 갱신"),
+            ({"source": "live", "error": None, "sessions": [],
+              "refresh": {"state": "skipped", "reason": "deferred"}}, True, "갱신 대기"),
+            ({"source": "cache", "error": "http_429", "sessions": []}, False, "갱신 필요"),
+            ({"source": "cache", "error": "http_429", "sessions": [],
+              "refresh": {"state": "stopped", "reason": "invalid_grant"}}, True, "재로그인 필요"),
+        ]
+        for a, running, want in cases:
+            with self.subTest(a=a, running=running):
+                self.assertEqual(cli._token_state(dict(a, token_expires_at=soon), running, T0), want)
+        self.assertIsNone(cli._token_state({"source": "live", "error": None, "token_expires_at": soon}, True))
+
     def test_live_row_without_error_shows_age_only(self):
         self.assertEqual(TestRender.row(self, render(render_doc(), T0, TZ9, 200), "alice")[-1], "12초 전")
+
+
+def collide_doc():
+    """dashboard_doc with groups and labels that repeat across groups (same label, same or other plan)."""
+    doc = grouped(dashboard_doc())
+    for n, (lab, g, plan) in enumerate((("alice", "TEAM 1", "Max5x"), ("alice", "TEAM 2", "Max5x"),
+                                        ("alice", "TEAM 2", "Max5x"), ("team.member.10", "TEAM 1", "Team"),
+                                        ("team.member.10", "TEAM 2", "Max5x"), ("team.member.10", "TEAM 2", "Team"))):
+        doc["accounts"].append(dict(doc["accounts"][0], account_id="%x%x%x%x-0000-0000-0000-000000000000" % ((n + 10,) * 4),
+                                    label=lab, group=g, plan=plan, pointer=False))
+    return doc
+
+
+class TestNarrowLabels(unittest.TestCase):
+    """rework F1: the label is never eaten by its suffix, and the table keeps its right border."""
+
+    def test_labels_stay_readable_and_distinct(self):
+        for width in (60, 70, 80):
+            for amb in (False, True):
+                with self.subTest(width=width, amb=amb):
+                    lines = render(collide_doc(), T0, TZ9, width, ambiguous_wide=amb)
+                    head = cells(tables(lines)[0][1])
+                    shown = [tuple(c for c, h in zip(cells(l), head) if h in ("계정", "그룹", "플랜"))
+                             for l in account_rows(lines)]
+                    self.assertEqual(len(set(shown)), len(shown), shown)  # every row tells itself apart
+                    for row in shown:
+                        self.assertNotRegex(row[0], r"^(…|~)|^ |^#", row)
+                    alice = [r[0] for r in shown if r[0].startswith("alice")]
+                    self.assertEqual(len(alice), 4, shown)  # "alice" itself is kept whole
+
+    def test_suffix_is_cut_before_the_label(self):
+        ctx = cli._Ctx(cli.GLYPHS_UNICODE, False, False)
+        accounts = collide_doc()["accounts"]  # dashboard_doc's alice is TEAM 1 Max5x too
+        aid = lambda n: "%x%x%x%x-0000-0000-0000-000000000000" % ((n + 10,) * 4)  # noqa: E731
+        texts = cli._label_texts(accounts, ctx, None, False, False)
+        self.assertEqual([texts[aid(i)] for i in range(6)],
+                         ["alice TEAM 1 Max5x #aaaa", "alice TEAM 2 Max5x #bbbb", "alice TEAM 2 Max5x #cccc",
+                          "team.member.10 TEAM 1 Team", "team.member.10 TEAM 2 Max5x", "team.member.10 TEAM 2 Team"])
+        # group cut, then group left out, then plan left out (#id4 whenever the row would repeat), then label cut
+        for cap, want in ((24, "alice TEAM 2 Max5x #bbbb"), (21, "alice TE… Max5x #bbbb"), (17, "alice Max5x #bbbb"),
+                          (12, "alice #bbbb"), (10, "ali… #bbbb"), (7, "alice"), (4, "ali…")):
+            with self.subTest(cap=cap):
+                got = cli._label_texts(accounts, ctx, cap, False, False)[aid(1)]
+                self.assertEqual(got, want)
+                self.assertLessEqual(cli.display_width(got), cap)
+        at24 = cli._label_texts(accounts, ctx, 24, False, False)
+        self.assertEqual(at24[aid(4)], "team.member.10 TE… Max5x")  # unique once its plan shows: no #id
+        self.assertEqual(at24[aid(3)], "team.member.10 #dddd")  # "team.member.10 Team" would repeat aid(5)
+        for cap in range(4, 30):
+            got = cli._label_texts(accounts, ctx, cap, False, False)
+            self.assertTrue(all(cli.display_width(t) <= cap for t in got.values()), (cap, got))
+            self.assertTrue(all(not t.startswith(("…", " ", "#")) for t in got.values()), (cap, got))
+
+    def test_cut_group_that_repeats_falls_back_to_id(self):
+        ctx = cli._Ctx(cli.GLYPHS_UNICODE, False, False)
+        accounts = [{"account_id": "aaaa0000", "label": "user", "group": "TEAM 1", "plan": "Team"},
+                    {"account_id": "bbbb0000", "label": "user", "group": "TEAM 2", "plan": "Team"}]
+        self.assertEqual(sorted(cli._label_texts(accounts, ctx, None, False, False).values()),
+                         ["user TEAM 1 Team", "user TEAM 2 Team"])
+        self.assertEqual(sorted(cli._label_texts(accounts, ctx, 14, False, False).values()),
+                         ["user #aaaa", "user #bbbb"])  # "user TE… Team" twice would read the same
+
+    def test_unique_label_gets_no_suffix(self):
+        ctx = cli._Ctx(cli.GLYPHS_UNICODE, False, False)
+        texts = cli._label_texts(collide_doc()["accounts"], ctx, 8, False, False)
+        self.assertEqual(texts["00000000-0000-0000-0000-000000000003"], "carol")
+
+    def test_no_hard_cut_from_60_to_220(self):
+        for amb in (False, True):
+            for ascii in (False, True):
+                for off in (False, True):
+                    for width in range(60, 221, 7):
+                        with self.subTest(amb=amb, ascii=ascii, off=off, width=width):
+                            doc = daemon_off(collide_doc()) if off else collide_doc()
+                            lines = render(doc, T0, TZ9, width, ambiguous_wide=amb, ascii=ascii)
+                            for block in tables(lines, ascii):
+                                self.assertIn(block[0][-1], "┐+", "\n".join(block))
+                                self.assertEqual(len({cli.display_width(SGR.sub("", l), ambiguous_wide=amb)
+                                                      for l in block}), 1)
+                                self.assertEqual(len({tuple(border_cols(l, amb, ascii)) for l in block}), 1)
+                            for l in set(lines) - RELAUNCH_LINES:
+                                self.assertLessEqual(cli.display_width(l, ambiguous_wide=amb), width)
+
+
+def realistic_doc():
+    """Nine accounts like a real machine: dotted labels repeating across two groups, nine sessions."""
+    doc = render_doc()
+    names = ["team.member.1", "team.member.10", "team.member.11", "team.member.12", "team.member.2",
+             "team.member.10", "team.member.11", "team.member.12", "other.person"]
+    plans = ["Max5x", "Team", "Team", "Team", "Max5x", "Max5x", "Max5x", "Max5x", "Max5x"]
+    groups = ["TEAM 1"] * 5 + ["TEAM 2"] * 3 + ["TEAM 1"]
+    doc["accounts"] = [dict(render_doc()["accounts"][0], account_id="%04x0000-0000-0000-0000-000000000000" % (0xa000 + i),
+                            label=n, plan=p, group=g, pointer=(i == 5)) for i, (n, p, g) in enumerate(zip(names, plans, groups))]
+    doc["sessions"] = [dict(render_doc()["sessions"][0], pid=40000 + i, account_id=doc["accounts"][i % 9]["account_id"],
+                            model="claude-opus-5-5", decision=None, last_result=None, hint="") for i in range(9)]
+    doc["unmanaged_sessions"], doc["attention"] = [{"pid": 555, "session_id": SID2, "status": "idle",
+                                                    "model": "claude-opus-5-5"}], []
+    return doc
+
+
+class TestSessionsTableFits(unittest.TestCase):
+    """rework F2: the sessions table fits 80 columns on realistic data with a compact 계정 cell."""
+
+    def test_fits_80_without_hard_cut(self):
+        for width, amb in ((80, False), (80, True), (74, False)):
+            with self.subTest(width=width, amb=amb):
+                lines = render(realistic_doc(), T0, TZ9, width, ambiguous_wide=amb)
+                block = tables(lines)[1]
+                self.assertIn(block[0][-1], "┐", "\n".join(block))
+                self.assertLessEqual(cli.display_width(block[0], ambiguous_wide=amb), width)
+                names = {cells(l)[1] for l in block[3:-1]} - {"(관리 밖)"}
+                self.assertEqual(len(names), 9, names)  # nine accounts, nine distinct 계정 cells
+                for n in names:
+                    self.assertLessEqual(cli.display_width(n, ambiguous_wide=amb), cli._SESSION_LABEL_CAP)
+                    self.assertFalse(n.startswith("…"), n)
+
+    def test_too_narrow_keeps_labels_readable(self):
+        lines = render(realistic_doc(), T0, TZ9, 50)
+        block = tables(lines)[1]
+        self.assertTrue(all(cli.display_width(l) <= 50 for l in block))
+        self.assertNotIn("┐", block[0])  # hard cut: the 모델 column alone does not fit
+        names = {cells(l)[1] for l in block[3:-1]}
+        self.assertIn("other.person", names)  # not cut down to "oth…" first: the cut buys nothing
+        self.assertIn("team.member.10 TEAM 1 Team", names)
+
+    def test_wide_sessions_label_shows_group_and_plan(self):
+        lines = render(realistic_doc(), T0, TZ9, 200)
+        names = {cells(l)[1] for l in tables(lines)[1][3:-1]}
+        self.assertIn("team.member.10 TEAM 1 Team", names)  # label, group and plan when they fit 26 columns
+        self.assertIn("team.member.10 TEAM… Max5x", names)  # 27 columns: its group is cut, not its label
+        self.assertIn("other.person", names)  # a label no other account has needs nothing after it
+
+
+class TestWrapAtSpaces(unittest.TestCase):
+    """rework F4: the footer and hint lines break only at spaces."""
+
+    def check(self, text, width, indent="      ", long_word=None):
+        out = cli._wrap(text, width, False, "…")
+        self.assertEqual(out[0] + "".join(l[len(indent):] for l in out[1:]), text)
+        for l in out:
+            self.assertLessEqual(cli.display_width(l), width, l)
+        for a, b in zip(out, out[1:]):
+            inside_long = long_word is not None and set(a.strip()) == {"x"} and b[len(indent):].startswith("x")
+            self.assertTrue(a.endswith(" ") or b[len(indent):].startswith(" ") or inside_long, (a, b))
+        return out
+
+    def test_footer_at_narrow_widths(self):
+        for width in range(20, 80):
+            with self.subTest(width=width):
+                out = self.check(cli.REFRESH_FOOTER, width)
+                joined = " ".join(l.strip() for l in out)
+                self.assertIn("rotator daemon", joined)
+                self.assertIn("rotator install", joined)
+
+    def test_hint_lines(self):
+        hint = STATE_HINTS["exited"]
+        for width in (40, 60, 80):
+            self.check("  pid 101 힌트: " + hint, width)
+
+    def test_word_longer_than_a_line_is_split(self):
+        out = self.check("ab " + "x" * 50 + " cd", 20, long_word=True)
+        self.assertGreater(len(out), 2)
+        self.assertEqual(out[0], "ab ")  # the long word starts on its own line
+
+    def test_render_footer_never_mid_word(self):
+        lines = render(daemon_off(dashboard_doc()), T0, TZ9, 60)
+        i = next(i for i, l in enumerate(lines) if l.startswith("토큰 만료"))
+        block = [lines[i]] + list(itertools.takewhile(lambda l: l.startswith("      "), lines[i + 1:]))
+        self.assertEqual(block[0] + "".join(l[6:] for l in block[1:]), cli.REFRESH_FOOTER)
+        self.assertNotIn("      otator daemon)", block)
 
 
 class TestColor(unittest.TestCase):
