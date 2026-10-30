@@ -27,8 +27,8 @@ from rotator import launchd, refresh
 from rotator.accounts import profile_for_config_dir
 from rotator.config import CONFIG_PATH_DEFAULT, LOG_DIR_DEFAULT, Config, ConfigError, load_config
 from rotator.daemon import (
-    IN_PROGRESS_HINT, ORPHANED_HINT, STATE_FILENAME, Deps, UsageCache, identity_of,
-    load_records, real_deps, run_daemon, run_switch, touched, usage_summary,
+    IN_PROGRESS_HINT, ORPHANED_HINT, STATE_FILENAME, Deps, UsageCache, UsageStore, identity_of,
+    load_records, real_deps, run_daemon, run_switch, touched,
 )
 from rotator.policy import decide
 from rotator.sessions import session_homes
@@ -139,6 +139,22 @@ def plan_tag(tier: object) -> Optional[str]:
     return (t[len("default_"):] if t.startswith("default_") else t)[:8] or None
 
 
+def group_names(orgs: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
+    """Per account id, the organization name as the 그룹 column shows it: with two or more distinct names that
+    all start with the same word(s) and a space, that shared prefix is left out ("Org TEAM 1" -> "TEAM 1").
+    A name is never cut down to a bare number: the word before it stays."""
+    names = {aid: _clean(n) or None for aid, n in orgs.items()}
+    known = sorted({n for n in names.values() if n})
+    common = 0
+    if len(known) >= 2:
+        split = [n.split(" ") for n in known]
+        while all(len(ws) > common + 1 and ws[common] == split[0][common] for ws in split):
+            common += 1
+        while common and any(len(ws) == common + 1 and ws[common].isdigit() for ws in split):
+            common -= 1
+    return {aid: (" ".join(n.split(" ")[common:]) if n else None) for aid, n in names.items()}
+
+
 @dataclasses.dataclass(frozen=True)
 class Glyphs:
     h: str
@@ -154,8 +170,8 @@ class Glyphs:
 
 # The bar pair must share one East Asian width class: █ with ░ (A with N) draws bars of different lengths on
 # terminals that show ambiguous glyphs double width.
-GLYPHS_UNICODE = Glyphs("─", "│", "┌┬┐├┼┤└┴┘", "█", "▒", "…", "≥", "·", "↻%s")
-GLYPHS_ASCII = Glyphs("-", "|", "+++++++++", "#", ".", "~", ">=", "/", "(%s)")
+GLYPHS_UNICODE = Glyphs("─", "│", "┌┬┐├┼┤└┴┘", "█", "▒", "…", "≥", "·", "· %s")
+GLYPHS_ASCII = Glyphs("-", "|", "+++++++++", "#", ".", "~", ">=", "/", "/ %s")
 
 _REASONS = {"token_expired": "토큰 만료", "token_missing": "토큰 없음", "request_error": "요청 실패",
             "http_429": "호출 제한", "network": "연결 실패", "timeout": "연결 실패", "bad_json": "응답 이상",
@@ -163,7 +179,7 @@ _REASONS = {"token_expired": "토큰 만료", "token_missing": "토큰 없음", 
             "cache_bad_shape": "캐시 손상",
             # token refresh reasons (rotator.refresh.REFRESH_REASONS minus the success tokens)
             "disabled": "자동 갱신 꺼짐", "dry_run": "드라이런", "no_credential": "토큰 없음",
-            "no_refresh_token": "재로그인 필요", "plaintext_store": "갱신 불가", "live_session": "사용 중",
+            "no_refresh_token": "재로그인 필요", "plaintext_store": "갱신 불가", "live_session": "세션이 갱신",
             "discovery_failed": "세션 확인 실패", "keychain_item_unclear": "갱신 불가", "payload_too_large": "갱신 불가",
             "deferred": "갱신 대기", "locked": "갱신 중", "cc_lock_busy": "갱신 중", "cc_lock_stale": "잠금 남음",
             "changed_under_lock": "갱신 중", "keychain_write_unavailable": "키체인 쓰기 불가",
@@ -192,16 +208,17 @@ def reason_text(error: object, sep: str = "·") -> str:
 
 
 def remaining_text(seconds: float) -> str:
+    """Time until a reset, floored: ``1분 안``, ``N분 뒤``, ``N시간 M분 뒤``, ``N일 H시간 뒤`` (zero parts left out)."""
     s = int(max(0.0, seconds))
     if s < 60:
-        return "<1m"
+        return "1분 안"
     if s < 3600:
-        return "%dm" % (s // 60)
+        return "%d분 뒤" % (s // 60)
     if s < 86400:
         h, m = s // 3600, s % 3600 // 60
-        return "%dh%dm" % (h, m) if m else "%dh" % h
+        return "%d시간 %d분 뒤" % (h, m) if m else "%d시간 뒤" % h
     d, h = s // 86400, s % 86400 // 3600
-    return "%dd%dh" % (d, h) if h else "%dd" % d
+    return "%d일 %d시간 뒤" % (d, h) if h else "%d일 뒤" % d
 
 
 def age_text(seconds: float) -> str:
@@ -252,13 +269,20 @@ def _hint(rec: Optional[dict], deps: Deps) -> str:
     return rec.get("hint") or ""
 
 
+def _never_read(account_id: str, now: datetime) -> dict:
+    # Another process is fetching an account this one has no reading of yet.
+    return {"account_id": account_id, "source": "unavailable", "error": "request_error;cache_missing",
+            "fetched_at": _iso(now), "five_hour": None, "seven_day": None, "fable": None}
+
+
 def build_status(cfg: Config, deps: Deps, now: datetime, usage: Optional[UsageCache] = None) -> dict:
-    """One status document for the table and --json. Reads only: never locks, never writes.
+    """One status document for the table and --json. Its only writes are the shared usage files (under each
+    account's usage lock) when it fetches an account no rotator process fetched within usage_poll_s.
 
     Usage comes from a fresh snapshot of a running daemon, else from ``usage`` (a UsageCache the caller
     keeps across calls so each account is fetched at most once per usage_poll_s) or a new one-shot cache.
     """
-    log = logging.getLogger("rotator.cli")  # never deps.make_logger(): status writes nothing
+    log = logging.getLogger("rotator.cli")  # never deps.make_logger(): status writes no log
     profiles = deps.discover_profiles(cfg.profiles_root)
     try:
         found = deps.discover_sessions(session_homes(profiles))
@@ -282,12 +306,11 @@ def build_status(cfg: Config, deps: Deps, now: datetime, usage: Optional[UsageCa
         by_id = {d["account_id"]: d for d in (snap.get("accounts") or [])
                  if isinstance(d, dict) and "account_id" in d}
     missing = [p for p in profiles if p.account_id not in by_id]
-    cache = usage if usage is not None else UsageCache(cfg.usage_poll_s)
+    cache = usage if usage is not None else UsageCache(cfg.usage_poll_s, UsageStore(cfg.state_dir, deps))
     if missing:
         cache.refresh(missing, fetch=deps.fetch_usage, monotonic=deps.monotonic, now=now, log=log)
-    cached = cache.usages()
-    summaries = {p.account_id: by_id[p.account_id] if p.account_id in by_id else usage_summary(cached[p.account_id])
-                 for p in profiles}
+    summaries = {p.account_id: by_id[p.account_id] if p.account_id in by_id else
+                 (cache.summary(p.account_id) or _never_read(p.account_id, now)) for p in profiles}
     try:
         text = deps.read_pointer(cfg.profiles_root)
     except Exception:
@@ -351,6 +374,7 @@ def build_status(cfg: Config, deps: Deps, now: datetime, usage: Optional[UsageCa
     attention.sort(key=lambda a: a["updated_at"], reverse=True)
 
     profile_by_id = {p.account_id: p for p in profiles}
+    groups = group_names({p.account_id: p.organization_name for p in profiles})
 
     def _refresh_of(aid: str) -> Optional[dict]:
         if aid in by_id:
@@ -358,7 +382,7 @@ def build_status(cfg: Config, deps: Deps, now: datetime, usage: Optional[UsageCa
             return dict(rec) if isinstance(rec, dict) else None
         return dict(refresh.DAEMON_OFF_RECORD) if not running else None
 
-    accounts = [dict(summaries[aid], label=account_label(profile_by_id[aid]),
+    accounts = [dict(summaries[aid], label=account_label(profile_by_id[aid]), group=groups.get(aid),
                      plan=plan_tag(profile_by_id[aid].rate_limit_tier),
                      pointer=(aid == pointer_id), sessions=per_account.get(aid, []), refresh=_refresh_of(aid))
                 for aid in sorted(summaries)]
@@ -379,8 +403,12 @@ def build_status(cfg: Config, deps: Deps, now: datetime, usage: Optional[UsageCa
 TITLE = "Claude 계정 사용량"
 NO_ACCOUNTS = "계정 없음 (Orca 프로필 폴더 설정과 데몬 실행 여부를 확인하세요)"
 QUIT_HINT = "q 또는 Ctrl-C 종료"
+REFRESH_FOOTER = "토큰 만료 계정은 데몬이 자동 갱신해: rotator install (또는 rotator daemon)"
+# Caps a flexible cell shrinks to only when the natural (uncut) table is wider than the terminal.
 _LABEL_CAP = 18
 _AGE_CAP = 20
+_REASON_CAP, _REASON_CAP_NO_BARS = 24, 14
+_GROUP_CAP = 10
 _DIM, _YELLOW, _RED = "2", "33", "31"
 
 
@@ -440,35 +468,50 @@ def _row_plan(a: dict) -> str:
     return _clean(a.get("plan")) or "-"
 
 
-def _row_key(a: dict) -> Tuple[str, str, str]:
-    return _row_label(a), _row_plan(a), _clean(a.get("account_id"))
+def _row_group(a: dict, ctx: _Ctx) -> str:
+    return clip(_clean(a.get("group")), _GROUP_CAP, ctx.amb, ctx.g.ell) or "-"
 
 
-def _label_suffixes(accounts: List[dict], plan_visible: bool) -> Dict[str, str]:
-    """Per account id, what tells rows with the same label apart: the plan when no 플랜 column shows it, then
-    ``#`` and the account id's first 4 when label and plan still collide."""
+def _row_key(a: dict) -> Tuple[str, str, str, str]:
+    return _clean(a.get("group")), _row_label(a), _row_plan(a), _clean(a.get("account_id"))
+
+
+def _has_groups(accounts: List[dict]) -> bool:
+    return any(_clean(a.get("group")) for a in accounts)
+
+
+def _label_suffixes(accounts: List[dict], ctx: _Ctx, plan_visible: bool, group_visible: bool) -> Dict[str, str]:
+    """Per account id, what tells rows with the same label apart: the group and the plan when their columns
+    are not shown, then ``#`` and the account id's first 4 when label, group and plan all collide."""
     labels = collections.Counter(_row_label(a) for a in accounts)
-    pairs = collections.Counter((_row_label(a), _row_plan(a)) for a in accounts)
+    triples = collections.Counter((_row_label(a), _row_group(a, ctx), _row_plan(a)) for a in accounts)
     out: Dict[str, str] = {}
     for a in accounts:
-        label, plan = _row_label(a), _row_plan(a)
-        suffix = " " + plan if not plan_visible and labels[label] > 1 else ""
-        if pairs[(label, plan)] > 1:
+        label, group, plan = _row_label(a), _row_group(a, ctx), _row_plan(a)
+        suffix = ""
+        if labels[label] > 1:
+            if not group_visible and group != "-":
+                suffix += " " + group
+            if not plan_visible:
+                suffix += " " + plan
+        if triples[(label, group, plan)] > 1:
             suffix += " #" + _clean(a.get("account_id"))[:4]
         out[_clean(a.get("account_id"))] = suffix
     return out
 
 
-def _label_cell(a: dict, suffixes: Dict[str, str], cap: int, ctx: _Ctx) -> str:
+def _label_cell(a: dict, suffixes: Dict[str, str], cap: Optional[int], ctx: _Ctx) -> str:
     suffix = suffixes.get(_clean(a.get("account_id")), "")
+    if cap is None:
+        return _row_label(a) + suffix
     return clip(_row_label(a), cap - display_width(suffix, ctx.amb), ctx.amb, ctx.g.ell) + suffix
 
 
 def _reason_tokens(a: dict) -> str:
     """A non-live account's refresh reason, then its usage error (``;``-separated tokens).
 
-    The refresh reason goes first so it survives the fixed cell caps. ``daemon_off`` is left out: the header
-    already says the daemon is off, and the cells then read as they did before token refresh existed.
+    The refresh reason goes first so it survives the cell caps. ``daemon_off`` is left out: the title line
+    already says the daemon is off.
     """
     err = a.get("error")
     base = err if isinstance(err, str) else ""
@@ -479,84 +522,161 @@ def _reason_tokens(a: dict) -> str:
     return base
 
 
+NEEDS_REFRESH, WAITING_REFRESH, SESSION_REFRESHES, RELOGIN = "갱신 필요", "갱신 대기", "세션이 갱신", "재로그인 필요"
+_EVERY_ACCOUNT_REASONS = ("daemon_off", "disabled", "dry_run")  # recorded for every account, due or not
+
+
+def _token_state(a: dict, daemon_running: bool) -> Optional[str]:
+    """What a row whose token is not usable needs, in Korean; None for a usable token (a live reading whose
+    latest fetch succeeded).
+
+    The refresh record decides first; an expired token the record says nothing about reads 세션이 갱신 when a
+    Claude session runs on the account, else 갱신 필요 with the daemon off and 갱신 대기 while it runs.
+    """
+    err = a.get("error")
+    if a.get("source") == "live" and not err:
+        return None
+    toks = {t.strip() for t in err.split(";")} if isinstance(err, str) else set()
+    expired = "token_expired" in toks
+    rec = a.get("refresh") if isinstance(a.get("refresh"), dict) else {}
+    state = rec.get("state")
+    reason = rec.get("reason") if isinstance(rec.get("reason"), str) else None
+    if state == "stopped" or reason == "invalid_grant":
+        return RELOGIN
+    if state in ("skipped", "failed") and reason and reason not in _EVERY_ACCOUNT_REASONS:
+        return _REASONS.get(reason, "확인 불가")  # live_session reads 세션이 갱신
+    if expired and a.get("sessions"):
+        return SESSION_REFRESHES  # Claude Code refreshes it on that session's next request
+    if expired:
+        if not daemon_running:
+            return NEEDS_REFRESH
+        if state == "skipped" and reason in ("disabled", "dry_run"):
+            return _REASONS[reason]
+        return WAITING_REFRESH
+    if "token_missing" in toks:
+        return _REASONS["token_missing"]
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class _Layout:
+    """Which columns show and how far the flexible cells are cut (None = never cut)."""
+
+    level: int  # columns dropped so far: bars, 플랜, 그룹, 페이블, 갱신, reset text
+    label_cap: Optional[int] = None
+    age_cap: Optional[int] = None
+    reason_cap: Optional[int] = None
+
+
+_LEVELS = 7
+
+
 def _usage_cell(a: dict, key: str, now: datetime, ctx: _Ctx, *, bars: bool, cells: int, remaining: bool,
-                reason_cap: Optional[int]) -> Tuple[str, Optional[float]]:
+                reason: bool, reason_cap: Optional[int]) -> Tuple[str, Optional[float]]:
     """Cell text and the utilization it shows (None when it shows no number)."""
     if a.get("source") == "unavailable":
-        reason = reason_text(_reason_tokens(a), ctx.g.join) if reason_cap is not None else ""
-        return ("-  (%s)" % clip(reason, reason_cap or 0, ctx.amb, ctx.g.ell) if reason else "-"), None
+        text = reason_text(_reason_tokens(a), ctx.g.join) if reason else ""
+        if text and reason_cap is not None:
+            text = clip(text, reason_cap, ctx.amb, ctx.g.ell)
+        return ("-  (%s)" % text if text else "-"), None
     st = _window_state(a.get(key), now)
     if st is None:
         return "-", None
     util, left = st
-    parts = []
-    if a.get("source") == "cache":
-        parts.append(fit("(캐시)", max(6, display_width(_bar(0, cells, ctx.g), ctx.amb)), amb=ctx.amb)
-                     if bars else "(캐시)")
-    elif bars:
-        parts.append(_bar(util, cells, ctx.g))
+    parts = [_bar(util, cells, ctx.g)] if bars else []
     parts.append(_pct_text(util))
     if remaining and left is not None:
         parts.append(ctx.g.remaining % remaining_text(left))
     return " ".join(parts), util
 
 
-def _age_cell(a: dict, now: datetime, ctx: _Ctx) -> str:
+def _age_text(a: dict, now: datetime, ctx: _Ctx, daemon_running: bool) -> str:
+    """The 갱신 cell, uncut: the token state first (so a cut never hides it), the numbers' age, 캐시 for Claude
+    Code's cached copy, then why the latest fetch failed when no token state says more."""
+    state = _token_state(a, daemon_running)
     if a.get("source") == "unavailable":
-        return "-"
+        return state or "-"
     fetched = _parse_iso(a.get("fetched_at"))
-    if fetched is None:
-        return "-"
-    text = age_text((now - fetched).total_seconds())
-    toks = _reason_tokens(a)
-    if a.get("source") == "cache" and toks:
-        text += " (%s)" % reason_text(toks, ctx.g.join)
-    return clip(text, _AGE_CAP, ctx.amb, ctx.g.ell)
+    parts = [state] if state else []
+    if fetched is not None:
+        parts.append(age_text((now - fetched).total_seconds()))
+    if a.get("source") == "cache":
+        parts.append("캐시")
+    if state is None:
+        why = reason_text(a.get("error"), ctx.g.join)
+        if why:
+            parts.append(why)
+    return (" %s " % ctx.g.join).join(parts) or "-"
 
 
-def _accounts_table(accounts: List[dict], now: datetime, ctx: _Ctx, level: int, label_cap: int, soft_pct: float,
-                    hard_pct: float) -> List[str]:
-    bars, plan, fable, age = level == 0, level <= 1, level <= 2, level <= 3
-    headers = (["", "계정"] + (["플랜"] if plan else []) + ["5시간", "주간"] + (["페이블"] if fable else []) + ["세션"]
-               + (["갱신"] if age else []))
+def _accounts_table(accounts: List[dict], now: datetime, ctx: _Ctx, daemon_running: bool, lay: _Layout,
+                    soft_pct: float, hard_pct: float) -> List[str]:
+    lv = lay.level
+    bars, plan, fable, age, reset = lv == 0, lv <= 1, lv <= 3, lv <= 4, lv <= 5
+    group = lv <= 2 and _has_groups(accounts)
+    headers = (["", "계정"] + (["그룹"] if group else []) + (["플랜"] if plan else []) + ["5시간", "주간"]
+               + (["페이블"] if fable else []) + ["세션"] + (["갱신"] if age else []))
     aligns = ["left"] * (len(headers) - (2 if age else 1)) + ["right"] + (["left"] if age else [])
-    windows = [("five_hour", 9, True, 24 if bars else 14), ("seven_day", 9, True, None)]
+    windows = [("five_hour", 9, reset, True), ("seven_day", 9, reset, False)]
     if fable:
-        windows.append(("fable", 4, False, None))
+        windows.append(("fable", 4, False, False))
     rows: List[List[str]] = []
     styles: List[List[Optional[str]]] = []
-    suffixes = _label_suffixes(accounts, plan)
+    suffixes = _label_suffixes(accounts, ctx, plan, group)
     for a in accounts:
-        cells = ["*" if a.get("pointer") is True else "", _label_cell(a, suffixes, label_cap, ctx)]
+        cells = ["*" if a.get("pointer") is True else "", _label_cell(a, suffixes, lay.label_cap, ctx)]
         st: List[Optional[str]] = [None, None]
+        if group:
+            cells.append(_row_group(a, ctx))
+            st.append(None)
         if plan:
             cells.append(_row_plan(a))
             st.append(None)
-        for key, n, rem, reason_cap in windows:
-            text, util = _usage_cell(a, key, now, ctx, bars=bars, cells=n, remaining=rem, reason_cap=reason_cap)
+        for key, n, rem, why in windows:
+            text, util = _usage_cell(a, key, now, ctx, bars=bars, cells=n, remaining=rem, reason=why,
+                                     reason_cap=lay.reason_cap)
             cells.append(text)
             st.append(None if util is None else _RED if util >= hard_pct else _YELLOW if util >= soft_pct else None)
         cells.append(str(len(a.get("sessions") or [])))
         st.append(None)
         if age:
-            cells.append(_age_cell(a, now, ctx))
+            text = _age_text(a, now, ctx, daemon_running)
+            cells.append(text if lay.age_cap is None else clip(text, lay.age_cap, ctx.amb, ctx.g.ell))
             st.append(None)
         rows.append(cells)
         styles.append([_DIM] * len(cells) if a.get("source") == "cache" else st)
     return _table(headers, aligns, rows, ctx, styles)
 
 
-def _fit_accounts(accounts: List[dict], now: datetime, ctx: _Ctx, width: int, soft_pct: float,
-                  hard_pct: float) -> List[str]:
-    """The widest layout that fits: drop bars, then 플랜, then 페이블, then 갱신, then narrow 계정; else cut every
-    line. Rows are ordered by label, plan and account id."""
+def _layouts(accounts: List[dict], now: datetime, ctx: _Ctx, daemon_running: bool) -> List[_Layout]:
+    """Layouts from widest to narrowest: nothing cut; the flexible cells cut step by step down to their caps;
+    then the columns dropped in order (bars, 플랜, 그룹, 페이블, 갱신, reset text); then the label narrowed."""
+    suffixes = _label_suffixes(accounts, ctx, True, True)
+    label_w = max(display_width(_label_cell(a, suffixes, None, ctx), ctx.amb) for a in accounts)
+    age_w = max(display_width(_age_text(a, now, ctx, daemon_running), ctx.amb) for a in accounts)
+    reason_w = max(display_width(reason_text(_reason_tokens(a), ctx.g.join), ctx.amb) for a in accounts)
+    out = [_Layout(0)]
+    for k in range(1, max(label_w - _LABEL_CAP, age_w - _AGE_CAP, reason_w - _REASON_CAP, 0) + 1):
+        out.append(_Layout(0, max(_LABEL_CAP, label_w - k), max(_AGE_CAP, age_w - k),
+                           max(_REASON_CAP, reason_w - k)))
+    out.append(_Layout(0, _LABEL_CAP, _AGE_CAP, _REASON_CAP))
+    out += [_Layout(level, _LABEL_CAP, _AGE_CAP, _REASON_CAP_NO_BARS) for level in range(1, _LEVELS)]
+    out += [_Layout(_LEVELS - 1, cap, _AGE_CAP, _REASON_CAP_NO_BARS) for cap in range(_LABEL_CAP - 1, 3, -1)]
+    return out
+
+
+def _fit_accounts(accounts: List[dict], now: datetime, ctx: _Ctx, width: int, daemon_running: bool,
+                  soft_pct: float, hard_pct: float) -> List[str]:
+    """The widest layout that fits ``width`` (see _layouts); else cut every line. Rows are ordered by group,
+    label, plan and account id."""
     accounts = sorted(accounts, key=_row_key)
     plain = dataclasses.replace(ctx, color=False)
-    tries = [(level, _LABEL_CAP) for level in range(5)] + [(4, cap) for cap in range(_LABEL_CAP - 1, 3, -1)]
-    for level, cap in tries:
-        if _max_width(_accounts_table(accounts, now, plain, level, cap, soft_pct, hard_pct), ctx.amb) <= width:
-            return _accounts_table(accounts, now, ctx, level, cap, soft_pct, hard_pct)
-    return [clip(line, width, ctx.amb, "") for line in _accounts_table(accounts, now, plain, 4, 4, soft_pct, hard_pct)]
+    layouts = _layouts(accounts, now, ctx, daemon_running)
+    for lay in layouts:
+        if _max_width(_accounts_table(accounts, now, plain, daemon_running, lay, soft_pct, hard_pct), ctx.amb) <= width:
+            return _accounts_table(accounts, now, ctx, daemon_running, lay, soft_pct, hard_pct)
+    return [clip(line, width, ctx.amb, "")
+            for line in _accounts_table(accounts, now, plain, daemon_running, layouts[-1], soft_pct, hard_pct)]
 
 
 def _result_text(r: dict, label_of: Callable[[object], str], tz: tzinfo) -> str:
@@ -670,12 +790,24 @@ def render(doc: Optional[dict], now: datetime, tz: tzinfo, width: int, *, color:
     accounts = [a for a in d.get("accounts") or [] if isinstance(a, dict)]
     if not accounts:
         return [title(0), clip(NO_ACCOUNTS, w, amb, g.ell)]
-    table = _fit_accounts(accounts, now, ctx, w, soft_pct, hard_pct)
+    running = daemon.get("running") is True
+    table = _fit_accounts(accounts, now, ctx, w, running, soft_pct, hard_pct)
     legend = "* = Orca 선택 계정   노랑 %s%g%%  빨강 %s%g%%" % (g.ge, soft_pct, g.ge, hard_pct)
     lines = [title(display_width(table[0], amb))] + table + [clip(legend, w, amb, g.ell)]
+    if not running and any(_token_state(a, running) == NEEDS_REFRESH for a in accounts):
+        lines += _wrap(REFRESH_FOOTER, w, amb, g.ell)
 
-    suffixes = _label_suffixes(accounts, plan_visible=False)  # the sessions table has no 플랜 column
-    labels = {a.get("account_id"): _label_cell(a, suffixes, _LABEL_CAP, ctx) for a in accounts}
+    triples = collections.Counter((_row_label(a), _row_group(a, ctx), _row_plan(a)) for a in accounts)
+
+    def session_label(a: dict) -> str:
+        # The sessions table has no 그룹 or 플랜 column: "<label> <group> <plan>", each part only when known.
+        label, group, plan = _row_label(a), _row_group(a, ctx), _row_plan(a)
+        parts = [clip(label, _LABEL_CAP, amb, g.ell)] + [x for x in (group, plan) if x != "-"]
+        if triples[(label, group, plan)] > 1:
+            parts.append("#" + _clean(a.get("account_id"))[:4])
+        return " ".join(parts)
+
+    labels = {a.get("account_id"): session_label(a) for a in accounts}
 
     def label_of(aid: object) -> str:
         return labels.get(aid) or _clean(aid)[:8] or "-"
@@ -974,7 +1106,9 @@ def _watch(cfg: Config, deps: Deps, out: TextIO, tz: tzinfo, opts: Dict[str, Any
            read_key: Optional[Callable[[float], Optional[str]]], interval: float) -> None:
     """Redraw until q (with a key reader) or Ctrl-C / SIGTERM (KeyboardInterrupt)."""
     ev = threading.Event()
-    usage = UsageCache(cfg.usage_poll_s)  # one cache per watch: fetch per usage_poll_s, never per redraw
+    # One cache per watch over the shared store: an account is fetched once per usage_poll_s by whichever
+    # rotator process gets there first, never per redraw.
+    usage = UsageCache(cfg.usage_poll_s, UsageStore(cfg.state_dir, deps))
     doc: Optional[dict] = None
     built_at = 0.0
     hint = QUIT_HINT if read_key is not None else "Ctrl-C 종료"

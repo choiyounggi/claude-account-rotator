@@ -44,43 +44,60 @@ rotator switch --session <pid> --to <account-id> [--soft|--hard] [--dry-run]
 - `status` draws one table of accounts and one of sessions (synthetic example):
 
 ```text
-Claude 계정 사용량                                                                       21:00:00  데몬: 꺼짐
-┌───┬───────┬───────┬──────────────────────────┬────────────────────┬───────────┬──────┬────────────────────┐
-│   │ 계정  │ 플랜  │ 5시간                    │ 주간               │ 페이블    │ 세션 │ 갱신               │
-├───┼───────┼───────┼──────────────────────────┼────────────────────┼───────────┼──────┼────────────────────┤
-│ * │ alice │ Max5x │ ████████▒  89% ↻1h21m    │ ████▒▒▒▒▒  45% ↻6d │ █▒▒▒  25% │    1 │ 3초 전             │
-│   │ bob   │ Team  │ █████████ 100% ↻21m      │ ███▒▒▒▒▒▒  37% ↻6d │ -         │    0 │ 3초 전             │
-│   │ carol │ -     │ (캐시)      0%           │ (캐시)     28% ↻2d │ -         │    0 │ 3일 전 (호출 제한) │
-│   │ dave  │ -     │ -  (토큰 만료·캐시 없음) │ -                  │ -         │    0 │ -                  │
-└───┴───────┴───────┴──────────────────────────┴────────────────────┴───────────┴──────┴────────────────────┘
+Claude 계정 사용량                                                                                                        21:00:00  데몬: 꺼짐
+┌───┬───────┬────────┬───────┬────────────────────────────────┬───────────────────────────────┬───────────┬──────┬───────────────────────────┐
+│   │ 계정  │ 그룹   │ 플랜  │ 5시간                          │ 주간                          │ 페이블    │ 세션 │ 갱신                      │
+├───┼───────┼────────┼───────┼────────────────────────────────┼───────────────────────────────┼───────────┼──────┼───────────────────────────┤
+│ * │ alice │ TEAM 1 │ Max5x │ ████████▒  89% · 1시간 21분 뒤 │ ████▒▒▒▒▒  45% · 6일 2시간 뒤 │ █▒▒▒  25% │    1 │ 3초 전                    │
+│   │ carol │ TEAM 1 │ -     │ ▒▒▒▒▒▒▒▒▒   0%                 │ ██▒▒▒▒▒▒▒  28% · 2일 5시간 뒤 │ -         │    0 │ 갱신 필요 · 3일 전 · 캐시 │
+│   │ bob   │ TEAM 2 │ Team  │ █████████ 100% · 21분 뒤       │ ███▒▒▒▒▒▒  37% · 6일 뒤       │ -         │    0 │ 3초 전                    │
+│   │ dave  │ TEAM 2 │ -     │ -  (토큰 만료·캐시 없음)       │ -                             │ -         │    0 │ 갱신 필요                 │
+└───┴───────┴────────┴───────┴────────────────────────────────┴───────────────────────────────┴───────────┴──────┴───────────────────────────┘
 * = Orca 선택 계정   노랑 ≥85%  빨강 ≥95%
+토큰 만료 계정은 데몬이 자동 갱신해: rotator install (또는 rotator daemon)
 
-┌──────┬───────────┬──────┬─────────────────┬──────────────────────┐
-│ PID  │ 계정      │ 상태 │ 모델            │ 최근 전환 결과       │
-├──────┼───────────┼──────┼─────────────────┼──────────────────────┤
-│ 4101 │ alice     │ busy │ claude-opus-5-5 │ decision soft -> bob │
-│ 4202 │ (관리 밖) │ idle │ -               │ -                    │
-└──────┴───────────┴──────┴─────────────────┴──────────────────────┘
+┌──────┬────────────────────┬──────┬─────────────────┬──────────────────────────────────┐
+│ PID  │ 계정               │ 상태 │ 모델            │ 최근 전환 결과                   │
+├──────┼────────────────────┼──────┼─────────────────┼──────────────────────────────────┤
+│ 4101 │ alice TEAM 1 Max5x │ busy │ claude-opus-5-5 │ decision soft -> bob TEAM 2 Team │
+│ 4202 │ (관리 밖)          │ idle │ -               │ -                                │
+└──────┴────────────────────┴──────┴─────────────────┴──────────────────────────────────┘
 q 또는 Ctrl-C 종료
 ```
 
 - Accounts are named by their label: the local part of the account's email (before `@`), else its display name,
-  else the first 8 characters of the account folder id, cut with `…` at 18 columns. `*` marks the account
-  `selected-host` points to.
+  else the first 8 characters of the account folder id. `*` marks the account `selected-host` points to.
+- 그룹 is the organization the profile is logged in to (`oauthAccount.organizationName`). When two or more
+  different names all start with the same word(s), that shared start is left out (`Example Org TEAM 1` shows as
+  `TEAM 1`; a name is never cut down to a bare number). It is cut with `…` at 10 columns, `-` when unknown, and
+  the column is left out when no account has one.
 - 플랜 is the seat tier Orca stored for the profile (`rateLimitTier`): `Max5x`, `Max20x`, `Team` (`default_raven`),
   any other tier without its `default_` prefix cut to 8 characters, `-` when unknown. The same email logged in
-  under two profiles shows as two rows told apart by 플랜; rows whose label and plan are both equal get ` #` and
-  the first 4 characters of their account folder id. Rows are sorted by label, then plan, then folder id.
-- Each usage cell is a 9-cell bar (4 for 페이블), the percent rounded down, and `↻` with the time left until the
-  window resets (`21m`, `1h21m`, `6d`). A window already past its reset shows 0 % and no `↻`. `(캐시)` replaces
-  the bar when the numbers come from Claude Code's cached copy; an `unavailable` account shows `-` and the reason
-  (토큰 만료, 토큰 없음, 요청 실패, 호출 제한, 연결 실패, 캐시 없음, …). 세션 counts the account's live sessions,
-  갱신 is how long ago its usage was fetched.
+  under several profiles shows as several rows told apart by 그룹 and 플랜; rows whose label, group and plan are
+  all equal get ` #` and the first 4 characters of their account folder id. Rows are sorted by group, then label,
+  then plan, then folder id. The sessions table's 계정 shows `<label> <group> <plan>`.
+- Each usage cell is a 9-cell bar (4 for 페이블), the percent rounded down, and the time left until the window
+  resets, rounded down: `· 1분 안`, `· 21분 뒤`, `· 1시간 21분 뒤`, `· 6일 2시간 뒤` (zero parts are left out:
+  `· 1시간 뒤`, `· 6일 뒤`). A window already past its reset shows 0 % and no reset time. Cached numbers (Claude
+  Code's copy, used when the live fetch fails) are drawn the same way, dimmed; an `unavailable` account shows `-`
+  and the reason (토큰 만료, 토큰 없음, 요청 실패, 호출 제한, 연결 실패, 캐시 없음, …). 세션 counts the account's
+  live sessions.
+- 갱신 is how long ago the usage was fetched, followed by `· 캐시` for cached numbers. An account whose token is
+  not usable shows what it needs first: `갱신 필요` (expired, the daemon is off), `갱신 대기` (expired, the daemon
+  will refresh it), `세션이 갱신` (a Claude session runs on the account; Claude Code refreshes the token on that
+  session's next request and the rotator leaves it alone), `재로그인 필요` (the server refused the refresh token,
+  or the daemon stopped trying until the Keychain item changes), `키체인 저장 실패`, or another refresh reason
+  below. A cached row without a token problem shows its usage error there instead (`10분 전 · 캐시 · 호출 제한`).
+  With the daemon off and at least one `갱신 필요` row, a footer says `토큰 만료 계정은 데몬이 자동 갱신해: rotator
+  install (또는 rotator daemon)`; only the daemon refreshes tokens.
 - Colours (only when stdout is a terminal and `NO_COLOR` is unset or empty): yellow at `soft_pct`, red at
   `hard_pct`, cache rows dimmed. Without colour the layout is the same.
-- Every line is measured in terminal columns (Hangul counts 2). When the table does not fit the terminal it drops
-  the bars, then the 플랜 column (accounts sharing a label then show their plan after it), then 페이블, then 갱신,
-  then narrows 계정; rows are never wrapped. Hint lines below the sessions table wrap instead of being cut. A
+- Every line is measured in terminal columns (Hangul counts 2). Columns are as wide as their widest cell, so on
+  a wide enough terminal nothing is cut. When the table does not fit, the label, the 갱신 text and the
+  unavailable reason are cut step by step down to 18, 20 and 24 columns; then it drops the bars, then the 플랜
+  column, then 그룹 (accounts sharing a label then show their group and plan after it), then 페이블, then 갱신,
+  then the reset times, then narrows 계정; rows are never wrapped. `status --watch` measures the terminal on every
+  redraw, so resizing it widens or narrows the table within a second. Hint lines below the sessions table wrap instead of being cut. A
   relaunch command gets a line of its own, printed whole and never wrapped by `status` (the terminal soft-wraps it),
   so copying the line gives the exact command.
 - Box glyphs and `█▒` are "ambiguous width": terminals set to draw them double width (common in Korean setups)
@@ -99,16 +116,26 @@ q 또는 Ctrl-C 종료
 
 ### Live usage cadence
 
-- Usage is fetched per account at most once per `usage_poll_s` (default 30 s, minimum 15 s): by the daemon when
-  it runs, otherwise by `status --watch` itself with the same per-account cache, never once per redraw.
+- Usage is fetched per account at most once per `usage_poll_s` (default 30 s, minimum 15 s) across every rotator
+  process together: the daemon, `status --watch` and one-shot `status` share `usage/u-<hash>.json` in the state
+  dir (one file per account; mode 0600, replaced atomically; numbers, times and error tokens only, never a token
+  or an email). A process uses a stored reading younger than its interval instead of calling the API; only a
+  stale account is fetched, under that account's non-blocking `locks/u-<hash>.lock`, and a process that finds
+  the lock taken shows the stored reading and looks again next time. The next allowed fetch time is stored too,
+  so no process fetches an account that is backing off. A corrupt or missing file counts as empty.
+- When a fetch fails (호출 제한, 요청 실패, 연결 실패, HTTP 5xx, an expired token) the account keeps showing its last
+  successful live reading — bars, percent, reset time, with that reading's age and the failure in 갱신
+  (`5분 전 · 호출 제한`) — unless Claude Code's cache holds newer numbers. A usage cell shows `-` only for an
+  account that never had a live reading and has no cache. In the JSON such an account stays `source` `live`
+  and carries the failure in `error`.
 - `status --watch` redraws every `--interval` seconds (default 1). It re-discovers sessions and re-reads the
   daemon snapshot, records and `selected-host` only every `session_poll_s` (default 10 s); the redraws in
   between re-render the last view with the current time, so the 갱신 age (`N초 전`, i.e. N seconds ago, since
-  that account's usage was fetched) and the `↻1h12m` reset countdowns still tick every second.
+  that account's usage was fetched) and the `1시간 12분 뒤` reset times still tick every second.
 - An account answered with HTTP 429 waits for the server's `Retry-After` when the answer carries one (seconds or
   an HTTP-date, RFC 9110 §10.2.3): next fetch after `max(usage_poll_s, min(900 s, Retry-After))`. Without the
   header it is fetched again only after twice its last interval, doubling up to 300 s.
-  It is shown as `(캐시)` with `(호출 제한)` after the age (rate_limited), or `-  (호출 제한·캐시 없음)` when Claude
+  It is shown with its cached numbers and `<age> · 캐시 · 호출 제한` in 갱신 (rate_limited), or `-  (호출 제한·캐시 없음)` when Claude
   Code has no cached usage; the age then shows how old the cached numbers are. Any other answer returns it to `usage_poll_s`.
 
 ## Fable usage
@@ -190,8 +217,9 @@ set with no log line at all.
 when no Claude session runs on that account. A stale `.oauth_refresh.lock.owner` file is left alone: Claude Code
 answers `record_mismatch` for it and does not take the lock over.
 
-**Reasons** (the `reason` of a record; for a cached or unavailable account the table shows the Korean text first,
-then the usage error, clipped to the cell width; `daemon_off` appears only in the JSON):
+**Reasons** (the `reason` of a record; for a cached or unavailable account the 갱신 cell shows the Korean text
+first, and an unavailable account's usage cell shows it before the usage error; `daemon_off` itself appears only
+in the JSON — with the daemon off an expired account reads `갱신 필요`):
 
 | reason | text | meaning |
 |--------|------|---------|
@@ -203,7 +231,7 @@ then the usage error, clipped to the cell width; `daemon_off` appears only in th
 | `plaintext_store` | 갱신 불가 | the profile keeps a plaintext `.credentials.json` |
 | `keychain_item_unclear` | 갱신 불가 | the item was not found under Claude Code's account name |
 | `payload_too_large` | 갱신 불가 | the write line would exceed 4032 characters |
-| `live_session` | 사용 중 | a Claude session runs on the account (Claude Code refreshes it) |
+| `live_session` | 세션이 갱신 | a Claude session runs on the account (Claude Code refreshes it) |
 | `discovery_failed` | 세션 확인 실패 | sessions could not be listed, so nothing is refreshed |
 | `deferred` | 갱신 대기 | waiting for its turn (one network refresh per tick) |
 | `locked` | 갱신 중 | another rotator process holds the account's lock |
@@ -236,16 +264,16 @@ updates.
 | `schema` | `1` |
 | `generated_at` | when the document was built |
 | `daemon` | `{running, pid, snapshot_age_s, flags}` from the daemon's last snapshot |
-| `accounts` | one entry per account: `account_id, label, plan, source, error, fetched_at, five_hour, seven_day, fable` (each window `{utilization, resets_at}` or null), `pointer`, `sessions` (`[{pid, status, model}]`) |
+| `accounts` | one entry per account (a `live` entry with an `error` is the last good reading after a failed fetch): `account_id, label, group, plan, source, error, fetched_at, five_hour, seven_day, fable` (each window `{utilization, resets_at}` or null), `pointer`, `sessions` (`[{pid, status, model}]`) |
 | `pointer_account_id` | the account `selected-host` names, or null |
 | `sessions` | managed live sessions: `pid, session_id, status, account_id, model, decision, would_switch, in_flight, in_flight_pid, stuck, unswitchable, hard_hold_until, excluded, record_state, last_result, hint, post_verify` |
 | `unmanaged_sessions` | `[{pid, session_id, status, model}]` |
 | `attention` | `[{pid, session_id, updated_at, record_state, last_result, hint}]`: touched, not-ok switches of gone processes from the last 24 h |
 
 Times are ISO-8601 UTC strings. `relaunch_command` appears only inside `last_result`. `label` is the short account name shown in
-the table (email local part, else display name, else folder id prefix) and `plan` its seat tier tag (or null);
-no full email address, account UUID,
-organization, token or environment value is included. The only argv or transcript value included is a session's
+the table (email local part, else display name, else folder id prefix), `group` its organization name without
+the prefix all organization names share (or null, uncut), and `plan` its seat tier tag (or null); no full email
+address, account UUID, token or environment value is included. The only argv or transcript value included is a session's
 model id (`model`, from the transcript or its `--model` argument, validated as above). Changes within schema 1 are
 additive only.
 `model` is the session's model id or null.
@@ -305,8 +333,8 @@ Numbers must be finite and not `true`/`false`.
 ## Files
 
 - State dir `~/Library/Application Support/claude-account-rotator/`: `config.json` (the default config),
-  `state.json` (daemon snapshot), `daemon.lock` (single instance, holds the daemon pid), `locks/` and
-  `sessions/`. The state dir is fixed: `--config PATH` changes only which config file is read, so every daemon
+  `state.json` (daemon snapshot), `daemon.lock` (single instance, holds the daemon pid), `usage/` (the
+  shared usage readings, one file per account), `locks/` and `sessions/`. The state dir is fixed: `--config PATH` changes only which config file is read, so every daemon
   and `rotator switch` process uses the same locks and records whatever config it was started with.
 - `locks/` holds one empty file per switched session or pane; `sessions/` holds one small JSON record per
   switched session identity. The rotator never prunes either; delete them only while no rotator process runs.
@@ -338,7 +366,7 @@ Numbers must be finite and not `true`/`false`.
 11. `ExitTimeOut` is fixed at install time; re-run `rotator install` after changing `timeouts`.
 12. With `KeepAlive`, a foreground `rotator daemon` makes the agent copy exit 1 and respawn every 10 s; run
     `rotator uninstall` first.
-13. `locks/` and `sessions/` under the state dir are never pruned by the program.
+13. `locks/`, `sessions/` and `usage/` under the state dir are never pruned by the program.
 14. A Claude Code session that starts on an account during a refresh section and needs a refresh itself sees
     `lock_changed` while the rotator touches the lock dirs and waits about 2 × (5-10 s) + 7.5 s before giving up
     with `lock_busy`; in the worst case (every step hitting its timeout, about 2 minutes) its first request can

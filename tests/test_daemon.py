@@ -17,7 +17,7 @@ from typing import Callable, Dict, List, Optional, Set
 from rotator import daemon, refresh, switcher, usage
 from rotator.config import Config
 from rotator.daemon import (
-    GONE_REASONS, IN_PROGRESS_HINT, Daemon, UsageCache, rate_limited, real_deps, run_daemon, ORPHANED_HINT, STRUCTURAL_REASONS, TARGET_REASONS, TOUCHED_ONLY_REASONS, TRANSIENT_REASONS,
+    GONE_REASONS, IN_PROGRESS_HINT, Daemon, SharedUsage, UsageCache, UsageStore, rate_limited, shown_usage, real_deps, run_daemon, ORPHANED_HINT, STRUCTURAL_REASONS, TARGET_REASONS, TOUCHED_ONLY_REASONS, TRANSIENT_REASONS,
     Deps, FileLock, atomic_write_text, classify_untouched, identity_of, key_of, load_records, lock_paths,
     record_path, result_dict, setup_logging, touched, try_lock, usage_from_summary, usage_summary,
 )
@@ -1201,6 +1201,275 @@ class TestUsageCacheRefresh(unittest.TestCase):
         self.assertNotIn(("fetch", ACC_A), self.env.calls)
 
 
+class SharedBase(unittest.TestCase):
+    """Two processes (two UsageCache over one state dir) on one fake clock."""
+
+    def setUp(self):
+        self.env = FakeEnv()
+        self.deps = self.env.deps()
+        self.log = self.deps.make_logger()
+        self.cfg = make_cfg()
+        self.store = UsageStore(self.cfg.state_dir, self.deps)
+        self.a = UsageCache(30.0, UsageStore(self.cfg.state_dir, self.deps))
+        self.b = UsageCache(30.0, UsageStore(self.cfg.state_dir, self.deps))
+        self.profiles = [prof(ACC_A), prof(ACC_B)]
+        self.env.pcts = {ACC_A: 20.0, ACC_B: 40.0}
+
+    def step(self, cache, profiles=None):
+        return cache.refresh(profiles or self.profiles, fetch=self.deps.fetch_usage, monotonic=self.deps.monotonic,
+                             now=self.env.now_v, log=self.log)
+
+    def fetches(self):
+        return [c[1] for c in self.env.calls if c[0] == "fetch"]
+
+    def usage_files(self):
+        return {p: t for p, t in self.env.files.items() if os.sep + "usage" + os.sep in p}
+
+
+class TestSharedUsage(SharedBase):
+    def test_one_fetch_per_account_per_interval_across_processes(self):
+        per_tick = []
+        for t in range(0, 121, 5):  # both processes poll every 5 s for 2 minutes
+            before = len(self.fetches())
+            got = self.step(self.a) + self.step(self.b)
+            per_tick.append((t, got))
+            self.assertEqual(len(self.fetches()) - before, len(got))
+            self.env.advance(5)
+        fetch_times = [t for t, got in per_tick for _ in got]
+        self.assertEqual(fetch_times, [0, 0, 30, 30, 60, 60, 90, 90, 120, 120])
+        self.assertEqual(sorted(self.fetches()), [ACC_A] * 5 + [ACC_B] * 5)
+        self.assertEqual({aid: u.five_hour.utilization for aid, u in self.b.usages().items()},
+                         {ACC_A: 20.0, ACC_B: 40.0})  # b shows a's readings without fetching them
+
+    def test_429_keeps_last_good_and_waits_for_backoff(self):
+        self.step(self.a)  # live 20 % for A
+        self.env.advance(30)
+        self.env.pcts.pop(ACC_A)
+        self.env.usages[ACC_A] = limited(ACC_A, "unavailable")
+        self.assertEqual(self.step(self.a), [ACC_A, ACC_B])
+        for cache in (self.a, self.b):
+            if cache is self.b:
+                self.step(self.b)
+            shown = cache.usages()[ACC_A]
+            self.assertEqual((shown.source, shown.error, shown.five_hour.utilization), ("cache", "http_429", 20.0))
+            self.assertEqual(shown.fetched_at, T0)  # the age of the last good reading
+            d = cache.summary(ACC_A)
+            self.assertEqual((d["source"], d["error"], d["five_hour"]["utilization"]), ("live", "http_429", 20.0))
+        # 429 without Retry-After: next allowed fetch after 2 x 30 s, for either process
+        n = self.fetches().count(ACC_A)
+        for _ in range(11):
+            self.env.advance(5)
+            self.step(self.a)
+            self.step(self.b)
+        self.assertEqual(self.fetches().count(ACC_A), n)  # 55 s: still backing off
+        self.env.advance(5)
+        self.step(self.b)
+        self.step(self.a)
+        self.assertEqual(self.fetches().count(ACC_A), n + 1)
+
+    def test_backoff_doubles_from_the_stored_interval_in_another_process(self):
+        self.env.pcts.pop(ACC_A)
+        self.env.usages[ACC_A] = limited(ACC_A, "unavailable")
+        self.step(self.a, [prof(ACC_A)])  # 429: next fetch in 60 s
+        self.assertEqual(self.store.load(ACC_A, self.env.now_v).interval_s, 60.0)
+        self.env.advance(60)
+        fresh = UsageCache(30.0, UsageStore(self.cfg.state_dir, self.deps))  # no in-memory entry
+        self.assertEqual(self.step(fresh, [prof(ACC_A)]), [ACC_A])  # 429 again
+        self.assertEqual(self.store.load(ACC_A, self.env.now_v).interval_s, 120.0)
+        self.assertEqual(fresh.interval(ACC_A), 120.0)
+
+    def test_entry_stored_while_taking_the_lock_is_used(self):
+        self.step(self.a)
+        self.env.advance(30)
+        other = live(ACC_A, 77.0, now=self.env.now_v)
+        base_lock = self.deps.lock
+
+        def lock(path):  # another process stores a fresh reading just before we get the lock
+            got = base_lock(path)
+            if got is not None and path.endswith("u-%s.lock" % key_of(ACC_A)):
+                self.store.save(ACC_A, SharedUsage(other, other, self.env.now_v + timedelta(seconds=30), 30.0))
+            return got
+        c = UsageCache(30.0, UsageStore(self.cfg.state_dir, dataclasses.replace(self.deps, lock=lock)))
+        self.assertEqual(self.step(c), [ACC_B])
+        self.assertEqual(c.usages()[ACC_A].five_hour.utilization, 77.0)
+
+    def test_retry_after_shared(self):
+        self.env.usages[ACC_A] = limited_ra(ACC_A, 300.0, "unavailable")
+        self.env.pcts.pop(ACC_A)
+        self.step(self.a)
+        self.env.advance(299)
+        self.step(self.b)
+        self.assertEqual(self.fetches().count(ACC_A), 1)
+        self.env.advance(1)
+        self.step(self.b)
+        self.assertEqual(self.fetches().count(ACC_A), 2)
+
+    def test_lock_busy_uses_stored_entry_without_fetching(self):
+        self.step(self.a)
+        self.env.advance(30)
+        lock = self.store.lock(ACC_A)  # another process is fetching A right now
+        self.assertIsNotNone(lock)
+        self.assertEqual(self.step(self.b), [ACC_B])
+        self.assertEqual(self.b.usages()[ACC_A].five_hour.utilization, 20.0)
+        lock.release()
+        self.assertEqual(self.step(self.b), [ACC_A])  # looked at again on the next call
+
+    def test_lock_busy_and_nothing_stored_shows_nothing_yet(self):
+        lock = self.store.lock(ACC_A)
+        self.assertEqual(self.step(self.b), [ACC_B])
+        self.assertNotIn(ACC_A, self.b.usages())
+        lock.release()
+
+    def test_lock_os_error_still_fetches(self):
+        deps = dataclasses.replace(self.deps, lock=lambda path: (_ for _ in ()).throw(OSError("no locks")))
+        c = UsageCache(30.0, UsageStore(self.cfg.state_dir, deps))
+        self.assertEqual(self.step(c), [ACC_A, ACC_B])
+        self.assertEqual(len(self.env.logs("usage_store_error")), 2)
+
+    def test_corrupt_or_missing_files_are_empty(self):
+        self.step(self.a)
+        bad = ["{", "[]", "null", '"x"', json.dumps({"account_id": ACC_A}), "[" * 100000,
+               json.dumps({"account_id": ACC_B, "latest": usage_summary(live(ACC_B, 1.0)), "last_good": None,
+                           "next_fetch_at": (T0 + timedelta(hours=1)).isoformat(), "interval_s": 30.0}),
+               json.dumps({"account_id": ACC_A, "latest": usage_summary(live(ACC_A, 1.0)), "last_good": None,
+                           "next_fetch_at": "soon", "interval_s": 30.0}),
+               json.dumps({"account_id": ACC_A, "latest": usage_summary(live(ACC_A, 1.0)), "last_good": None,
+                           "next_fetch_at": (T0 + timedelta(hours=1)).isoformat(), "interval_s": float("nan")}),
+               json.dumps({"account_id": ACC_A, "latest": usage_summary(live(ACC_A, 1.0)),
+                           "last_good": usage_summary(limited(ACC_A)),
+                           "next_fetch_at": (T0 + timedelta(hours=1)).isoformat(), "interval_s": 30.0})]
+        path = self.store.path(ACC_A)
+        for text in bad:
+            with self.subTest(text=text[:40]):
+                self.env.files[path] = text
+                self.assertIsNone(self.store.load(ACC_A, self.env.now_v))
+                c = UsageCache(30.0, UsageStore(self.cfg.state_dir, self.deps))
+                self.assertIn(ACC_A, self.step(c, [prof(ACC_A)]))  # treated as empty: fetched
+        del self.env.files[path]
+        self.assertIsNone(self.store.load(ACC_A, self.env.now_v))
+
+    def test_far_future_next_fetch_never_blocks(self):
+        self.step(self.a)
+        e = self.store.load(ACC_A, self.env.now_v)
+        self.store.save(ACC_A, SharedUsage(e.latest, e.last_good, T0 + timedelta(days=365), 30.0))
+        self.env.advance(30)
+        self.assertIn(ACC_A, self.step(self.b))
+
+    def test_file_holds_numbers_times_and_tokens_only(self):
+        self.env.pcts.pop(ACC_B)
+        self.env.usages[ACC_B] = limited(ACC_B)
+        self.step(self.a)
+        files = self.usage_files()
+        self.assertEqual(len(files), 2)
+        for path, text in files.items():
+            for secret in SECRETS + ("sk-ant", "accessToken", "refreshToken", "@"):
+                self.assertNotIn(secret, text)
+            d = json.loads(text)
+            self.assertEqual(set(d), {"account_id", "latest", "last_good", "next_fetch_at", "interval_s"})
+            self.assertEqual(set(d["latest"]), set(usage_summary(live(ACC_A, 1.0))))
+            self.assertTrue(os.path.basename(path).startswith("u-") and ACC_A not in path and ACC_B not in path)
+        self.assertIn('"utilization": 20.0', "".join(files.values()))  # negative control: readings are there
+
+    def test_write_error_is_logged_and_reading_kept(self):
+        self.env.fail_write.add(os.sep + "usage" + os.sep)
+        self.assertEqual(self.step(self.a), [ACC_A, ACC_B])
+        self.assertEqual(self.a.usages()[ACC_A].five_hour.utilization, 20.0)
+        self.assertEqual(len(self.env.logs("usage_store_error")), 2)
+
+    def test_written_through_the_atomic_0600_writer(self):
+        self.assertIs(real_deps(self.cfg).write_text, atomic_write_text)
+        self.step(self.a)
+        writes = [c[1] for c in self.env.calls if c[0] == "write"]
+        self.assertEqual(sorted(writes), sorted(self.store.path(a) for a in (ACC_A, ACC_B)))
+
+    def test_mark_due_forces_a_fetch_past_a_fresh_entry(self):
+        self.step(self.a)
+        self.step(self.b)
+        self.env.advance(5)
+        self.b.mark_due(ACC_A)  # after a token refresh
+        self.assertEqual(self.step(self.b), [ACC_A])
+        self.assertEqual(self.step(self.a), [])  # a's own interval has not elapsed
+        self.env.advance(26)
+        self.assertEqual(self.step(self.a), [ACC_B])  # A: b's forced reading (stored at 5 s) is still fresh
+        self.assertEqual(self.fetches().count(ACC_A), 2)
+
+    def test_mark_due_never_overrides_a_shared_backoff(self):
+        self.env.pcts.pop(ACC_A)
+        self.env.usages[ACC_A] = limited(ACC_A)
+        self.step(self.a)
+        self.b.seed(live(ACC_A, 5.0), self.env.mono_v)
+        self.b.mark_due(ACC_A)
+        self.env.advance(5)
+        self.assertEqual(self.step(self.b), [])  # A: the shared back-off wins over mark_due; B: stored and fresh
+        self.assertEqual(self.fetches().count(ACC_A), 1)
+        self.assertTrue(rate_limited(self.b.usages()[ACC_A]))
+
+    def test_fresh_process_carries_the_stored_last_good_forward(self):
+        self.step(self.a, [prof(ACC_A)])  # a stores a live 20 % reading
+        self.env.advance(30)
+        self.env.pcts.pop(ACC_A)
+        self.env.usages[ACC_A] = limited(ACC_A, "unavailable")
+        fresh = UsageCache(30.0, UsageStore(self.cfg.state_dir, self.deps))  # a one-shot status: nothing in memory
+        self.assertEqual(self.step(fresh, [prof(ACC_A)]), [ACC_A])  # its fetch gets 429
+        shown = fresh.usages()[ACC_A]
+        self.assertEqual((shown.error, shown.five_hour.utilization, shown.fetched_at), ("http_429", 20.0, T0))
+        stored = self.store.load(ACC_A, self.env.now_v)
+        self.assertEqual((stored.last_good.five_hour.utilization, stored.last_good.fetched_at), (20.0, T0))
+        self.env.advance(5)
+        self.assertEqual(self.step(self.a, [prof(ACC_A)]), [])  # a adopts it: still the 20 % reading
+        self.assertEqual(self.a.usages()[ACC_A].five_hour.utilization, 20.0)
+
+    def test_newer_in_memory_last_good_beats_an_older_stored_one(self):
+        self.step(self.a, [prof(ACC_A)])  # stored last good: 20 % at T0
+        self.env.advance(30)
+        c = UsageCache(30.0, UsageStore(self.cfg.state_dir, self.deps))
+        c.seed(live(ACC_A, 55.0, now=self.env.now_v), self.env.mono_v - 30)  # this process saw a newer one
+        self.env.pcts.pop(ACC_A)
+        self.env.usages[ACC_A] = limited(ACC_A, "unavailable")
+        self.assertEqual(self.step(c, [prof(ACC_A)]), [ACC_A])
+        self.assertEqual(c.usages()[ACC_A].five_hour.utilization, 55.0)
+        self.assertEqual(self.store.load(ACC_A, self.env.now_v).last_good.five_hour.utilization, 55.0)
+
+    def test_seeded_reading_is_kept_after_a_failed_fetch(self):
+        c = UsageCache(30.0)  # no store: the daemon's snapshot seed alone must keep the numbers
+        c.seed(live(ACC_A, 42.0), self.env.mono_v)
+        self.env.advance(30)
+        self.env.pcts.pop(ACC_A)
+        self.env.usages[ACC_A] = AccountUsage(account_id=ACC_A, source="unavailable", fetched_at=self.env.now_v,
+                                              error="network;cache_missing")
+        self.assertEqual(self.step(c, [prof(ACC_A)]), [ACC_A])
+        shown = c.usages()[ACC_A]
+        self.assertEqual((shown.source, shown.error, shown.five_hour.utilization), ("cache", "network", 42.0))
+        self.assertEqual(c.summary(ACC_A)["source"], "live")
+
+    def test_never_shared_cache_unchanged(self):
+        c = UsageCache(30.0)
+        self.step(c)
+        self.assertEqual(self.usage_files(), {})
+        self.assertEqual([x for x in self.env.calls if x[0] in ("lock", "write")], [])
+
+
+class TestShownUsage(unittest.TestCase):
+    def test_choices(self):
+        good = live(ACC_A, 30.0, now=T0 - timedelta(minutes=5))
+        newer_cache = dataclasses.replace(limited(ACC_A), fetched_at=T0 - timedelta(minutes=1))
+        older_cache = dataclasses.replace(limited(ACC_A), fetched_at=T0 - timedelta(minutes=9))
+        unavailable = AccountUsage(account_id=ACC_A, source="unavailable", fetched_at=T0, error="network;cache_missing")
+        fresh = live(ACC_A, 50.0)
+        self.assertEqual(shown_usage(fresh, good), (fresh, False))
+        self.assertEqual(shown_usage(newer_cache, good), (newer_cache, False))
+        self.assertEqual(shown_usage(unavailable, None), (unavailable, False))
+        u, kept = shown_usage(older_cache, good)
+        self.assertTrue(kept)
+        self.assertEqual((u.source, u.error, u.fetched_at, u.five_hour), ("cache", "http_429", good.fetched_at,
+                                                                           good.five_hour))
+        u, kept = shown_usage(unavailable, good)
+        self.assertTrue(kept)
+        self.assertEqual((u.error, u.five_hour.utilization), ("network", 30.0))
+        same_time = dataclasses.replace(limited(ACC_A), fetched_at=good.fetched_at)
+        self.assertTrue(shown_usage(same_time, good)[1])  # only a strictly newer cache wins
+
+
 class TickBase(unittest.TestCase):
     def setUp(self):
         self.env = FakeEnv()
@@ -1295,12 +1564,15 @@ class TestTickUsage(TickBase):
         for age in (61, 60, -5):
             with self.subTest(age=age):
                 self.env.calls.clear()
+                # each case starts without the shared usage files the previous case's fetches stored
+                self.env.files = {k: v for k, v in self.env.files.items() if os.sep + "usage" + os.sep not in k}
                 self.make(self.cfg)
                 self._seed_snapshot(age)
                 self.d._load_state()
                 self.assertEqual(self.d.snapshot()["accounts"], [])
                 self.assertEqual(self.fetch_counts(1), [3])
         self.env.calls.clear()
+        self.env.files = {k: v for k, v in self.env.files.items() if os.sep + "usage" + os.sep not in k}
         self.make(self.cfg)
         self.env.files[self.state_path] = "{"
         self.d._load_state()

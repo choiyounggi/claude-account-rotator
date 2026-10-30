@@ -31,6 +31,7 @@ log = logging.getLogger("rotator.accounts")
 # http.client raise an exception whose message embeds the header value.
 # Always applied with .fullmatch().
 _TOKEN_RE = re.compile(r"[\x21-\x7e]{1,4096}")
+ORGANIZATION_NAME_MAX = 64
 
 def _read_text_utf8(path: str) -> str:
     # UnicodeDecodeError is a ValueError: re-raised as OSError so every
@@ -78,7 +79,16 @@ def _read_identity(home: str, read_text: ReadText) -> Dict[str, Optional[str]]:
         value = account.get(key)
         if isinstance(value, str):
             identity[field] = value
+    identity["organization_name"] = _display_text(identity["organization_name"], ORGANIZATION_NAME_MAX)
     return identity
+
+
+def _display_text(value: Optional[str], cap: int) -> Optional[str]:
+    """``value`` stripped and cut to ``cap`` characters when it is printable text, else None."""
+    if value is None:
+        return None
+    value = value.strip()
+    return value[:cap] if value and value.isprintable() else None
 
 
 def discover_profiles(root: Optional[str] = None, *, read_text: Optional[ReadText] = None) -> List[Profile]:

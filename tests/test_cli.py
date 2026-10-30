@@ -25,6 +25,7 @@ from typing import Callable, Dict, List, Optional, Set
 
 from rotator import cli, daemon, launchd, refresh
 from rotator.cli import STATUS_KEYS, build_status, main, render
+from rotator.daemon import UsageCache, UsageStore
 from rotator.config import (
     CONFIG_DIR_DEFAULT, LOG_DIR_DEFAULT, TIMEOUT_KEYS, TOP_KEYS, Config, ConfigError, load_config, parse_config, prompt_ok,
 )
@@ -265,9 +266,9 @@ ACC_B = "00000000-0000-0000-0000-00000000000b"
 ACC_C = "00000000-0000-0000-0000-00000000000c"
 EMAIL = "user@example.com"
 UUID_SECRET = "00000000-0000-0000-0000-00000000aaaa"
-ORG = "Fixture Org Secret"
 TOKEN = "sk-ant-oat01-FIXTURE-TOKEN-0000"
-SECRETS = (EMAIL, UUID_SECRET, ORG, TOKEN, "Fixture User")
+# The organization name is not among them: the status document shows it as the account's group.
+SECRETS = (EMAIL, UUID_SECRET, TOKEN, "Fixture User")
 T0 = datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc)
 SID1 = "00000000-0000-4000-8000-000000000001"
 SID2 = "00000000-0000-4000-8000-000000000002"
@@ -277,7 +278,7 @@ T0_ISO = "2026-10-28T12:00:00+00:00"
 def prof(aid):
     return Profile(account_id=aid, home=os.path.join(ROOT, aid, "home"),
                    keychain_service="Claude Code-credentials-0000", email=EMAIL, display_name="Fixture User",
-                   account_uuid=UUID_SECRET, organization_name=ORG)
+                   account_uuid=UUID_SECRET)
 
 
 def sess(pid, aid, sid=SID1, handle="term_00000001", status="idle", started_at=T0, argv=None):
@@ -673,7 +674,8 @@ class TestBuildStatus(StatusBase):
         self.assertEqual(doc["schema"], 1)
         self.assertEqual(set(doc["daemon"]), {"running", "pid", "snapshot_age_s", "flags"})
         self.assertEqual(set(doc["accounts"][0]), {"account_id", "source", "error", "fetched_at", "five_hour",
-                                                   "seven_day", "fable", "label", "plan", "pointer", "sessions",
+                                                   "seven_day", "fable", "label", "group", "plan", "pointer",
+                                                   "sessions",
                                                    "refresh"})
         self.assertEqual(set(doc["sessions"][0]), {
             "pid", "session_id", "status", "account_id", "decision", "would_switch", "in_flight", "in_flight_pid",
@@ -702,6 +704,10 @@ class TestBuildStatus(StatusBase):
         self.env.files[self.state_path] = snapshot_doc(self.env, T0 - timedelta(seconds=5))
         doc = self.doc()
         self.assertIs(doc["daemon"]["running"], False)
+        self.assertEqual(len(self.env.fetches()), 0)  # the first call's readings are in the shared usage files
+        self.assertTrue(all(a["source"] != "unavailable" for a in doc["accounts"]))
+        self.env.advance(30.0)  # usage_poll_s later every stored reading is due again
+        self.doc()
         self.assertEqual(len(self.env.fetches()), 3)
 
     def test_non_finite_snapshot_utilization_renders_as_unknown(self):
@@ -876,10 +882,15 @@ class TestBuildStatus(StatusBase):
         self.assertEqual(err.getvalue(), "")
         self.assertEqual(self.account(doc, ACC_B)["error"], "http_429")
 
-    def test_writes_nothing(self):
+    def test_writes_only_the_shared_usage_files(self):
         self.env.sessions = [sess(101, ACC_A)]
         self.doc()
-        self.assertEqual([c for c in self.env.calls if c[0] in ("write", "lock")], [])
+        touched = [c for c in self.env.calls if c[0] in ("write", "lock")]
+        usage_dir = os.path.join(self.cfg.state_dir, "usage") + os.sep
+        locks_dir = os.path.join(self.cfg.state_dir, "locks", "u-")
+        self.assertEqual(len(touched), 6)  # one lock and one write per account
+        for kind, path in touched:
+            self.assertTrue(path.startswith(usage_dir if kind == "write" else locks_dir), (kind, path))
 
     def test_discovery_error_propagates(self):
         self.env.profiles_raise = True
@@ -986,8 +997,10 @@ class TestLabel(unittest.TestCase):
 
 class TestCells(unittest.TestCase):
     def test_remaining_text(self):
-        cases = [(-5, "<1m"), (0, "<1m"), (59.9, "<1m"), (60, "1m"), (3599, "59m"), (3600, "1h"), (4860, "1h21m"),
-                 (4890, "1h21m"), (86399, "23h59m"), (86400, "1d"), (90000, "1d1h"), (6 * 86400 + 86399, "6d23h")]
+        cases = [(-5, "1분 안"), (0, "1분 안"), (59.9, "1분 안"), (60, "1분 뒤"), (119.9, "1분 뒤"), (3599, "59분 뒤"),
+                 (3600, "1시간 뒤"), (3659, "1시간 뒤"), (3660, "1시간 1분 뒤"), (4860, "1시간 21분 뒤"),
+                 (4890, "1시간 21분 뒤"), (86399, "23시간 59분 뒤"), (86400, "1일 뒤"), (89999, "1일 뒤"),
+                 (90000, "1일 1시간 뒤"), (6 * 86400 + 86399, "6일 23시간 뒤")]
         for secs, want in cases:
             with self.subTest(secs=secs):
                 self.assertEqual(cli.remaining_text(secs), want)
@@ -1109,7 +1122,26 @@ def dashboard_doc():
         {"account_id": acc(6), "label": "a-very-long-account-name-indeed", "source": "live", "error": None,
          "fetched_at": (T0 - timedelta(seconds=40)).isoformat(), "five_hour": win(12.0, timedelta(hours=2)),
          "seven_day": win(3.0, timedelta(days=3)), "fable": None, "pointer": False, "sessions": []},
+        {"account_id": acc(7), "label": "erin", "source": "cache", "error": "token_expired",
+         "fetched_at": (T0 - timedelta(hours=23)).isoformat(), "five_hour": win(64.0, timedelta(hours=3, minutes=5)),
+         "seven_day": win(51.0, timedelta(days=4, hours=2)), "fable": None, "pointer": False, "sessions": [],
+         "refresh": {"state": "stopped", "reason": "invalid_grant", "at": None, "last_refreshed_at": None}},
+        {"account_id": acc(8), "label": "frank", "source": "cache", "error": "token_expired",
+         "fetched_at": (T0 - timedelta(days=12)).isoformat(), "five_hour": win(20.0, timedelta(seconds=30)),
+         "seven_day": win(77.0, timedelta(days=5)), "fable": None, "pointer": False,
+         "sessions": [{"pid": 900, "status": "busy"}]},
+        {"account_id": acc(9), "label": "gina", "source": "unavailable", "error": "token_expired;cache_missing",
+         "fetched_at": T0_ISO, "five_hour": None, "seven_day": None, "fable": None, "pointer": False, "sessions": [],
+         "refresh": {"state": "failed", "reason": "write_failed", "at": None, "last_refreshed_at": None}},
     ]
+    return doc
+
+
+def daemon_off(doc):
+    """The same document as a status run with the daemon off: every refresh record is daemon_off."""
+    doc["daemon"] = {"running": False, "pid": None, "snapshot_age_s": None, "flags": None}
+    for a in doc["accounts"]:
+        a["refresh"] = {"state": "skipped", "reason": "daemon_off", "at": None, "last_refreshed_at": None}
     return doc
 
 
@@ -1193,39 +1225,42 @@ class TestRender(unittest.TestCase):
     def test_label_truncated_to_18(self):
         doc = render_doc()
         doc["accounts"][0]["label"] = "a-very-long-account-name-indeed"
-        self.assertEqual(self.row(self.lines(doc), "a-very-long-accou…")[1], "a-very-long-accou…")
+        # A wide terminal shows the whole label; the 18-column cap applies only once the table no longer fits.
+        self.assertEqual(self.row(self.lines(doc), "a-very-long-account-name-indeed")[1],
+                         "a-very-long-account-name-indeed")
+        self.assertEqual(self.row(self.lines(doc, width=100), "a-very-long-accou…")[1], "a-very-long-accou…")
         self.assertEqual(cli.display_width("a-very-long-accou…"), 18)
 
     def test_unavailable_with_error(self):
         row = self.row(self.lines(), "bob")
-        self.assertEqual(row[2:], ["-", "-  (토큰 만료·캐시 없음)", "-", "-", "0", "-"])
+        self.assertEqual(row[2:], ["-", "-  (토큰 만료·캐시 없음)", "-", "-", "0", "갱신 대기"])
 
     def test_live_cell_bar_percent_remaining(self):
         doc = render_doc()
         doc["accounts"][0]["five_hour"] = win(89.4, timedelta(hours=1, minutes=21, seconds=30))
         doc["accounts"][0]["fable"] = win(25.0, timedelta(days=5))
         row = self.row(self.lines(doc), "alice")
-        self.assertEqual(row[3], "████████▒  89% ↻1h21m")
-        self.assertEqual(row[4], "▒▒▒▒▒▒▒▒▒  10% ↻1h12m")
+        self.assertEqual(row[3], "████████▒  89% · 1시간 21분 뒤")
+        self.assertEqual(row[4], "▒▒▒▒▒▒▒▒▒  10% · 1시간 12분 뒤")
         self.assertEqual(row[5], "█▒▒▒  25%")  # the fable cell never shows a reset
         self.assertEqual(row[6], "1")
 
     def test_countdown(self):
         row = self.row(self.lines(), "alice")
-        self.assertEqual(row[3], "▒▒▒▒▒▒▒▒▒   0%")  # the 5h window reset at 03:00 UTC: 0% and no ↻
+        self.assertEqual(row[3], "▒▒▒▒▒▒▒▒▒   0%")  # the 5h window reset at 03:00 UTC: 0% and no reset text
         doc = render_doc()
         doc["accounts"][0]["five_hour"]["resets_at"] = None
         self.assertEqual(self.row(self.lines(doc), "alice")[3], "███▒▒▒▒▒▒  42%")  # floor(42 * 9 / 100) = 3 cells
         at = self.row(self.lines(now=T0 + timedelta(hours=1, minutes=12)), "alice")
         self.assertEqual(at[4], "▒▒▒▒▒▒▒▒▒   0%")
         early = self.row(self.lines(now=T0 + timedelta(hours=1, minutes=11, seconds=30)), "alice")
-        self.assertEqual(early[4], "▒▒▒▒▒▒▒▒▒  10% ↻<1m")
+        self.assertEqual(early[4], "▒▒▒▒▒▒▒▒▒  10% · 1분 안")
 
     def test_age_from_now(self):
         self.assertEqual(self.row(self.lines(), "alice")[7], "12초 전")
         later = self.lines(now=T0 + timedelta(seconds=5))
         self.assertEqual(self.row(later, "alice")[7], "17초 전")
-        self.assertEqual(self.row(later, "bob")[7], "-")
+        self.assertEqual(self.row(later, "bob")[7], "갱신 대기")
         doc = render_doc()
         doc["accounts"][0]["fetched_at"] = (T0 + timedelta(seconds=3)).isoformat()
         self.assertEqual(self.row(self.lines(doc), "alice")[7], "0초 전")
@@ -1235,10 +1270,12 @@ class TestRender(unittest.TestCase):
     def test_rate_limited_label(self):
         cases = [({"source": "cache", "error": "http_429", "fetched_at": (T0 - timedelta(minutes=10)).isoformat(),
                    "five_hour": win(50.0, timedelta(hours=1))},
-                  "(캐시)     50% ↻1h", "10분 전 (호출 제한)"),
+                  "████▒▒▒▒▒  50% · 1시간 뒤", "10분 전 · 캐시 · 호출 제한"),
                  ({"source": "unavailable", "error": "http_429;cache_missing"}, "-  (호출 제한·캐시 없음)", "-"),
                  ({"source": "cache", "error": "http_500", "fetched_at": T0_ISO, "five_hour": win(5.0, timedelta(0))},
-                  "(캐시)      0%", "0초 전 (HTTP 500)")]
+                  "▒▒▒▒▒▒▒▒▒   0%", "0초 전 · 캐시 · HTTP 500"),
+                 ({"source": "cache", "error": None, "fetched_at": (T0 - timedelta(days=3)).isoformat(),
+                   "five_hour": win(33.0, timedelta(days=2, minutes=59))}, "██▒▒▒▒▒▒▒  33% · 2일 뒤", "3일 전 · 캐시")]
         for patch, five, age in cases:
             with self.subTest(patch=patch):
                 doc = render_doc()
@@ -1350,9 +1387,30 @@ class TestRender(unittest.TestCase):
         for l in lines:
             self.assertTrue(all(ch.isascii() or "가" <= ch <= "힣" for ch in l), l)
         row = next(cells(l, ascii=True) for l in account_rows(lines, ascii=True) if cells(l, ascii=True)[1] == "alice")
-        self.assertEqual(row[3], "########.  89% (1h21m)")
+        self.assertEqual(row[3], "########.  89% / 1시간 21분 뒤")
         self.assertIn("노랑 >=85%", "\n".join(lines))
         self.assertTrue(any("(토큰 만료/캐시 없음)" in l for l in lines))
+        erin = next(cells(l, ascii=True) for l in account_rows(lines, ascii=True) if cells(l, ascii=True)[1] == "erin")
+        self.assertEqual(erin[-1], "재로그인 필요 / 23시간 전 / 캐시")
+
+    def test_no_reset_arrow_anywhere(self):
+        for kw in ({}, {"ascii": True}, {"ambiguous_wide": True}, {"color": True}):
+            for width in (200, 150, 120, 100, 80, 60):
+                with self.subTest(kw=kw, width=width):
+                    text = "\n".join(render(dashboard_doc(), T0, TZ9, width, **kw))
+                    self.assertNotIn("↻", text)
+                    self.assertNotIn("<1m", text)
+
+    def test_cache_row_draws_bars_and_reset(self):
+        lines = self.lines(dashboard_doc())
+        carol = self.row(lines, "carol")
+        self.assertEqual(carol[3], "▒▒▒▒▒▒▒▒▒   0%")  # past its reset: 0% and no reset text
+        self.assertEqual(carol[4], "██▒▒▒▒▒▒▒  28% · 2일 뒤")
+        self.assertEqual(carol[-1], "3일 전 · 캐시 · 호출 제한")
+        self.assertNotIn("(캐시)", "\n".join(lines))
+        frank = self.row(lines, "frank")
+        self.assertEqual(frank[3], "█▒▒▒▒▒▒▒▒  20% · 1분 안")
+        self.assertEqual(frank[4], "██████▒▒▒  77% · 5일 뒤")
 
 
 class TestAlignment(unittest.TestCase):
@@ -1376,12 +1434,15 @@ class TestAlignment(unittest.TestCase):
     def test_every_line_same_width_and_borders(self):
         for amb in (False, True):
             for ascii in (False, True):
-                for width in (200, 160, 120, 105, 100, 80, 65, 50):
+                for width in (200, 160, 150, 120, 105, 100, 80, 65, 60, 50):
                     for color in (False, True):
-                        with self.subTest(amb=amb, ascii=ascii, width=width, color=color):
-                            lines = render(dashboard_doc(), T0, TZ9, width, ambiguous_wide=amb, ascii=ascii,
-                                           color=color)
-                            self.check(lines, amb, ascii, width)
+                        for off in (False, True):
+                            with self.subTest(amb=amb, ascii=ascii, width=width, color=color, off=off):
+                                doc = daemon_off(dashboard_doc()) if off else dashboard_doc()
+                                lines = render(doc, T0, TZ9, width, ambiguous_wide=amb, ascii=ascii, color=color)
+                                self.check(lines, amb, ascii, width)
+                                if off and width >= 150:
+                                    self.assertIn("갱신 필요", "\n".join(lines))
 
     def test_rule_glyphs_fill_cells_exactly_when_wide(self):
         lines = render(dashboard_doc(), T0, TZ9, 300, ambiguous_wide=True)
@@ -1403,11 +1464,18 @@ class TestFallback(unittest.TestCase):
             return 2
         if "갱신" in head:
             return 3
-        return 4
+        if "뒤" in rows or "1분 안" in rows:
+            return 4
+        return 5
 
     def test_degradation_order(self):
         doc = dashboard_doc()
-        cases = [(130, 0), (115, 1), (105, 2), (100, 3), (80, 4), (65, 4)]
+        full = cli.display_width(tables(render(doc, T0, TZ9, 500))[0][0])
+        widths = {}
+        for w in range(full, 30, -1):
+            widths.setdefault(self.level(render(doc, T0, TZ9, w)), w)
+        self.assertEqual(sorted(widths), [0, 1, 2, 3, 4, 5])
+        cases = [(widths[k], k) for k in range(6)] + [(widths[k + 1] + 1, k) for k in range(5)]
         for width, want in cases:
             with self.subTest(width=width):
                 lines = render(doc, T0, TZ9, width)
@@ -1417,20 +1485,42 @@ class TestFallback(unittest.TestCase):
 
     def test_level_never_decreases_as_width_shrinks(self):
         doc = dashboard_doc()
-        levels = [self.level(render(doc, T0, TZ9, w)) for w in range(160, 39, -1)]
+        levels = [self.level(render(doc, T0, TZ9, w)) for w in range(200, 39, -1)]
         self.assertEqual(levels, sorted(levels))
-        self.assertEqual((levels[0], levels[-1]), (0, 4))
+        self.assertEqual((levels[0], levels[-1]), (0, 5))
 
     def test_full_table_kept_when_it_fits_exactly(self):
         doc = dashboard_doc()
         full = cli.display_width(tables(render(doc, T0, TZ9, 500))[0][0])
         self.assertEqual(self.level(render(doc, T0, TZ9, full)), 0)
-        self.assertEqual(self.level(render(doc, T0, TZ9, full - 1)), 1)
+        self.assertFalse(any("…" in l for l in tables(render(doc, T0, TZ9, full))[0]))
+        # One column less: still every column, the over-long label cut first
+        narrower = render(doc, T0, TZ9, full - 1)
+        self.assertEqual(self.level(narrower), 0)
+        self.assertIn("a-very-long-account-name-inde…", [cells(l)[1] for l in account_rows(narrower)])
+        capped = max(w for w in range(full, 40, -1) if self.level(render(doc, T0, TZ9, w)) == 1)
+        self.assertEqual(self.level(render(doc, T0, TZ9, capped + 1)), 0)
+        self.assertIn("a-very-long-accou…", [cells(l)[1] for l in account_rows(render(doc, T0, TZ9, capped + 1))])
+
+    def test_reset_text_dropped_before_label_shrinks(self):
+        doc = dashboard_doc()
+        for width in range(120, 40, -1):
+            lines = render(doc, T0, TZ9, width)
+            labels = [cells(l)[1] for l in account_rows(lines)]
+            if any(lab.endswith("…") for lab in labels if not lab.startswith("a-very-long")):
+                break
+            if "a-very-long-accou…" not in labels:
+                self.assertEqual(self.level(lines), 5, width)
+                break
+        else:
+            self.fail("the label never shrank")
+        five = cells(account_rows(render(doc, T0, TZ9, width))[0])
+        self.assertTrue(all("뒤" not in c and "1분 안" not in c for c in five), five)
 
     def test_label_shrinks_after_columns_are_gone(self):
         doc = dashboard_doc()
-        lines = render(doc, T0, TZ9, 65)
-        self.assertEqual(self.level(lines), 4)
+        lines = render(doc, T0, TZ9, 60)
+        self.assertEqual(self.level(lines), 5)
         labels = [cells(l)[1] for l in account_rows(lines)]
         self.assertTrue(any(lab.endswith("…") for lab in labels), labels)
         self.assertIn("alice", labels)
@@ -1518,8 +1608,10 @@ class TestPlan(unittest.TestCase):
 
     def test_suffix_survives_label_cut(self):
         long = "a-very-long-account-name-indeed"
-        rows = self.rows(plan_doc([(ID_A1, long, "Team"), (ID_B2, long, "Team")]))
-        self.assertEqual([r[1] for r in rows], ["a-very-long… #aaaa", "a-very-long… #bbbb"])
+        doc = plan_doc([(ID_A1, long, "Team"), (ID_B2, long, "Team")])
+        self.assertEqual([r[1] for r in self.rows(doc)], [long + " #aaaa", long + " #bbbb"])  # wide: uncut
+        rows = self.rows(doc, width=70)
+        self.assertEqual([r[1] for r in rows], ["a-very… Team #aaaa", "a-very… Team #bbbb"])
         self.assertTrue(all(cli.display_width(r[1]) <= 18 for r in rows))
 
     def test_alignment_with_plan_column(self):
@@ -1539,6 +1631,188 @@ class TestPlan(unittest.TestCase):
         doc = plan_doc([(ID_A1, "user", None)])
         del doc["accounts"][0]["plan"]
         self.assertEqual(self.rows(doc)[0][2], "-")
+
+
+def grouped(doc, names=("Example Org TEAM 1", "Example Org TEAM 2")):
+    """Groups the accounts round-robin under ``names``, as build_status's group_names shows them."""
+    shown = cli.group_names({a["account_id"]: names[i % len(names)] for i, a in enumerate(doc["accounts"])})
+    for a in doc["accounts"]:
+        a["group"] = shown[a["account_id"]]
+    return doc
+
+
+class TestGroup(unittest.TestCase):
+    def test_group_names(self):
+        cases = [
+            ({"a": "Example Org TEAM 1", "b": "Example Org TEAM 2"}, {"a": "TEAM 1", "b": "TEAM 2"}),
+            ({"a": "Example Org TEAM 1", "b": "Example Org TEAM 2", "c": None}, {"a": "TEAM 1", "b": "TEAM 2", "c": None}),
+            ({"a": "Alpha Team", "b": "Beta Team"}, {"a": "Alpha Team", "b": "Beta Team"}),  # no common prefix
+            ({"a": "Example Org", "b": "Example Org"}, {"a": "Example Org", "b": "Example Org"}),  # one name: whole
+            ({"a": "Example Org", "b": "Example Org TEAM 2"}, {"a": "Org", "b": "Org TEAM 2"}),  # >= 1 word kept
+            ({"a": "Example", "b": "Example Org"}, {"a": "Example", "b": "Example Org"}),
+            ({"a": "ExampleX TEAM", "b": "Example TEAM"}, {"a": "ExampleX TEAM", "b": "Example TEAM"}),  # words only
+            ({"a": "Example Org Sales", "b": "Example Org Ops"}, {"a": "Sales", "b": "Ops"}),
+            ({"a": "Example Org 1", "b": "Example Org 2"}, {"a": "Org 1", "b": "Org 2"}),  # never a bare number
+            ({"a": "Example Org TEAM 1", "b": "Example Org TEAM 12", "c": "Example Org TEAM"},
+             {"a": "TEAM 1", "b": "TEAM 12", "c": "TEAM"}),
+            ({"a": "  ", "b": "\x1b[31mX Y", "c": None}, {"a": None, "b": "[31mX Y", "c": None}),
+            ({}, {}),
+        ]
+        for orgs, want in cases:
+            with self.subTest(orgs=orgs):
+                self.assertEqual(cli.group_names(orgs), want)
+
+    def test_build_status_group(self):
+        env = standard_env()
+        env.profiles = [dataclasses.replace(prof(ACC_A), organization_name="Example Org TEAM 1"),
+                        dataclasses.replace(prof(ACC_B), organization_name="Example Org TEAM 2"),
+                        prof(ACC_C)]
+        doc = build_status(make_cfg(), env.deps(), T0)
+        self.assertEqual({a["account_id"]: a["group"] for a in doc["accounts"]},
+                         {ACC_A: "TEAM 1", ACC_B: "TEAM 2", ACC_C: None})
+
+    def rows(self, doc, width=200, **kw):
+        return [cells(l, kw.get("ascii", False)) for l in account_rows(render(doc, T0, TZ9, width, **kw),
+                                                                       kw.get("ascii", False))]
+
+    def test_column_after_label_and_sorting(self):
+        doc = plan_doc([(ID_A1, "user", "Max5x"), (ID_B2, "user", "Max5x"), (ID_C3, "alice", "Team")])
+        doc["accounts"][0]["group"], doc["accounts"][1]["group"], doc["accounts"][2]["group"] = "TEAM 2", "TEAM 1", None
+        lines = render(doc, T0, TZ9, 200)
+        self.assertEqual(cells(tables(lines)[0][1])[:4], ["", "계정", "그룹", "플랜"])
+        # group, then label: None (no group) first, then TEAM 1, TEAM 2; same label + plan, groups differ: no #id
+        self.assertEqual([r[1:4] for r in self.rows(doc)],
+                         [["alice", "-", "Team"], ["user", "TEAM 1", "Max5x"], ["user", "TEAM 2", "Max5x"]])
+
+    def test_group_sorts_before_label(self):
+        doc = plan_doc([(ID_A1, "alice", "Team"), (ID_B2, "zed", "Team"), (ID_C3, "mia", "Team")])
+        for a, g in zip(doc["accounts"], ("TEAM 2", "TEAM 1", "TEAM 2")):
+            a["group"] = g
+        self.assertEqual([r[1:3] for r in self.rows(doc)], [["zed", "TEAM 1"], ["alice", "TEAM 2"], ["mia", "TEAM 2"]])
+
+    def test_no_group_column_without_groups(self):
+        doc = plan_doc([(ID_A1, "user", "Max5x"), (ID_B2, "bob", "Team")])
+        self.assertNotIn("그룹", cells(tables(render(doc, T0, TZ9, 200))[0][1]))
+
+    def test_suffix_only_when_label_group_plan_collide(self):
+        doc = plan_doc([(ID_A1, "user", "Max5x"), (ID_B2, "user", "Max5x"), (ID_C3, "user", "Max5x")])
+        for a, g in zip(doc["accounts"], ("TEAM 1", "TEAM 1", "TEAM 2")):
+            a["group"] = g
+        self.assertEqual([r[1] for r in self.rows(doc)], ["user #aaaa", "user #bbbb", "user"])
+
+    def test_group_truncated_to_10(self):
+        doc = plan_doc([(ID_A1, "user", "Max5x")])
+        doc["accounts"][0]["group"] = "A Very Long Group Name"
+        self.assertEqual(self.rows(doc)[0][2], "A Very Lo…")
+        self.assertEqual(cli.display_width(self.rows(doc)[0][2]), 10)
+        self.assertEqual(self.rows(doc, ascii=True)[0][2], "A Very Lo~")
+
+    def test_dropped_group_joins_the_label(self):
+        doc = plan_doc([(ID_A1, "user", "Max5x"), (ID_B2, "user", "Max5x")])
+        doc["accounts"][0]["group"], doc["accounts"][1]["group"] = "TEAM 1", "TEAM 2"
+        seen = set()
+        for width in range(120, 40, -1):
+            lines = render(doc, T0, TZ9, width)
+            head = cells(tables(lines)[0][1])
+            labels = [cells(l)[1] for l in account_rows(lines)]
+            if "플랜" in head:
+                self.assertIn("그룹", head)  # 그룹 is dropped only after 플랜
+            if "그룹" not in head and "플랜" not in head and all(lab.startswith("user ") for lab in labels):
+                self.assertEqual(labels, ["user TEAM 1 Max5x", "user TEAM 2 Max5x"])
+                seen.add(width)
+        self.assertTrue(seen)
+
+    def test_sessions_label_has_group_and_plan(self):
+        doc = plan_doc([(ID_A1, "user", "Max5x"), (ID_B2, "user", "Max5x")])
+        doc["accounts"][0]["group"], doc["accounts"][1]["group"] = "TEAM 1", "TEAM 2"
+        lines = render(doc, T0, TZ9, 200)
+        rows = [cells(l) for l in tables(lines)[1][3:-1]]
+        self.assertEqual(rows[0][1], "user TEAM 1 Max5x")
+        self.assertIn("-> user TEAM 1 Max5x", rows[1][4])
+        rows = [cells(l) for l in tables(render(doc, T0, TZ9, 45))[1][3:-1]]
+        self.assertTrue(all(cli.display_width(r[1]) <= 45 for r in rows))
+
+    def test_alignment_with_groups(self):
+        for names in (("Example Org TEAM 1", "Example Org TEAM 2"), ("Alpha", "그룹 둘")):
+            for amb in (False, True):
+                for ascii in (False, True):
+                    for width in (200, 150, 120, 100, 80, 60):
+                        with self.subTest(names=names, amb=amb, ascii=ascii, width=width):
+                            lines = render(grouped(dashboard_doc(), names), T0, TZ9, width, ambiguous_wide=amb,
+                                           ascii=ascii)
+                            TestAlignment.check(self, lines, amb, ascii, width)
+                            if width >= 150:
+                                self.assertIn("그룹", cells(tables(lines, ascii)[0][1], ascii))
+
+
+class TestNaturalWidths(unittest.TestCase):
+    def test_wide_terminal_cuts_nothing(self):
+        doc = daemon_off(dashboard_doc())
+        doc["accounts"][3]["error"] = "token_expired;cache_missing;network"
+        full = cli.display_width(tables(render(doc, T0, TZ9, 1000))[0][0])
+        for width in (full, full + 1, 1000):
+            with self.subTest(width=width):
+                block = tables(render(doc, T0, TZ9, width))[0]
+                self.assertFalse(any("…" in l for l in block), "\n".join(block))
+                self.assertIn("a-very-long-account-name-indeed", "\n".join(block))
+
+    def test_narrow_terminal_cuts(self):
+        doc = dashboard_doc()
+        doc["accounts"][2]["fetched_at"] = (T0 - timedelta(hours=16)).isoformat()
+        wide = {cells(l)[1]: cells(l)[-1] for l in account_rows(render(doc, T0, TZ9, 1000))}
+        self.assertEqual(wide["carol"], "16시간 전 · 캐시 · 호출 제한")
+        narrow = {cells(l)[1]: cells(l)[-1] for l in account_rows(render(doc, T0, TZ9, 140))}
+        self.assertTrue(narrow["carol"].startswith("16시간 전 · 캐시") and narrow["carol"].endswith("…"), narrow)
+        self.assertLessEqual(cli.display_width(narrow["carol"]), cli._AGE_CAP)
+
+    def test_unavailable_reason_uncut_when_wide(self):
+        doc = render_doc()
+        doc["accounts"][1]["error"] = "token_expired;cache_missing;network;http_500"
+        row = TestRender.row(self, render(doc, T0, TZ9, 300), "bob")
+        self.assertEqual(row[3], "-  (토큰 만료·캐시 없음·연결 실패·HTTP 500)")
+        short = TestRender.row(self, render(doc, T0, TZ9, 100), "bob")
+        self.assertTrue(short[3].endswith("…)"), short)
+
+
+class TestLastGood(StatusBase):
+    """Addendum 3: one usage poll per account across rotator processes, and the last good reading kept."""
+
+    def test_watch_and_one_shot_status_share_one_poll(self):
+        watch = UsageCache(30.0, UsageStore(self.cfg.state_dir, self.deps))
+        for _ in range(7):  # a watch rebuilding every 10 s and a one-shot status each time, for 60 s
+            self.doc(usage=watch)
+            self.doc()
+            self.env.advance(10.0)
+        self.assertEqual(len(self.env.fetches()), 3 * 3)  # at 0, 30 and 60 s, once per account
+
+    def test_rate_limited_keeps_last_good_numbers(self):
+        self.doc()
+        self.env.advance(300.0)
+        self.env.usages[ACC_A] = AccountUsage(account_id=ACC_A, source="unavailable", fetched_at=self.env.now_v,
+                                              error="http_429;cache_missing")
+        doc = self.doc()
+        a = self.account(doc, ACC_A)
+        self.assertEqual((a["source"], a["error"], a["five_hour"]["utilization"]), ("live", "http_429", 20.0))
+        self.assertEqual(a["fetched_at"], T0_ISO)  # the age is the good reading's
+        lines = render(doc, self.env.now_v, TZ9, 200)
+        rows = [cells(l) for l in account_rows(lines)]
+        self.assertEqual(cells(tables(lines)[0][1])[3], "5시간")
+        self.assertTrue(all("%" in r[3] and "%" in r[4] for r in rows), rows)  # never blank: numbers everywhere
+        self.assertEqual(sorted(r[-1] for r in rows), ["5분 전", "5분 전", "5분 전 · 호출 제한"])
+
+    def test_expired_token_after_a_good_reading(self):
+        doc = render_doc()
+        doc["accounts"][0].update(error="token_expired", fetched_at=(T0 - timedelta(minutes=5)).isoformat())
+        row = TestRender.row(self, render(doc, T0, TZ9, 200), "alice")
+        self.assertEqual(row[-1], "세션이 갱신 · 5분 전")  # alice has a live session
+        self.assertTrue(row[4].startswith("▒▒▒▒▒▒▒▒▒  10% · "), row)
+        doc["accounts"][0]["sessions"] = []
+        self.assertEqual(TestRender.row(self, render(doc, T0, TZ9, 200), "alice")[-1], "갱신 대기 · 5분 전")
+        doc = daemon_off(doc)
+        self.assertEqual(TestRender.row(self, render(doc, T0, TZ9, 200), "alice")[-1], "갱신 필요 · 5분 전")
+
+    def test_live_row_without_error_shows_age_only(self):
+        self.assertEqual(TestRender.row(self, render(render_doc(), T0, TZ9, 200), "alice")[-1], "12초 전")
 
 
 class TestColor(unittest.TestCase):
@@ -1761,8 +2035,24 @@ class TestStatusCommand(MainBase):
         self.assertEqual(f.count(("fetch", ACC_A)), 5)
         self.assertEqual(f.count(("fetch", ACC_C)), 5)
         b = cells(account_rows(self.frames()[-1].splitlines())[1])
-        self.assertTrue(b[3].startswith("(캐시)"), b)
-        self.assertTrue(b[7].endswith("(호출 제한)"), b)
+        self.assertTrue(b[3].startswith("████▒▒▒▒▒  50% · "), b)
+        self.assertTrue(b[7].endswith(" · 캐시 · 호출 제한"), b)
+
+    def test_watch_follows_terminal_resize(self):
+        sizes = iter(["70", "300"])
+
+        def hook(k):
+            self.env.advance(1.0)
+            os.environ["COLUMNS"] = next(sizes, "300")  # the terminal is resized between redraws
+            if k == 3:
+                raise KeyboardInterrupt
+        self.env.wait_hook = hook
+        self.assertEqual(self.main("status", "--watch"), 0)
+        widths = [max(cli.display_width(l) for l in tables(f.splitlines())[0]) for f in self.frames()]
+        self.assertEqual(len(widths), 3)
+        self.assertLessEqual(widths[1], 70)
+        self.assertGreater(widths[0], 70)
+        self.assertGreater(widths[2], 70)  # widened again (cells hold the ticking ages, so not byte-equal)
 
     def test_status_discovery_failure(self):
         self.env.profiles_raise = True
@@ -2401,7 +2691,7 @@ class TestStatusRefresh(StatusBase):
         self.snapshot(T0 - timedelta(seconds=5), {ACC_A: REFRESHED})
         text = json.dumps(self.doc())
         # The fixture profiles carry planted identity values; none may reach the status JSON.
-        for planted in (UUID_SECRET, EMAIL, ORG, "SECRET-", "accessToken", "refreshToken"):
+        for planted in (UUID_SECRET, EMAIL, "SECRET-", "accessToken", "refreshToken"):
             self.assertNotIn(planted, text)
         self.assertIn(ACC_A, text)  # negative control: the document holds the accounts
         self.assertIn('"refresh"', text)
@@ -2427,11 +2717,61 @@ class TestRefreshReasons(unittest.TestCase):
                          "토큰 없음")
         self.assertEqual(self.tokens("cache", None, {"state": "failed", "reason": "write_failed"}), "write_failed")
 
-    def test_daemon_off_never_in_cells(self):
+    def test_daemon_off_reason_stays_out_but_needs_refresh_shows(self):
+        # daemon_off itself is never a cell text; an expired token under a stopped daemon reads 갱신 필요.
         for source in ("cache", "unavailable"):
             with self.subTest(source=source):
                 self.assertEqual(self.tokens(source, "token_expired",
                                              {"state": "skipped", "reason": "daemon_off"}), "token_expired")
+                self.assertEqual(self.state(source, "token_expired", OFF, running=False), "갱신 필요")
+        lines = render(daemon_off(dashboard_doc()), T0, TZ9, 200)
+        self.assertNotIn("데몬 꺼짐", "\n".join(lines[1:]))
+        self.assertIn("갱신 필요", "\n".join(lines))
+
+    def state(self, source, error, rec, running=True, sessions=()):
+        return cli._token_state({"source": source, "error": error, "refresh": rec,
+                                 "sessions": [{"pid": p} for p in sessions]}, running)
+
+    def rec(self, state, reason):
+        return {"state": state, "reason": reason, "at": None, "last_refreshed_at": None}
+
+    def test_token_states(self):
+        cases = [
+            # expired, no session: daemon off -> 갱신 필요; daemon on and waiting -> 갱신 대기
+            (("cache", "token_expired", OFF, False, ()), "갱신 필요"),
+            (("unavailable", "token_expired;cache_missing", OFF, False, ()), "갱신 필요"),
+            (("cache", "token_expired", None, True, ()), "갱신 대기"),
+            (("cache", "token_expired", self.rec("skipped", "deferred"), True, ()), "갱신 대기"),
+            (("cache", "token_expired", self.rec("not_needed", "fresh"), True, ()), "갱신 대기"),
+            # a live Claude session on the account refreshes it (daemon on or off)
+            (("cache", "token_expired", OFF, False, (7,)), "세션이 갱신"),
+            (("cache", "token_expired", self.rec("skipped", "live_session"), True, (7,)), "세션이 갱신"),
+            (("unavailable", "token_expired;cache_missing", self.rec("skipped", "live_session"), True, ()),
+             "세션이 갱신"),
+            # stopped until the item changes -> re-login
+            (("cache", "token_expired", self.rec("stopped", "invalid_grant"), True, ()), "재로그인 필요"),
+            (("cache", "token_expired", self.rec("stopped", "outcome_unknown"), True, ()), "재로그인 필요"),
+            (("cache", "token_expired", self.rec("stopped", "rejected"), True, ()), "재로그인 필요"),
+            (("unavailable", "token_missing;cache_missing", self.rec("skipped", "no_refresh_token"), True, ()),
+             "재로그인 필요"),
+            # write_failed (held) and the other failures keep the Korean map
+            (("cache", "token_expired", self.rec("failed", "write_failed"), True, ()), "키체인 저장 실패"),
+            (("cache", "token_expired", self.rec("failed", "server_error"), True, ()), "갱신 실패"),
+            (("cache", "token_expired", self.rec("skipped", "cc_lock_busy"), True, ()), "갱신 중"),
+            (("cache", "token_expired", self.rec("skipped", "disabled"), True, ()), "자동 갱신 꺼짐"),
+            (("cache", "token_expired", self.rec("skipped", "dry_run"), True, ()), "드라이런"),
+            (("unavailable", "token_missing;cache_missing", OFF, False, ()), "토큰 없음"),
+            # usable token: no state
+            (("live", None, self.rec("skipped", "live_session"), True, (7,)), None),
+            (("live", None, OFF, False, ()), None),
+            (("cache", "http_429", self.rec("not_needed", "fresh"), True, ()), None),
+            (("cache", "http_429", OFF, False, ()), None),
+            (("cache", None, None, True, ()), None),
+            (("cache", "http_429", self.rec("skipped", "disabled"), True, ()), None),
+        ]
+        for (source, error, rec, running, sessions), want in cases:
+            with self.subTest(source=source, error=error, rec=rec, running=running, sessions=sessions):
+                self.assertEqual(self.state(source, error, rec, running, sessions), want)
 
     def test_unchanged_cases(self):
         self.assertEqual(self.tokens("live", "token_expired", {"state": "skipped", "reason": "live_session"}),
@@ -2466,8 +2806,52 @@ class TestRenderRefresh(unittest.TestCase):
         lines = self.lines(doc, width=260)
         for row in account_rows(lines):
             self.assertNotIn("데몬 꺼짐", row)
-        rows = [cells(l) for l in account_rows(lines)]
-        self.assertTrue(any(c.endswith("(토큰 만료)") for r in rows for c in r), rows)
+        a, b = (cells(l) for l in account_rows(lines)[:2])  # rows sort by label, plan, id: ACC_A, ACC_B
+        self.assertEqual(a[-1], "갱신 필요 · 12분 전 · 캐시")
+        self.assertEqual(a[3], "████▒▒▒▒▒  50% · 1시간 뒤")  # floor(50 * 9 / 100) = 4 cells
+        self.assertEqual(b[-1], "갱신 필요")
+        self.assertIn(cli.REFRESH_FOOTER, lines)
+        self.assertEqual(cli.REFRESH_FOOTER, "토큰 만료 계정은 데몬이 자동 갱신해: rotator install (또는 rotator daemon)")
+
+    def test_footer_only_with_daemon_off_and_needs_refresh(self):
+        self.assertIn(cli.REFRESH_FOOTER, render(daemon_off(dashboard_doc()), T0, TZ9, 200))
+        self.assertNotIn(cli.REFRESH_FOOTER, render(dashboard_doc(), T0, TZ9, 200))  # daemon on
+        doc = daemon_off(dashboard_doc())
+        doc["accounts"] = [a for a in doc["accounts"] if a.get("source") == "live" or a["label"] == "frank"]
+        lines = render(doc, T0, TZ9, 200)
+        self.assertNotIn(cli.REFRESH_FOOTER, lines)  # daemon off, but no row needs a refresh
+        self.assertIn("세션이 갱신", "\n".join(lines))
+        for width in (80, 40, 10):
+            with self.subTest(width=width):
+                out = render(daemon_off(dashboard_doc()), T0, TZ9, width)
+                for l in set(out) - RELAUNCH_LINES:
+                    self.assertLessEqual(cli.display_width(l), width, l)
+                self.assertTrue(any(l.startswith("토큰 만료") for l in out))
+
+    def test_state_cells_in_table(self):
+        lines = render(dashboard_doc(), T0, TZ9, 200)
+        last = {cells(l)[1]: cells(l)[-1] for l in account_rows(lines)}
+        self.assertEqual(last["dave"], "갱신 대기")
+        self.assertEqual(last["erin"], "재로그인 필요 · 23시간 전 · 캐시")
+        self.assertEqual(last["frank"], "세션이 갱신 · 12일 전 · 캐시")
+        self.assertEqual(last["gina"], "키체인 저장 실패")
+        self.assertEqual(last["alice"], "3초 전")
+        off = {cells(l)[1]: cells(l)[-1] for l in account_rows(render(daemon_off(dashboard_doc()), T0, TZ9, 200))}
+        self.assertEqual(off["dave"], "갱신 필요")
+        self.assertEqual(off["erin"], "갱신 필요 · 23시간 전 · 캐시")
+        self.assertEqual(off["frank"], "세션이 갱신 · 12일 전 · 캐시")
+        self.assertEqual(off["carol"], "3일 전 · 캐시 · 호출 제한")
+
+    def test_state_cell_clipped_with_ellipsis(self):
+        doc = render_doc()
+        doc["accounts"][0].update(source="cache", error="token_expired", fetched_at=(T0 - timedelta(hours=23)).isoformat(),
+                                  refresh={"state": "failed", "reason": "write_failed", "at": None,
+                                           "last_refreshed_at": None})
+        self.assertEqual(self.row(self.lines(doc), "alice")[-1], "키체인 저장 실패 · 23시간 전 · 캐시")  # wide: whole
+        cell = self.row(self.lines(doc, width=110), "alice")[-1]
+        self.assertTrue(cell.startswith("키체인 저장 실패 · "), cell)
+        self.assertTrue(cell.endswith("…"), cell)
+        self.assertEqual(cli.display_width(cell), cli._AGE_CAP)
 
     def test_cache_past_reset_shows_zero_and_reason(self):
         doc = self.doc_with(source="cache", error="token_expired", five_hour=win(90.0, timedelta(minutes=-1)),
@@ -2475,26 +2859,24 @@ class TestRenderRefresh(unittest.TestCase):
                                      "last_refreshed_at": None})
         row = self.row(self.lines(doc), "alice")
         joined = " ".join(row)
-        self.assertIn("(캐시)", joined)
-        five = next(c for c in row if "(캐시)" in c)
-        self.assertIn("0%", five)
+        self.assertEqual(row[3], "▒▒▒▒▒▒▒▒▒   0%")
         self.assertNotIn("90%", joined)
-        age = row[-1]
-        self.assertTrue(age.startswith("12초 전 (재로그인"), age)
+        self.assertEqual(row[-1], "재로그인 필요 · 12초 전 · 캐시")
 
     def test_unavailable_shows_refresh_reason(self):
         doc = self.doc_with(source="unavailable", error="token_expired;cache_missing", five_hour=None,
                             seven_day=None, refresh={"state": "failed", "reason": "write_failed", "at": None,
                                                      "last_refreshed_at": None})
-        five = self.row(self.lines(doc, width=260), "alice")[3]
-        self.assertTrue(five.startswith("-  (키체인 저장 실패·토큰"), five)
+        row = self.row(self.lines(doc, width=260), "alice")
+        self.assertTrue(row[3].startswith("-  (키체인 저장 실패·토큰"), row)
+        self.assertEqual(row[-1], "키체인 저장 실패")
 
     def test_cache_age_cell_leads_with_refresh_reason(self):
         doc = self.doc_with(source="cache", error="token_expired", five_hour=win(90.0, timedelta(minutes=-1)),
                             refresh={"state": "failed", "reason": "write_failed", "at": None,
                                      "last_refreshed_at": None})
         row = self.row(self.lines(doc), "alice")
-        self.assertTrue(row[-1].startswith("12초 전 (키체인 저"), row)
+        self.assertEqual(row[-1], "키체인 저장 실패 · 12초 전 · 캐시")
 
     def test_live_account_hides_live_session(self):
         doc = self.doc_with(refresh={"state": "skipped", "reason": "live_session", "at": None,
@@ -2572,7 +2954,10 @@ class TestReadme(unittest.TestCase):
         self.assertIn("%g" % cli.WATCH_INTERVAL_S, cadence)
 
     def test_dashboard_documented(self):
-        for needle in ("Claude 계정 사용량", "--ascii", "NO_COLOR", "q 또는 Ctrl-C 종료", "(캐시)", "토큰 만료", "↻",
+        self.assertNotIn("↻", self.text)
+        self.assertNotIn("(캐시)", self.text)
+        for needle in ("Claude 계정 사용량", "--ascii", "NO_COLOR", "q 또는 Ctrl-C 종료", "· 캐시", "토큰 만료", "시간 21분 뒤",
+                       "1분 안", "갱신 필요", "갱신 대기", "세션이 갱신", "재로그인 필요", cli.REFRESH_FOOTER,
                        "`label`", "alternate screen", "플랜", "`plan`", "Max5x", "` #`"):
             self.assertIn(needle, self.text)
         block = self.text[self.text.index("```text\nClaude 계정 사용량"):]

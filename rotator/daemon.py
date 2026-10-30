@@ -33,6 +33,7 @@ STATE_FILENAME = "state.json"
 LOCK_FILENAME = "daemon.lock"
 SESSIONS_DIRNAME = "sessions"
 LOCKS_DIRNAME = "locks"
+USAGE_DIRNAME = "usage"
 SNAPSHOT_SCHEMA = 1
 RECORD_SCHEMA = 1
 LOG_FILENAME = "rotator.log"
@@ -556,23 +557,136 @@ def rate_limited(u: AccountUsage) -> bool:
     return isinstance(e, str) and (e == RATE_LIMITED_TOKEN or e.startswith(RATE_LIMITED_TOKEN + ";"))
 
 
+def _live_kind(u: AccountUsage) -> Optional[str]:
+    """The live fetch's failure token of a cache or unavailable result (``http_429;cache_missing`` -> ``http_429``)."""
+    return u.error.split(";", 1)[0] if isinstance(u.error, str) and u.error else None
+
+
+def shown_usage(latest: AccountUsage, last_good: Optional[AccountUsage]) -> Tuple[AccountUsage, bool]:
+    """What to show and decide on, and whether it is the last good live reading.
+
+    A failed fetch keeps the last successful live reading (as a ``cache`` usage carrying the failure token, so
+    the policy's age check still applies) unless Claude Code's cache holds newer numbers."""
+    if latest.source == "live" or last_good is None:
+        return latest, False
+    if latest.source == "cache" and latest.fetched_at > last_good.fetched_at:
+        return latest, False
+    return AccountUsage(account_id=last_good.account_id, source="cache", fetched_at=last_good.fetched_at,
+                        five_hour=last_good.five_hour, seven_day=last_good.seven_day,
+                        error=_live_kind(latest) or "request_error", fable=last_good.fable), True
+
+
+@dataclass(frozen=True)
+class SharedUsage:
+    latest: AccountUsage  # the last fetch's own result
+    last_good: Optional[AccountUsage]  # the last live result
+    next_at: datetime  # no process fetches the account before this
+    interval_s: float  # the interval next_at came from (the 429 back-off doubles it)
+
+
+class UsageStore:
+    """Usage shared by every rotator process (daemon, status, status --watch): one file per account under
+    ``<state_dir>/usage``, written only by the holder of that account's lock, so one fetch per account and
+    interval happens across all of them. A file holds numbers, times and error tokens only."""
+
+    def __init__(self, state_dir: str, deps: Deps) -> None:
+        self._dir = os.path.join(state_dir, USAGE_DIRNAME)
+        self._locks = os.path.join(state_dir, LOCKS_DIRNAME)
+        self._deps = deps
+
+    def path(self, account_id: str) -> str:
+        return os.path.join(self._dir, "u-%s.json" % key_of(account_id))
+
+    def lock(self, account_id: str, log: logging.Logger = _cache_log) -> Optional[Any]:
+        """The account's fetch lock, or None when another process holds it (never waits). A lock that cannot
+        be taken at all (an OS error) does not stop the fetch: the worst case is one duplicate request."""
+        try:
+            return self._deps.lock(os.path.join(self._locks, "u-%s.lock" % key_of(account_id)))
+        except Exception as e:
+            log.error("event=usage_store_error what=lock account=%s exc=%s", account_id, type(e).__name__)
+            return _NO_LOCK
+
+    def load(self, account_id: str, now: datetime) -> Optional[SharedUsage]:
+        """The stored entry; None when missing, unreadable, malformed or for another account."""
+        try:
+            d = json.loads(self._deps.read_text(self.path(account_id)))
+            latest = usage_from_summary(d["latest"])
+            good = usage_from_summary(d["last_good"]) if d.get("last_good") is not None else None
+            next_at = _parse_iso(d["next_fetch_at"])
+            interval = d["interval_s"]
+        except Exception:
+            return None
+        if (d.get("account_id") != account_id or latest is None or latest.account_id != account_id
+                or (good is not None and (good.source != "live" or good.account_id != account_id))
+                or next_at is None or isinstance(interval, bool) or not isinstance(interval, (int, float))
+                or not 0 <= interval <= RETRY_AFTER_MAX_S):
+            return None
+        # A next_at beyond any interval this program sets (clock change, edited file) never blocks fetching.
+        if (next_at - now).total_seconds() > RETRY_AFTER_MAX_S:
+            next_at = now
+        return SharedUsage(latest, good, next_at, float(interval))
+
+    def save(self, account_id: str, entry: SharedUsage, log: logging.Logger = _cache_log) -> None:
+        doc = {"account_id": account_id, "latest": usage_summary(entry.latest),
+               "last_good": usage_summary(entry.last_good) if entry.last_good is not None else None,
+               "next_fetch_at": _iso(entry.next_at), "interval_s": entry.interval_s}
+        try:
+            self._deps.write_text(self.path(account_id), _dump(doc))
+        except Exception as e:
+            log.error("event=usage_store_error what=write account=%s exc=%s", account_id, type(e).__name__)
+
+
+class _NoLock:
+    def release(self) -> None:
+        pass
+
+
+_NO_LOCK = _NoLock()
+
+
+class _Entry:
+    __slots__ = ("stamp", "interval", "latest", "last_good", "force")
+
+    def __init__(self, stamp: float, interval: float, latest: AccountUsage, last_good: Optional[AccountUsage],
+                 force: bool = False) -> None:
+        self.stamp, self.interval, self.latest, self.last_good, self.force = stamp, interval, latest, last_good, force
+
+
 class UsageCache:
     """Per-account usage refreshed at most once per interval (D4); shared by the daemon tick and
-    status --watch. Thread-safe; never calls fetch while holding its lock."""
+    status --watch. Thread-safe; never calls fetch while holding its lock. With a UsageStore, a reading
+    another process stored within its interval is used instead of fetching."""
 
-    def __init__(self, poll_s: float) -> None:
+    def __init__(self, poll_s: float, store: Optional[UsageStore] = None) -> None:
         self._poll_s = poll_s
+        self._store = store
         self._lock = threading.Lock()
-        self._entries: Dict[str, Tuple[float, float, AccountUsage]] = {}
+        self._entries: Dict[str, _Entry] = {}
         self._refresh: Dict[str, dict] = {}
         self._flush_next: bool = True
+
+    def _interval_after(self, u: AccountUsage, prev: Optional[float], log: logging.Logger) -> float:
+        if not rate_limited(u):
+            return self._poll_s
+        if u.retry_after_s is not None:
+            interval = max(self._poll_s, min(RETRY_AFTER_MAX_S, u.retry_after_s))
+        else:
+            interval = max(self._poll_s, min(2 * (prev if prev is not None else self._poll_s), USAGE_BACKOFF_MAX_S))
+        log.warning("event=usage_rate_limited account=%s next_s=%d", u.account_id, int(interval))
+        return interval
+
+    def _adopt(self, aid: str, shared: SharedUsage, stamp: float, now: datetime) -> None:
+        left = max(0.0, (shared.next_at - now).total_seconds())
+        with self._lock:
+            self._entries[aid] = _Entry(stamp, left, shared.latest, shared.last_good)
 
     def refresh(self, profiles: Sequence[Profile], *, fetch: Callable[[Profile], AccountUsage],
                 monotonic: Callable[[], float], now: datetime, log: logging.Logger,
                 pre: Optional[Callable[[Profile, Sequence[Profile]], dict]] = None) -> List[str]:
         """Fetch every account whose interval elapsed; returns the account ids fetched, in order.
 
-        ``pre(profile, profiles)`` (the token-refresh gate) runs right before each fetch and its record is kept."""
+        ``pre(profile, profiles)`` (the token-refresh gate) runs for each account whose interval elapsed, right
+        before it is fetched or a stored reading is taken, and its record is kept."""
         mono = monotonic()
         ids = {p.account_id for p in profiles}
         with self._lock:
@@ -582,9 +696,10 @@ class UsageCache:
                 del self._refresh[aid]
         fetched: List[str] = []
         for p in profiles:
+            aid = p.account_id
             with self._lock:
-                entry = self._entries.get(p.account_id)
-            if entry is not None and mono - entry[0] < entry[1]:
+                entry = self._entries.get(aid)
+            if entry is not None and mono - entry.stamp < entry.interval:
                 continue
             if pre is not None:
                 kind = None
@@ -594,49 +709,90 @@ class UsageCache:
                 except Exception as e:
                     kind = type(e).__name__
                 if kind is not None:
-                    log.error("event=token_refresh_error account=%s exc=%s", p.account_id, kind)
+                    log.error("event=token_refresh_error account=%s exc=%s", aid, kind)
                     rec = {"state": "failed", "reason": "internal_error", "at": _iso(now), "last_refreshed_at": None}
                 with self._lock:
-                    self._refresh[p.account_id] = rec
-            stamp = monotonic()
+                    self._refresh[aid] = rec
+            held = None
+            shared = None
+            if self._store is not None:
+                shared = self._store.load(aid, now)
+                force = entry is not None and entry.force
+                if shared is not None and shared.next_at > now and not (force and not rate_limited(shared.latest)):
+                    self._adopt(aid, shared, monotonic(), now)
+                    continue
+                held = self._store.lock(aid, log)
+                if held is None:  # another process is fetching it: show what it stored last, look again next call
+                    if shared is not None:
+                        with self._lock:
+                            self._entries[aid] = _Entry(monotonic(), 0.0, shared.latest, shared.last_good)
+                    continue
             try:
-                u = fetch(p)
-            except Exception as e:
-                log.error("event=fetch_error account=%s exc=%s", p.account_id, type(e).__name__)
-                u = AccountUsage(account_id=p.account_id, source="unavailable", fetched_at=now,
-                                 error="request_error;cache_missing")
-            if rate_limited(u):
-                if u.retry_after_s is not None:
-                    interval = max(self._poll_s, min(RETRY_AFTER_MAX_S, u.retry_after_s))
-                else:
-                    prev = entry[1] if entry is not None else self._poll_s
-                    interval = max(self._poll_s, min(2 * prev, USAGE_BACKOFF_MAX_S))
-                log.warning("event=usage_rate_limited account=%s next_s=%d", p.account_id, int(interval))
-            else:
-                interval = self._poll_s
-            with self._lock:
-                self._entries[p.account_id] = (stamp, interval, u)
-            fetched.append(p.account_id)
+                if self._store is not None:
+                    shared = self._store.load(aid, now)  # it may have been stored while we took the lock
+                    force = entry is not None and entry.force
+                    if shared is not None and shared.next_at > now and not (force and not rate_limited(shared.latest)):
+                        self._adopt(aid, shared, monotonic(), now)
+                        continue
+                stamp = monotonic()
+                try:
+                    u = fetch(p)
+                except Exception as e:
+                    log.error("event=fetch_error account=%s exc=%s", aid, type(e).__name__)
+                    u = AccountUsage(account_id=aid, source="unavailable", fetched_at=now,
+                                     error="request_error;cache_missing")
+                prev = shared.interval_s if shared is not None else entry.interval if entry is not None else None
+                interval = self._interval_after(u, prev, log)
+                good = u if u.source == "live" else (shared.last_good if shared is not None else None)
+                if entry is not None and entry.last_good is not None and u.source != "live" and (
+                        good is None or entry.last_good.fetched_at > good.fetched_at):
+                    good = entry.last_good
+                with self._lock:
+                    self._entries[aid] = _Entry(stamp, interval, u, good)
+                if self._store is not None:
+                    self._store.save(aid, SharedUsage(u, good, now + timedelta(seconds=interval), interval), log)
+                fetched.append(aid)
+            finally:
+                if held is not None:
+                    held.release()
         return fetched
 
     def seed(self, u: AccountUsage, stamp: float) -> None:
         with self._lock:
-            self._entries[u.account_id] = (stamp, self._poll_s, u)
+            self._entries[u.account_id] = _Entry(stamp, self._poll_s, u, u if u.source == "live" else None)
 
     def usages(self) -> Dict[str, AccountUsage]:
         with self._lock:
-            return {aid: u for aid, (_, _, u) in self._entries.items()}
+            return {aid: shown_usage(e.latest, e.last_good)[0] for aid, e in self._entries.items()}
 
     def interval(self, account_id: str) -> Optional[float]:
         with self._lock:
             entry = self._entries.get(account_id)
-            return entry[1] if entry is not None else None
+            return entry.interval if entry is not None else None
+
+    def summary(self, account_id: str) -> Optional[dict]:
+        """usage_summary of what is shown; a last good live reading keeps ``source`` "live" and carries the
+        failed fetch's token in ``error``."""
+        with self._lock:
+            e = self._entries.get(account_id)
+        if e is None:
+            return None
+        u, kept = shown_usage(e.latest, e.last_good)
+        d = usage_summary(u)
+        if kept:
+            d["source"] = "live"
+        return d
 
     def summaries(self) -> List[dict]:
         with self._lock:
-            return [dict(usage_summary(u),
-                         refresh=(dict(self._refresh[aid]) if isinstance(self._refresh.get(aid), dict) else None))
-                    for aid, (_, _, u) in sorted(self._entries.items())]
+            ids = sorted(self._entries)
+            recs = {aid: self._refresh.get(aid) for aid in ids}
+        out = []
+        for aid in ids:
+            d = self.summary(aid)
+            if d is not None:
+                out.append(dict(d, refresh=(dict(recs[aid]) if isinstance(recs[aid], dict) else None)))
+        return out
 
     def refresh_record(self, account_id: str) -> Optional[dict]:
         with self._lock:
@@ -647,8 +803,8 @@ class UsageCache:
         """Make the next refresh() fetch this account now (not when it is rate-limited)."""
         with self._lock:
             entry = self._entries.get(account_id)
-            if entry is not None and not rate_limited(entry[2]):
-                self._entries[account_id] = (entry[0], 0.0, entry[2])
+            if entry is not None and not rate_limited(entry.latest):
+                entry.interval, entry.force = 0.0, True
 
     def refresh_one(self, profiles: Sequence[Profile], *, call: Callable[[Profile, Sequence[Profile]], dict],
                     held: Callable[..., List[str]], skip: FrozenSet[str] = frozenset()) -> Optional[str]:
@@ -701,7 +857,7 @@ class Daemon:
         self._log = logger
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._usage = UsageCache(cfg.usage_poll_s)
+        self._usage = UsageCache(cfg.usage_poll_s, UsageStore(cfg.state_dir, deps))
         self._inflight: Dict[str, InFlight] = {}
         self._inflight_handles: Dict[str, str] = {}
         self._records: Dict[Identity, dict] = {}

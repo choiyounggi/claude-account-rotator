@@ -243,6 +243,25 @@ class IdentityTest(unittest.TestCase):
             self.assertIsNone(p.display_name)
             self.assertEqual(p.organization_name, "Example Org")
 
+    def test_organization_name_cleaned(self):
+        cases = [("  Example Org TEAM 1  ", "Example Org TEAM 1"), ("예시 조직 TEAM 2", "예시 조직 TEAM 2"),
+                 ("x" * 64, "x" * 64), ("x" * 65, "x" * 64), ("Bad\x1b[31m Org", None), ("Tab\tOrg", None),
+                 ("Zero\u200bWidth", None), ("   ", None), ("", None), (7, None), (None, None), (["Org"], None)]
+        for raw, want in cases:
+            with self.subTest(raw=raw):
+                with tempfile.TemporaryDirectory() as root:
+                    make_profile(root, ACC1, claude_json=json.dumps({"oauthAccount": {"organizationName": raw}}))
+                    self.assertEqual(discover_profiles(root)[0].organization_name, want)
+
+    def test_organization_name_cleaning_leaves_other_fields(self):
+        with tempfile.TemporaryDirectory() as root:
+            ident = dict(IDENTITY, displayName="  Spaced  ", organizationName="Bad\x07Org")
+            make_profile(root, ACC1, claude_json=json.dumps({"oauthAccount": ident}))
+            p = discover_profiles(root)[0]
+            self.assertEqual(p.display_name, "  Spaced  ")  # unchanged: only the organization name is cleaned
+            self.assertIsNone(p.organization_name)
+            self.assertEqual(p.email, "user@example.com")
+
     def test_default_read_text_utf8(self):
         with tempfile.TemporaryDirectory() as root:
             make_profile(root, ACC1, claude_json=json.dumps({"oauthAccount": {"displayName": "Zoë"}}, ensure_ascii=False))
