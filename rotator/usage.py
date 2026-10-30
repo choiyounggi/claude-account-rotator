@@ -27,6 +27,7 @@ log = logging.getLogger("rotator.usage")
 USAGE_TIMEOUT_S: float = 10.0
 _MAX_BODY_BYTES = 1_048_576
 RETRY_AFTER_MAX_LEN = 64
+NETWORK_JSON_MAX_DEPTH = 32
 _DELAY_SECONDS_RE = re.compile(r"[0-9]{1,10}")
 
 # Python 3.9 fromisoformat rejects "Z", "+0000" and fractions that are not
@@ -240,6 +241,42 @@ def _urllib_http(url: str, headers: Mapping[str, str], timeout: float) -> Tuple[
     return r.status, r.body
 
 
+def loads_network_json(text: object) -> object:
+    """``json.loads`` of a network response body, refusing hostile shapes first.
+
+    Raises ValueError, like malformed JSON, for a non-str, a text longer than
+    ``_MAX_BODY_BYTES`` or bracket nesting deeper than ``NETWORK_JSON_MAX_DEPTH``;
+    the message never contains the body.
+    """
+    # CPython 3.9's C scanner can abort the whole process ("Cannot recover from
+    # stack overflow") on deep nesting instead of raising RecursionError, so
+    # catching RecursionError around json.loads is not enough.
+    if not isinstance(text, str) or len(text) > _MAX_BODY_BYTES:
+        raise ValueError("network JSON body rejected")
+    if text.count("[") + text.count("{") > NETWORK_JSON_MAX_DEPTH:
+        depth = 0
+        in_str = escaped = False
+        for ch in text:
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "[" or ch == "{":
+                depth += 1
+                if depth > NETWORK_JSON_MAX_DEPTH:
+                    raise ValueError("network JSON nesting too deep")
+            elif ch == "]" or ch == "}":
+                depth -= 1
+                if depth < 0:
+                    raise ValueError("network JSON body rejected")
+    return json.loads(text)
+
+
 def _status_kind(code: object) -> str:
     return "http_%d" % code if type(code) is int and 100 <= code <= 999 else "network"
 
@@ -318,7 +355,7 @@ def fetch_usage(
             else:
                 obj = None
                 try:
-                    obj = json.loads(body)
+                    obj = loads_network_json(body)
                 except (ValueError, RecursionError):
                     live_kind = "bad_json"
                 if live_kind is None:

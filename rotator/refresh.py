@@ -141,7 +141,7 @@ def _finite_pos(v: object) -> bool:
 def parse_token_response(body: str, now_ms: int, posted_refresh_token: str) -> Optional[_Tokens]:
     """Strictly validated token set from a 200 body, or None."""
     try:
-        obj = json.loads(body)
+        obj = usage.loads_network_json(body)
     except (ValueError, RecursionError):
         return None
     if not isinstance(obj, dict):
@@ -310,7 +310,7 @@ def _same_json(a: str, b: str) -> bool:
 def _oauth_error(body: Any) -> Optional[str]:
     """The OAuth ``error`` code of a response body; the body and its description are never logged."""
     try:
-        obj = json.loads(body)
+        obj = usage.loads_network_json(body)
     except (ValueError, RecursionError, TypeError):
         return None
     err = obj.get("error") if isinstance(obj, dict) else None

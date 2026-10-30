@@ -746,5 +746,118 @@ class FetchRetryAfterTest(unittest.TestCase):
         self.assertFalse(any("SECRET-RETRY-123" in r.getMessage() for r in cap.records))
 
 
+def nest(depth, inner="0"):
+    return "[" * depth + inner + "]" * depth
+
+
+def depth_of(obj):
+    d = 0
+    while isinstance(obj, (list, dict)):
+        d += 1
+        obj = obj[0] if isinstance(obj, list) else next(iter(obj.values()))
+    return d
+
+
+class NetworkJsonBoundTest(unittest.TestCase):
+    """Network bodies are rejected before json.loads when nested or sized beyond the bound."""
+
+    def spy(self):
+        p = unittest.mock.patch.object(rotator.usage.json, "loads", wraps=json.loads)
+        s = p.start()
+        self.addCleanup(p.stop)
+        return s
+
+    def assertRejected(self, text):
+        s = self.spy()
+        with self.assertRaises(ValueError):
+            rotator.usage.loads_network_json(text)
+        self.assertEqual(s.call_count, 0)
+
+    def test_depth_bound_value(self):
+        self.assertEqual(rotator.usage.NETWORK_JSON_MAX_DEPTH, 32)
+
+    def test_list_at_bound_parses(self):
+        s = self.spy()
+        obj = rotator.usage.loads_network_json(nest(32))
+        self.assertEqual(depth_of(obj), 32)
+        self.assertEqual(s.call_count, 1)
+
+    def test_list_over_bound_rejected(self):
+        self.assertRejected(nest(33))
+
+    def test_object_nesting_counts(self):
+        self.assertEqual(depth_of(rotator.usage.loads_network_json('{"a":' * 32 + "1" + "}" * 32)), 32)
+        self.assertRejected('{"a":' * 33 + "1" + "}" * 33)
+
+    def test_mixed_nesting_counts(self):
+        text = '[{"k":' * 16 + "0" + "}]" * 16
+        self.assertEqual(depth_of(rotator.usage.loads_network_json(text)), 32)
+        self.assertRejected("[" + text + "]")
+
+    def test_depth_not_total_bracket_count(self):
+        text = "[" + ",".join([nest(31)] * 5) + "]"
+        obj = rotator.usage.loads_network_json(text)
+        self.assertEqual(len(obj), 5)
+        self.assertEqual(depth_of(obj), 32)
+
+    def test_brackets_inside_string_not_counted(self):
+        value = "[" * 1000 + "{" * 1000
+        self.assertEqual(rotator.usage.loads_network_json(json.dumps([value])), [value])
+
+    def test_escaped_quote_keeps_string_open(self):
+        value = '"' + "[" * 100
+        text = json.dumps([value])
+        self.assertIn('\\"', text)
+        self.assertEqual(rotator.usage.loads_network_json(text), [value])
+
+    def test_escaped_backslash_closes_string(self):
+        # The string is a single backslash; every bracket after it is structural.
+        self.assertEqual(rotator.usage.loads_network_json('["\\\\",' + nest(31) + "]")[0], "\\")
+        over = '["\\\\",' + nest(32) + "]"
+        self.assertEqual(depth_of(json.loads(over)[1]), 32)  # well-formed: only the bound rejects it
+        self.assertRejected(over)
+
+    def test_length_cap(self):
+        cap = rotator.usage._MAX_BODY_BYTES
+        self.assertEqual(rotator.usage.loads_network_json(" " * (cap - 1) + "1"), 1)
+        self.assertRejected(" " * cap + "1")
+
+    def test_hundred_thousand_brackets_never_reach_loads(self):
+        self.assertRejected("[" * 100000)
+        self.assertRejected(nest(100000))
+
+    def test_non_str_rejected_as_malformed(self):
+        for value in (b"{}", None, 7):
+            with self.subTest(value=value):
+                self.assertRejected(value)
+
+    def test_empty_and_malformed_still_value_error(self):
+        for text in ("", "{", "]]]]"):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    rotator.usage.loads_network_json(text)
+
+    def test_rejection_does_not_embed_body(self):
+        with self.assertRaises(ValueError) as cm:
+            rotator.usage.loads_network_json('["SECRET-BODY-9",' + nest(40) + "]")
+        self.assertNotIn("SECRET-BODY-9", str(cm.exception))
+
+    def test_fetch_usage_deep_body_never_reaches_loads(self):
+        body = "[" * 100000
+        s = self.spy()
+        result = run(http=FakeHttp(200, body))
+        self.assertEqual(result.error, "bad_json;cache_missing")
+        self.assertNotIn(body, [c.args[0] for c in s.call_args_list if c.args])
+
+    def test_fetch_usage_balanced_over_bound_is_bad_json(self):
+        body = '{"five_hour":' + nest(32, "null") + "}"
+        self.assertEqual(run(http=FakeHttp(200, body)).error, "bad_json;cache_missing")
+
+    def test_fetch_usage_body_at_bound_is_parsed(self):
+        # Parsed (not bad_json); the shape is wrong, so bad_shape proves it reached the parser.
+        body = '{"five_hour":' + nest(31, "null") + "}"
+        self.assertEqual(run(http=FakeHttp(200, body)).error, "bad_shape;cache_missing")
+
+
 if __name__ == "__main__":
     unittest.main()

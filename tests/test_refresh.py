@@ -209,6 +209,43 @@ class TestParse(TripwireCase):
         with self.assertRaises(TypeError):
             pickle.dumps(t)
 
+    def test_deep_body_never_reaches_json_loads(self):
+        with mock.patch.object(refresh.json, "loads", wraps=json.loads) as spy:
+            self.assertIsNone(refresh.parse_token_response("[" * 100000, T, "R1"))
+            self.assertIsNone(refresh.parse_token_response(
+                '{"access_token":"A2","expires_in":60,"x":' + "[" * 32 + "]" * 32 + "}", T, "R1"))
+        self.assertEqual(spy.call_count, 0)
+
+    def test_body_at_depth_bound_is_parsed(self):
+        t = refresh.parse_token_response(
+            '{"access_token":"A2","expires_in":60,"x":' + "[" * 31 + "]" * 31 + "}", T, "R1")
+        self.assertEqual((t.access_token, t.refresh_token), ("A2", "R1"))
+
+    def test_brackets_inside_string_do_not_count(self):
+        t = refresh.parse_token_response(
+            '{"access_token":"A2","expires_in":60,"x":"' + "[" * 1000 + '"}', T, "R1")
+        self.assertEqual(t.access_token, "A2")
+
+
+class TestOAuthError(TripwireCase):
+    def test_error_code(self):
+        self.assertEqual(refresh._oauth_error('{"error":"invalid_grant"}'), "invalid_grant")
+
+    def test_over_bound_body_never_reaches_json_loads(self):
+        with mock.patch.object(refresh.json, "loads", wraps=json.loads) as spy:
+            self.assertIsNone(refresh._oauth_error("[" * 100000))
+            self.assertIsNone(refresh._oauth_error('{"error":"invalid_grant","x":' + "[" * 32 + "]" * 32 + "}"))
+        self.assertEqual(spy.call_count, 0)
+
+    def test_body_at_depth_bound_is_parsed(self):
+        self.assertEqual(
+            refresh._oauth_error('{"error":"invalid_grant","x":' + "[" * 31 + "]" * 31 + "}"), "invalid_grant")
+
+    def test_non_str_and_malformed(self):
+        for body in (None, b'{"error":"invalid_grant"}', "", "{", '["invalid_grant"]', '{"error":7}'):
+            with self.subTest(body=body):
+                self.assertIsNone(refresh._oauth_error(body))
+
 
 STORED = ('{"claudeAiOauth":{"accessToken":"A1","refreshToken":"R1","expiresAt":1,"scopes":["user:inference"],'
           '"subscriptionType":"max","rateLimitTier":"default_x","x-new":7},"mcpOAuth":{"s":{"k":1}}}')
