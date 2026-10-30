@@ -28,6 +28,8 @@ log.addHandler(logging.NullHandler())
 # The exchange below mirrors this Claude Code release; re-verify after it updates.
 CLAUDE_CODE_VERSION = "2.1.296"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+# The edge (Cloudflare error 1010) answers 403 to urllib's default Python-urllib/x.y agent.
+USER_AGENT = "claude-account-rotator/0.1"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 BASE_SCOPES = ("user:profile", "user:inference", "user:sessions:claude_code", "user:mcp_servers",
                "user:file_upload", "user:plugins")
@@ -43,6 +45,7 @@ FLUSH_BACKOFF_START_S = 30.0
 FLUSH_BACKOFF_MAX_S = 600.0
 CC_LOCK_STALE_S = 60.0
 ERROR_BODY_MAX = 65_536
+_LOGGABLE_OAUTH_ERROR = re.compile(r"[a-z0-9_]{1,64}")
 REFRESH_STATES = ("not_needed", "skipped", "refreshed", "failed", "stopped")
 REFRESH_REASONS = frozenset({
     "fresh", "ok", "write_recovered", "disabled", "dry_run", "daemon_off", "no_credential", "no_refresh_token",
@@ -317,6 +320,15 @@ def _oauth_error(body: Any) -> Optional[str]:
     return err if isinstance(err, str) else None
 
 
+def _http_detail(status: int, err: Optional[str]) -> str:
+    """``status=<n> error=<code>`` for a log line; an error code outside a short lowercase charset shows as ``?``."""
+    if err is None:
+        shown = "-"
+    else:
+        shown = err if _LOGGABLE_OAUTH_ERROR.fullmatch(err) else "?"
+    return "status=%d error=%s" % (status, shown)
+
+
 class _State:
     """Per-account in-memory refresh state (never persisted)."""
 
@@ -394,12 +406,13 @@ class Refresher:
     def _now_ms(self) -> int:
         return int(self._now().timestamp() * 1000)
 
-    def _record(self, aid: str, st: _State, state: str, reason: str) -> dict:
+    def _record(self, aid: str, st: _State, state: str, reason: str, detail: str = "") -> dict:
         prev = st.record
         rec = {"state": state, "reason": reason, "at": _iso(self._now()), "last_refreshed_at": st.last_ok_at}
         st.record = rec
         if prev is None or (prev["state"], prev["reason"]) != (state, reason) or state in ("refreshed", "failed", "stopped"):
-            self._log.info("event=token_refresh account=%s state=%s reason=%s", aid, state, reason)
+            self._log.info("event=token_refresh account=%s state=%s reason=%s%s", aid, state, reason,
+                           " " + detail if detail else "")
         return dict(rec)
 
     def _previous(self, st: _State) -> dict:
@@ -568,6 +581,7 @@ class Refresher:
             return self._record(aid, st, "stopped", "outcome_unknown")
         status = res.status
         err = _oauth_error(res.body)
+        detail = _http_detail(status, err)
         if status == 200:
             tokens = None
             try:
@@ -587,15 +601,13 @@ class Refresher:
             return self._record(aid, st, "stopped", "invalid_scope")
         if status == 429:
             self._backoff(st, usage.parse_retry_after(res.retry_after, self._now()))
-            return self._record(aid, st, "failed", "rate_limited")
-        if 400 <= status <= 499:
-            st.stop_fp = _fp(rt)
-            return self._record(aid, st, "stopped", "rejected")
-        if 500 <= status <= 599:
+            return self._record(aid, st, "failed", "rate_limited", detail)
+        # A 403 without an OAuth error is an edge block, not a verdict on the token.
+        if 500 <= status <= 599 or (status == 403 and err is None):
             self._backoff(st)
-            return self._record(aid, st, "failed", "server_error")
+            return self._record(aid, st, "failed", "server_error", detail)
         st.stop_fp = _fp(rt)
-        return self._record(aid, st, "stopped", "rejected")
+        return self._record(aid, st, "stopped", "rejected", detail)
 
     def _post_once(self, oauth: Mapping[str, Any], rt: str, scopes: Sequence[str]
                    ) -> Tuple[Optional[PostResult], Optional[str]]:
@@ -605,8 +617,8 @@ class Refresher:
                            "scope": " ".join(scopes)}, separators=(",", ":")).encode("utf-8")
         res, kind = None, None
         try:
-            res = self._post(TOKEN_URL, {"Content-Type": "application/json", "Accept": "application/json"}, data,
-                             REFRESH_TIMEOUT_S)
+            res = self._post(TOKEN_URL, {"Content-Type": "application/json", "Accept": "application/json",
+                                         "User-Agent": USER_AGENT}, data, REFRESH_TIMEOUT_S)
         except Exception as e:
             # Only a failure before anything was sent is safe to retry later.
             pre_send = isinstance(e, urllib.error.URLError) and isinstance(

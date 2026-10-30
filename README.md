@@ -217,7 +217,7 @@ then the usage error, clipped to the cell width; `daemon_off` appears only in th
 | `malformed_response` | 응답 이상 | a 200 whose body is not a valid token set |
 | `outcome_unknown` | 갱신 결과 불명 | the request may have reached the server; not retried |
 | `network_error` | 연결 실패 | DNS or connection refused before sending; backed off |
-| `server_error` | 갱신 실패 | a 5xx; backed off |
+| `server_error` | 갱신 실패 | a 5xx, or a 403 without an OAuth error (an edge block); backed off |
 | `rate_limited` | 호출 제한 | a 429; backed off |
 | `write_failed` | 키체인 저장 실패 | the new tokens are held in memory, write retried |
 | `conflict` | 갱신 충돌 | the item holds another refresh token; the new set was dropped |
@@ -367,3 +367,7 @@ Numbers must be finite and not `true`/`false`.
     target) can have it replaced in memory by the older disk copy, so that tick may dispatch the session once
     more without the hold or the exclusion. Touched sessions are unaffected (the in-memory touched set and
     `run_switch`'s on-disk re-check still block them).
+21. The token endpoint sits behind Cloudflare, which answers 403 (error 1010) to urllib's default
+    `Python-urllib` agent; the refresh POST therefore sends `User-Agent: claude-account-rotator/0.1`. If the edge
+    blocks that agent too, refreshes end as `server_error` with `status=403 error=-` in `rotator.log` and are
+    retried after a back-off rather than stopped.

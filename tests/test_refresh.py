@@ -1202,7 +1202,9 @@ class TestRequest(SectionCase):
         post = self.w.posts[0]
         self.assertEqual(post["url"], refresh.TOKEN_URL)
         self.assertEqual(post["url"], "https://platform.claude.com/v1/oauth/token")
-        self.assertEqual(post["headers"], {"Content-Type": "application/json", "Accept": "application/json"})
+        self.assertEqual(refresh.USER_AGENT, "claude-account-rotator/0.1")
+        self.assertEqual(post["headers"], {"Content-Type": "application/json", "Accept": "application/json",
+                                           "User-Agent": "claude-account-rotator/0.1"})
         self.assertEqual(post["timeout"], 10.0)
         self.assertEqual(post["body"], {
             "grant_type": "refresh_token", "refresh_token": "R1", "client_id": refresh.CLIENT_ID,
@@ -1223,6 +1225,7 @@ class TestRequest(SectionCase):
         rec = self.go()
         self.assertEqual(len(self.w.posts), 2)
         self.assertEqual(self.w.posts[1]["body"]["scope"], "user:inference user:profile user:projects:read")
+        self.assertEqual([p["headers"].get("User-Agent") for p in self.w.posts], [refresh.USER_AGENT] * 2)
         self.assertEqual(self.sr(rec), ("refreshed", "ok"))
 
     def test_invalid_scope_twice_stops(self):
@@ -1248,6 +1251,26 @@ class TestRequest(SectionCase):
         self.assertEqual(self.sr(rec), ("stopped", "invalid_scope"))
 
 
+class TestWireUserAgent(SectionCase):
+    """The real urllib seam: without an explicit header urllib sends Python-urllib/x.y, which the edge blocks."""
+
+    def test_user_agent_reaches_the_wire_on_every_post(self):
+        seen = []
+
+        def open_(req, timeout=None):
+            seen.append(req.get_header("User-agent"))
+            body = json.dumps({"error": "invalid_scope"}).encode() if len(seen) == 1 else OK200.body.encode()
+            if len(seen) == 1:
+                raise urllib.error.HTTPError(req.full_url, 400, "x", email.message.Message(), io.BytesIO(body))
+            return _Resp(200, body)
+        self.put(item(scopes=["user:inference", "user:profile", "user:projects:read"]))
+        self.r._post = ORIG_URLLIB_POST
+        with mock.patch.object(usage._NO_REDIRECT_OPENER, "open", open_):
+            rec = self.go()
+        self.assertEqual(self.sr(rec), ("refreshed", "ok"))
+        self.assertEqual(seen, ["claude-account-rotator/0.1"] * 2)
+
+
 class TestFailures(SectionCase):
     def advance(self, s):
         self.w.mono_v += s
@@ -1271,14 +1294,81 @@ class TestFailures(SectionCase):
                 self.assertEqual(self.w.posts[1]["body"]["refresh_token"], "R5")
 
     def test_rejected_classes(self):
-        for res in (refresh.PostResult(403, ""), err(400, "invalid_client"), refresh.PostResult(302, ""),
-                    refresh.PostResult(101, "")):
+        for res in (err(403, "access_denied"), err(400, "invalid_client"), refresh.PostResult(302, ""),
+                    refresh.PostResult(101, ""), refresh.PostResult(404, "")):
             with self.subTest(status=res.status):
                 self.setUp()
                 self.w.responses = [res]
                 self.assertEqual(self.sr(self.go()), ("stopped", "rejected"))
                 self.assertEqual(self.go()["reason"], "rejected")
                 self.assertEqual(len(self.w.posts), 1)
+
+    def test_edge_block_403_backs_off_like_server_error(self):
+        cf = ("<!DOCTYPE html><title>Attention Required! | Cloudflare</title>"
+              "<h1>Error 1010</h1><span>Access denied</span>")
+        for body in (cf, "", '{"message": "forbidden"}', '{"error": 7}'):
+            with self.subTest(body=body[:20]):
+                self.setUp()
+                m = self.w.mono_v
+                self.w.responses = [refresh.PostResult(403, body)]
+                self.assertEqual(self.sr(self.go()), ("failed", "server_error"))
+                self.assertIsNone(self.st().stop_fp)
+                self.assertEqual(self.st().until, m + 300)
+                self.advance(299)
+                self.go()
+                self.assertEqual(len(self.w.posts), 1)
+                self.advance(1)
+                self.w.responses = [refresh.PostResult(403, body)]
+                self.assertEqual(self.sr(self.go()), ("failed", "server_error"))
+                self.assertEqual(len(self.w.posts), 2)
+                self.assertEqual(self.st().step_s, 600.0)
+                self.w.mono_v = self.st().until
+                self.w.responses = [OK200]
+                self.assertEqual(self.sr(self.go()), ("refreshed", "ok"))
+
+    def test_failure_log_carries_status_and_error_not_body(self):
+        cf = "<html>Cloudflare Error 1010 Access denied ray-id BODYMARK</html>"
+        cases = ((refresh.PostResult(403, cf), "failed", "server_error", "status=403 error=-"),
+                 (err(403, "access_denied"), "stopped", "rejected", "status=403 error=access_denied"),
+                 (refresh.PostResult(400, json.dumps({"error": "invalid_client", "error_description": "BODYMARK"})),
+                  "stopped", "rejected", "status=400 error=invalid_client"),
+                 (refresh.PostResult(503, "upstream BODYMARK"), "failed", "server_error", "status=503 error=-"),
+                 (refresh.PostResult(429, '{"error":"rate_limit_error","m":"BODYMARK"}', "60"), "failed",
+                  "rate_limited", "status=429 error=rate_limit_error"),
+                 (refresh.PostResult(302, "BODYMARK"), "stopped", "rejected", "status=302 error=-"))
+        for res, state, reason, detail in cases:
+            with self.subTest(status=res.status, reason=reason):
+                self.setUp()
+                self.w.responses = [res]
+                with self.assertLogs("rotator.refresh", "INFO") as cm:
+                    self.assertEqual(self.sr(self.go()), (state, reason))
+                line = "event=token_refresh account=%s state=%s reason=%s %s" % (ACC_A, state, reason, detail)
+                self.assertEqual([l for l in cm.output if "event=token_refresh " in l],
+                                 ["INFO:rotator.refresh:" + line])
+                self.assertNotIn("BODYMARK", "\n".join(cm.output))
+
+    def test_oauth_error_in_log_is_capped_and_charset_safe(self):
+        cases = (("a" * 64, "a" * 64), ("a" * 65, "?"), ("bad code", "?"), ("x\nevent=forged", "?"),
+                 ("caf\u00e9", "?"), ("", "?"), ("Invalid-Request", "?"), ("INVALID_GRANT", "?"), ("rate_limit_error_2", "rate_limit_error_2"))
+        for raw, shown in cases:
+            with self.subTest(raw=raw[:20]):
+                self.setUp()
+                self.w.responses = [err(400, raw)]
+                with self.assertLogs("rotator.refresh", "INFO") as cm:
+                    self.assertEqual(self.sr(self.go()), ("stopped", "rejected"))
+                lines = [l for l in cm.output if "event=token_refresh " in l]
+                self.assertEqual(len(lines), 1)
+                self.assertTrue(lines[0].endswith(" status=400 error=" + shown), lines[0])
+
+    def test_other_outcomes_log_no_status(self):
+        for res, reason in ((err(400, "invalid_grant"), "invalid_grant"), (err(400, "invalid_scope"), "invalid_scope")):
+            with self.subTest(reason=reason):
+                self.setUp()
+                self.w.responses = [res, res]
+                with self.assertLogs("rotator.refresh", "INFO") as cm:
+                    self.assertEqual(self.sr(self.go()), ("stopped", reason))
+                self.assertIn("INFO:rotator.refresh:event=token_refresh account=%s state=stopped reason=%s"
+                              % (ACC_A, reason), cm.output)
 
     def test_malformed_200(self):
         self.w.responses = [refresh.PostResult(200, "{}")]
@@ -1583,6 +1673,18 @@ class TestSecretChannels(TripwireCase):
 
     def test_server_error_echoing_body(self):
         self.check([refresh.PostResult(503, "upstream echoed " + SECRET_R)])
+
+    def test_edge_block_echoing_body(self):
+        text = self.check([refresh.PostResult(403, "<html>blocked " + SECRET_R + "</html>")])
+        self.assertIn("status=403", text)
+
+    def test_oauth_error_echoing_secret(self):
+        for raw in (SECRET_R, SECRET_R.lower(), "x" * 60 + SECRET_R):
+            with self.subTest(raw=raw[:20]):
+                self.setUp()
+                text = self.check([err(400, raw)])
+                self.assertIn("status=400 error=?", text)
+                self.assertNotIn(raw, text)
 
     def test_post_raising(self):
         self.check([OSError("boom " + SECRET_R)])
