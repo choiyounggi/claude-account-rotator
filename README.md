@@ -6,6 +6,30 @@ that session on a less-used account (`/exit`, then `claude --resume` with the ot
 switch at `soft_pct` once the session is idle, a hard switch at `hard_pct` even while it works. It also keeps
 Orca's global `selected-host` pointer on a usable account.
 
+## Features
+
+- **Live usage dashboard** — `rotator status --watch` shows every account's 5-hour, weekly and Fable usage as an
+  aligned terminal table (group, plan, bars, time until reset, token state) that redraws every second and widens
+  with the terminal.
+- **Automatic per-session rotation** — soft switch when idle, hard switch near the limit, then the session
+  continues on the new account with `--resume`.
+- **Fable-aware** — Fable sessions are judged by the highest of the 5-hour, weekly and Fable windows.
+- **Idle-account token refresh** — the daemon refreshes OAuth tokens of accounts with no live session, the same
+  way Claude Code does, and writes them back to the same Keychain item.
+- **Shared, rate-limit friendly polling** — one usage request per account per interval across all rotator
+  processes; the last good reading stays on screen through transient failures.
+- **Python standard library only**, run by a launchd user agent.
+
+## Quick start
+
+```sh
+git clone https://github.com/choiyounggi/claude-account-rotator.git
+cd claude-account-rotator
+bin/rotator status --watch     # dashboard only, changes nothing
+bin/rotator daemon --dry-run   # see what the daemon would do, sends nothing
+bin/rotator install            # run the daemon in the background (automatic switching on)
+```
+
 ## Requirements
 
 - macOS.
@@ -404,3 +428,7 @@ Numbers must be finite and not `true`/`false`.
     `Python-urllib` agent; the refresh POST therefore sends `User-Agent: claude-account-rotator/0.1`. If the edge
     blocks that agent too, refreshes end as `server_error` with `status=403 error=-` in `rotator.log` and are
     retried after a back-off rather than stopped.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
