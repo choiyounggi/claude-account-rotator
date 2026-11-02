@@ -523,25 +523,69 @@ class FakeRunner:
         return [argv[1] for argv, _ in self.calls]
 
 
-class TestLaunchd(unittest.TestCase):
-    all_calls: List[list] = []
+COPIED_AT = datetime(2026, 11, 2, 3, 4, 5, tzinfo=timezone.utc)
 
+
+def make_source(root, extra_py=("x.py",)):
+    """A fake checkout: the runnable app plus everything install must leave behind."""
+    files = {"bin/rotator": "#!/usr/bin/python3\nprint('entry')\n", "rotator/__init__.py": "",
+             "rotator/cli.py": "CLI = 1\n", "tests/test_x.py": "T = 1\n", ".git/HEAD": "ref: refs/heads/main\n",
+             ".orchestration/notes.md": "n\n", "rotator/__pycache__/cli.cpython-39.pyc": "pyc",
+             "rotator/notes.txt": "not code\n", "README.md": "r\n"}
+    for name in extra_py:
+        files["rotator/" + name] = "# %s\n" % name
+    for rel, text in files.items():
+        p = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
+    return root
+
+
+def tree(root):
+    out = set()
+    for d, dirs, names in os.walk(root):
+        for n in dirs + names:
+            out.add(os.path.relpath(os.path.join(d, n), root))
+    return out
+
+
+def read_file(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+class LaunchdBase(unittest.TestCase):
     def setUp(self):
         self.agents = scratch("agents-" + self._testMethodName)
         self.plist = os.path.join(self.agents, LABEL + ".plist")
         self.logs = os.path.join(BASE, "logs-" + self._testMethodName)
         shutil.rmtree(self.logs, ignore_errors=True)
+        self.source = make_source(scratch("src-" + self._testMethodName))
+        self.state = scratch("state-" + self._testMethodName)
+        self.app = os.path.join(self.state, "app")
+        self.commit = "abc1234"
 
-    def install(self, runner):
-        rc = launchd.install(runner=runner, uid=501, plist_path=self.plist, repo_root="/Users/user/repo",
-                             config_path="/Users/user/cfg/config.json", log_dir=self.logs, timeouts=Timeouts())
+    def install(self, runner, **kw):
+        args = dict(runner=runner, uid=501, plist_path=self.plist, source_root=self.source, state_dir=self.state,
+                    config_path="/Users/user/cfg/config.json", log_dir=self.logs, timeouts=Timeouts(),
+                    commit_of=lambda root: self.commit, now=lambda: COPIED_AT)
+        args.update(kw)
+        rc = launchd.install(**args)
         TestLaunchd.all_calls.extend(argv for argv, _ in runner.calls)
         return rc
 
     def uninstall(self, runner):
-        rc = launchd.uninstall(runner=runner, uid=501, plist_path=self.plist)
+        rc = launchd.uninstall(runner=runner, uid=501, plist_path=self.plist, state_dir=self.state)
         TestLaunchd.all_calls.extend(argv for argv, _ in runner.calls)
         return rc
+
+    def leftovers(self):
+        return sorted(n for n in os.listdir(self.state) if n != "app")
+
+
+class TestLaunchd(LaunchdBase):
+    all_calls: List[list] = []
 
     def test_install_not_loaded(self):
         r = FakeRunner({"print": (113, "", "Could not find service")})
@@ -557,7 +601,8 @@ class TestLaunchd(unittest.TestCase):
         self.assertEqual(pl["ExitTimeOut"], 440)
         self.assertGreaterEqual(pl["ExitTimeOut"], 380)
         self.assertEqual(pl["ProgramArguments"][0], "/usr/bin/python3")
-        self.assertEqual(pl["ProgramArguments"][1], "/Users/user/repo/bin/rotator")
+        self.assertEqual(pl["ProgramArguments"][1], os.path.join(self.app, "bin", "rotator"))
+        self.assertEqual(pl["WorkingDirectory"], self.app)
         self.assertEqual(pl["ProgramArguments"][-3:], ["--config", "/Users/user/cfg/config.json", "daemon"])
         self.assertIs(pl["RunAtLoad"], True)
         self.assertIs(pl["KeepAlive"], True)
@@ -640,6 +685,397 @@ class TestLaunchd(unittest.TestCase):
     def test_repo_root(self):
         self.assertEqual(launchd.repo_root(), REPO)
         self.assertTrue(launchd.plist_path_default().endswith("/Library/LaunchAgents/" + LABEL + ".plist"))
+
+
+NOT_LOADED = {"print": (113, "", "")}
+APP_TREE = {"VERSION", "bin", "bin/rotator", "rotator", "rotator/__init__.py", "rotator/cli.py", "rotator/x.py"}
+
+
+def failing_copy(fail_at):
+    """shutil.copyfile that raises on its ``fail_at``-th call (1-based)."""
+    calls = []
+
+    def copy(src, dst):
+        calls.append(src)
+        if len(calls) == fail_at:
+            raise OSError(28, "No space left on device")
+        return shutil.copyfile(src, dst)
+    return copy
+
+
+class TestAppCopy(LaunchdBase):
+    def mode(self, *rel):
+        return stat.S_IMODE(os.lstat(os.path.join(self.app, *rel)).st_mode)
+
+    def test_copies_only_the_runnable_app(self):
+        rc, msg = self.install(FakeRunner(NOT_LOADED))
+        self.assertEqual(rc, 0, msg)
+        self.assertEqual(tree(self.app), APP_TREE)
+        for rel in ("bin/rotator", "rotator/__init__.py", "rotator/cli.py", "rotator/x.py"):
+            self.assertEqual(read_file(os.path.join(self.app, rel)), read_file(os.path.join(self.source, rel)))
+        self.assertEqual(self.leftovers(), [])
+        self.assertIn(self.app, msg)
+        self.assertIn(self.commit, msg)
+
+    def test_modes(self):
+        self.assertEqual(self.install(FakeRunner(NOT_LOADED))[0], 0)
+        self.assertEqual(self.mode(), 0o700)
+        self.assertEqual(self.mode("bin"), 0o700)
+        self.assertEqual(self.mode("rotator"), 0o700)
+        self.assertEqual(self.mode("bin", "rotator"), 0o700)
+        for rel in ("__init__.py", "cli.py", "x.py"):
+            self.assertEqual(self.mode("rotator", rel), 0o600)
+        self.assertEqual(self.mode("VERSION"), 0o600)
+
+    def test_modes_ignore_umask(self):
+        old = os.umask(0)
+        try:
+            self.assertEqual(self.install(FakeRunner(NOT_LOADED))[0], 0)
+        finally:
+            os.umask(old)
+        self.assertEqual(self.mode(), 0o700)
+        self.assertEqual(self.mode("rotator"), 0o700)
+        self.assertEqual(self.mode("rotator", "cli.py"), 0o600)
+
+    def test_version_file(self):
+        self.assertEqual(self.install(FakeRunner(NOT_LOADED))[0], 0)
+        lines = read_file(os.path.join(self.app, "VERSION")).splitlines()
+        self.assertEqual(lines, ["abc1234", "2026-11-02T03:04:05Z"])
+        self.assertEqual(launchd.installed_commit(self.state), "abc1234")
+
+    def test_version_unknown_without_commit(self):
+        self.assertEqual(self.install(FakeRunner(NOT_LOADED), commit_of=lambda root: None)[0], 0)
+        self.assertEqual(read_file(os.path.join(self.app, "VERSION")).splitlines()[0], "unknown")
+        self.assertIsNone(launchd.installed_commit(self.state))
+
+    def test_commit_read_from_the_source_root(self):
+        seen = []
+        self.install(FakeRunner(NOT_LOADED), commit_of=lambda root: seen.append(root) or "abc1234")
+        self.assertEqual(seen, [self.source])
+
+    def test_plist_points_to_the_copy(self):
+        self.assertEqual(self.install(FakeRunner(NOT_LOADED))[0], 0)
+        with open(self.plist, "rb") as f:
+            pl = plistlib.load(f)
+        self.assertEqual(pl["ProgramArguments"], ["/usr/bin/python3", os.path.join(self.app, "bin", "rotator"),
+                                                  "--config", "/Users/user/cfg/config.json", "daemon"])
+        self.assertEqual(pl["WorkingDirectory"], self.app)
+        for value in plistlib.dumps(pl).decode("utf-8").split("<string>")[1:]:
+            self.assertNotIn(self.source, value)
+
+    def test_reinstall_replaces_the_copy(self):
+        self.assertEqual(self.install(FakeRunner(NOT_LOADED))[0], 0)
+        os.remove(os.path.join(self.source, "rotator", "x.py"))
+        with open(os.path.join(self.source, "rotator", "y.py"), "w", encoding="utf-8") as f:
+            f.write("Y = 2\n")
+        self.commit = "def5678"
+        self.assertEqual(self.install(FakeRunner())[0], 0)
+        self.assertEqual(tree(self.app), APP_TREE - {"rotator/x.py"} | {"rotator/y.py"})
+        self.assertEqual(launchd.installed_commit(self.state), "def5678")
+        self.assertEqual(self.leftovers(), [])
+
+    def test_failed_copy_keeps_the_old_copy(self):
+        self.assertEqual(self.install(FakeRunner(NOT_LOADED))[0], 0)
+        plist_before = read_file(self.plist)
+        with open(os.path.join(self.source, "rotator", "cli.py"), "w", encoding="utf-8") as f:
+            f.write("CLI = 2\n")
+        for fail_at in (1, 2, 4):
+            with self.subTest(fail_at=fail_at):
+                self.commit = "def5678"
+                r = FakeRunner()
+                rc, msg = self.install(r, copy_file=failing_copy(fail_at))
+                self.assertEqual(rc, 1)
+                self.assertIn("copy", msg)
+                self.assertEqual(r.calls, [])
+                self.assertEqual(tree(self.app), APP_TREE)
+                self.assertEqual(read_file(os.path.join(self.app, "rotator", "cli.py")), "CLI = 1\n")
+                self.assertEqual(launchd.installed_commit(self.state), "abc1234")
+                self.assertEqual(read_file(self.plist), plist_before)
+                self.assertEqual(self.leftovers(), [])
+
+    def test_failed_swap_restores_the_old_copy(self):
+        self.assertEqual(self.install(FakeRunner(NOT_LOADED))[0], 0)
+        real_rename = os.rename
+        renames = []
+
+        def rename(src, dst):
+            renames.append((src, dst))
+            if dst == self.app and len(renames) == 2:
+                raise OSError(1, "Operation not permitted")
+            return real_rename(src, dst)
+        self.commit = "def5678"
+        with mock.patch("rotator.launchd.os.rename", rename):
+            rc, _ = self.install(FakeRunner())
+        self.assertEqual(rc, 1)
+        self.assertEqual(launchd.installed_commit(self.state), "abc1234")
+        self.assertEqual(tree(self.app), APP_TREE)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_missing_entry_point_refused(self):
+        os.remove(os.path.join(self.source, "bin", "rotator"))
+        r = FakeRunner(NOT_LOADED)
+        rc, _ = self.install(r)
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.lexists(self.app))
+        self.assertFalse(os.path.exists(self.plist))
+        self.assertEqual(r.calls, [])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_no_modules_refused(self):
+        for name in ("__init__.py", "cli.py", "x.py"):
+            os.remove(os.path.join(self.source, "rotator", name))
+        rc, _ = self.install(FakeRunner(NOT_LOADED))
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.lexists(self.app))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_symlinked_app_dir_refused_on_install(self):
+        victim = scratch("victim-" + self._testMethodName)
+        with open(os.path.join(victim, "keep.txt"), "w", encoding="utf-8") as f:
+            f.write("keep\n")
+        os.symlink(victim, self.app)
+        r = FakeRunner(NOT_LOADED)
+        rc, msg = self.install(r)
+        self.assertEqual(rc, 1)
+        self.assertIn("not a real directory", msg)
+        self.assertTrue(os.path.islink(self.app))
+        self.assertEqual(os.listdir(victim), ["keep.txt"])
+        self.assertEqual(r.calls, [])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_app_file_refused_on_install(self):
+        with open(self.app, "w", encoding="utf-8") as f:
+            f.write("file\n")
+        rc, msg = self.install(FakeRunner(NOT_LOADED))
+        self.assertEqual(rc, 1)
+        self.assertIn("not a real directory", msg)
+        self.assertEqual(read_file(self.app), "file\n")
+
+    def test_protected_config_refused(self):
+        home = os.path.expanduser("~")
+        for folder in ("Desktop", "Documents", "Downloads"):
+            with self.subTest(folder=folder):
+                r = FakeRunner(NOT_LOADED)
+                rc, msg = self.install(r, config_path=os.path.join(home, folder, "cfg", "config.json"))
+                self.assertEqual(rc, 2)
+                self.assertIn("~/" + folder, msg)
+                self.assertEqual(r.calls, [])
+                self.assertFalse(os.path.lexists(self.app))
+                self.assertFalse(os.path.exists(self.plist))
+
+    def test_protected_dir_is_component_wise(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(launchd.protected_dir(os.path.join(home, "Desktop")), "~/Desktop")
+        self.assertEqual(launchd.protected_dir(os.path.join(home, "Downloads", "a", "b.json")), "~/Downloads")
+        self.assertIsNone(launchd.protected_dir(os.path.join(home, "Desktopx", "config.json")))
+        self.assertIsNone(launchd.protected_dir(os.path.join(home, "Library", "Desktop", "config.json")))
+        self.assertIsNone(launchd.protected_dir(""))
+        rc, _ = self.install(FakeRunner(NOT_LOADED), config_path=os.path.join(home, "Desktopx", "config.json"))
+        self.assertEqual(rc, 0)
+
+    def test_uninstall_removes_only_the_copy(self):
+        self.assertEqual(self.install(FakeRunner(NOT_LOADED))[0], 0)
+        keep = {"config.json": "{}\n", "state.json": "{}\n", "usage/u-1.json": "{}\n", "app-old/x.py": "x\n",
+                "app.bak": "b\n"}
+        for rel, text in keep.items():
+            p = os.path.join(self.state, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text)
+        self.assertEqual(self.uninstall(FakeRunner()), (0, "uninstalled " + LABEL))
+        self.assertFalse(os.path.lexists(self.app))
+        for rel, text in keep.items():
+            self.assertEqual(read_file(os.path.join(self.state, rel)), text)
+        self.assertTrue(os.path.isdir(self.source))
+
+    def test_uninstall_symlinked_app_refused(self):
+        victim = scratch("victim-" + self._testMethodName)
+        with open(os.path.join(victim, "keep.txt"), "w", encoding="utf-8") as f:
+            f.write("keep\n")
+        os.symlink(victim, self.app)
+        rc, msg = self.uninstall(FakeRunner(NOT_LOADED))
+        self.assertEqual(rc, 1)
+        self.assertIn("refused", msg)
+        self.assertIn(self.app, msg)
+        self.assertTrue(os.path.islink(self.app))
+        self.assertEqual(os.listdir(victim), ["keep.txt"])
+
+    def test_uninstall_app_file_refused(self):
+        with open(self.app, "w", encoding="utf-8") as f:
+            f.write("file\n")
+        rc, msg = self.uninstall(FakeRunner(NOT_LOADED))
+        self.assertEqual(rc, 1)
+        self.assertIn("refused", msg)
+        self.assertEqual(read_file(self.app), "file\n")
+
+    def test_uninstall_bootout_failure_keeps_the_copy(self):
+        self.assertEqual(self.install(FakeRunner(NOT_LOADED))[0], 0)
+        self.assertEqual(self.uninstall(FakeRunner({"bootout": (5, "", "busy\n")})),
+                         (1, "launchctl bootout failed: busy"))
+        self.assertEqual(tree(self.app), APP_TREE)
+
+    def test_uninstall_without_copy(self):
+        self.assertEqual(self.uninstall(FakeRunner(NOT_LOADED)), (0, "uninstalled " + LABEL))
+        self.assertEqual(os.listdir(self.state), [])
+
+
+class TestStaleInstall(unittest.TestCase):
+    def setUp(self):
+        self.state = scratch("stale-state-" + self._testMethodName)
+        self.plist = os.path.join(scratch("stale-agents-" + self._testMethodName), LABEL + ".plist")
+        with open(self.plist, "w", encoding="utf-8") as f:
+            f.write("<plist/>\n")
+        self.source = scratch("stale-src-" + self._testMethodName)
+
+    def version(self, text):
+        os.makedirs(os.path.join(self.state, "app"), exist_ok=True)
+        with open(os.path.join(self.state, "app", "VERSION"), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def stale(self, commit):
+        return launchd.install_stale(self.plist, self.state, self.source, commit_of=lambda root: commit)
+
+    def test_differs(self):
+        self.version("abc1234\n2026-11-02T03:04:05Z\n")
+        self.assertIs(self.stale("def5678"), True)
+
+    def test_same_or_prefix(self):
+        self.version("abc1234\n2026-11-02T03:04:05Z\n")
+        self.assertIs(self.stale("abc1234"), False)
+        self.assertIs(self.stale("abc12345678"), False)
+        self.version("abc12345678\nx\n")
+        self.assertIs(self.stale("abc1234"), False)
+
+    def test_not_installed(self):
+        self.version("abc1234\n")
+        os.remove(self.plist)
+        self.assertIs(self.stale("def5678"), False)
+
+    def test_unknown_either_side(self):
+        self.assertIs(self.stale("def5678"), False)  # no VERSION
+        self.version("unknown\n2026-11-02T03:04:05Z\n")
+        self.assertIs(self.stale("def5678"), False)
+        self.version("")
+        self.assertIs(self.stale("def5678"), False)
+        self.version("abc1234\n")
+        self.assertIs(self.stale(None), False)
+
+    def test_errors_are_silent(self):
+        self.version("abc1234\n")
+
+        def boom(root):
+            raise OSError("git gone")
+        self.assertIs(launchd.install_stale(self.plist, self.state, self.source, commit_of=boom), False)
+        with open(os.path.join(self.state, "app", "VERSION"), "wb") as f:
+            f.write(b"\xff\xfe\x00")
+        self.assertIs(self.stale("def5678"), False)
+
+    def test_source_commit(self):
+        calls = []
+
+        def runner(out=(0, "abc1234\n", "")):
+            def run(argv, timeout):
+                calls.append(argv)
+                return out
+            return run
+        self.assertIsNone(launchd.source_commit(self.source, runner()))
+        self.assertEqual(calls, [])  # no .git: git is never asked (it would walk up to a parent repo)
+        os.makedirs(os.path.join(self.source, ".git"))
+        self.assertEqual(launchd.source_commit(self.source, runner()), "abc1234")
+        self.assertEqual(calls[-1], ["git", "-C", self.source, "rev-parse", "--short", "HEAD"])
+        self.assertIsNone(launchd.source_commit(self.source, runner((128, "", "fatal: not a git repository"))))
+        self.assertIsNone(launchd.source_commit(self.source, runner((0, "not a hash\n", ""))))
+        self.assertIsNone(launchd.source_commit(self.source, runner((0, "", ""))))
+
+        def missing(argv, timeout):
+            raise FileNotFoundError("git")
+        self.assertIsNone(launchd.source_commit(self.source, missing))
+
+    def test_source_commit_worktree_git_file(self):
+        with open(os.path.join(self.source, ".git"), "w", encoding="utf-8") as f:
+            f.write("gitdir: /elsewhere\n")
+        self.assertEqual(launchd.source_commit(self.source, lambda argv, timeout: (0, "0123abc\n", "")), "0123abc")
+
+    def test_render_line(self):
+        doc = {"daemon": {"running": False}, "accounts": [
+            {"account_id": "acc-1", "label": "a", "source": "live", "five_hour": None, "seven_day": None}]}
+        now = datetime(2026, 11, 2, tzinfo=timezone.utc)
+        plain = render(doc, now, timezone.utc, 120)
+        stale = render(doc, now, timezone.utc, 120, stale_install=True)
+        self.assertNotIn(cli.STALE_INSTALL, plain)
+        self.assertEqual(stale[1], cli.STALE_INSTALL)
+        self.assertEqual(stale[:1] + stale[2:], plain)
+        self.assertEqual(cli.STALE_INSTALL, "설치본이 오래됨 — rotator install 다시 실행")
+        empty = render({}, now, timezone.utc, 120, stale_install=True)
+        self.assertEqual(empty[1], cli.STALE_INSTALL)
+        for line in render(doc, now, timezone.utc, 20, stale_install=True):
+            self.assertLessEqual(cli.display_width(line, False), 20)
+
+
+class TestStaleInstallWiring(unittest.TestCase):
+    def setUp(self):
+        self.env = standard_env()
+        self.dir = scratch("stalecfg-" + self._testMethodName)
+        self.cfg_path = os.path.join(self.dir, "config.json")
+        env_patch = mock.patch.dict(os.environ, {"COLUMNS": "300", "LINES": "40"})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+
+    def run_status(self, *argv, **kw):
+        out, err = io.StringIO(), io.StringIO()
+        rc = main(["--config", self.cfg_path, "status"] + list(argv), make_deps=lambda cfg: self.env.deps(),
+                  launchctl=FakeRunner(), uid=lambda: 501, stdout=out, stderr=err, tz=timezone.utc, **kw)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_line_shown_when_stale(self):
+        rc, out, _ = self.run_status(stale_check=lambda: True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.splitlines()[1], cli.STALE_INSTALL)
+
+    def test_no_line_when_current(self):
+        rc, out, _ = self.run_status(stale_check=lambda: False)
+        self.assertEqual(rc, 0)
+        self.assertNotIn(cli.STALE_INSTALL, out)
+
+    def test_check_error_is_silent(self):
+        def boom():
+            raise OSError("x")
+        rc, out, err = self.run_status(stale_check=boom)
+        self.assertEqual(rc, 0)
+        self.assertNotIn(cli.STALE_INSTALL, out)
+        self.assertEqual(err, "")
+
+    def test_injected_deps_never_run_the_real_check(self):
+        with mock.patch("rotator.launchd.install_stale", side_effect=AssertionError("real check")) as real:
+            rc, out, _ = self.run_status()
+        self.assertEqual(rc, 0)
+        real.assert_not_called()
+        self.assertNotIn(cli.STALE_INSTALL, out)
+
+    def test_real_deps_use_the_real_check(self):
+        seen = []
+        with mock.patch("rotator.launchd.install_stale", lambda *a, **k: seen.append(a) or True):
+            self.assertIs(cli._real_stale_check(load_config(self.cfg_path))(), True)
+        self.assertEqual(seen, [(launchd.plist_path_default(), CONFIG_DIR_DEFAULT, launchd.repo_root())])
+
+    def test_json_has_no_line(self):
+        rc, out, _ = self.run_status("--json", stale_check=lambda: True)
+        self.assertEqual(rc, 0)
+        self.assertNotIn(cli.STALE_INSTALL, out)
+        self.assertEqual(set(json.loads(out)), set(STATUS_KEYS))
+
+    def test_watch_shows_line(self):
+        calls = []
+
+        def check():
+            calls.append(1)
+            return True
+        keys = iter(["q"])
+        rc, out, _ = self.run_status("--watch", "--interval", "1", stale_check=check,
+                                     read_key=lambda t: next(keys, "q"))
+        self.assertEqual(rc, 0)
+        self.assertIn(cli.STALE_INSTALL, out)
+        self.assertEqual(len(calls), 1)
 
 
 # --- Task 11 ---------------------------------------------------------------------------------------------
@@ -2717,9 +3153,33 @@ class TestInstallWiring(unittest.TestCase):
         kw = cli._install_kwargs(cfg, "/Users/user/cfg/config.json")
         self.assertEqual(kw["config_path"], "/Users/user/cfg/config.json")
         self.assertEqual(kw["log_dir"], LOG_DIR_DEFAULT)
-        self.assertEqual(kw["repo_root"], REPO)
+        self.assertEqual(kw["source_root"], REPO)
+        self.assertEqual(kw["state_dir"], CONFIG_DIR_DEFAULT)
         self.assertEqual(kw["plist_path"], launchd.plist_path_default())
         self.assertEqual(kw["timeouts"], Timeouts())
+        self.assertNotIn("repo_root", kw)
+
+    def test_main_passes_state_dir_to_install_and_uninstall(self):
+        seen = {}
+
+        def fake(name):
+            def call(**kw):
+                seen[name] = kw
+                return (0, name + " ok")
+            return call
+        cfg_path = os.path.join(scratch("wiring-" + self._testMethodName), "config.json")
+        with mock.patch("rotator.launchd.install", fake("install")), \
+                mock.patch("rotator.launchd.uninstall", fake("uninstall")):
+            for verb in ("install", "uninstall"):
+                out = io.StringIO()
+                rc = main(["--config", cfg_path, verb], launchctl=FakeRunner(), uid=lambda: 501, stdout=out,
+                          stderr=io.StringIO())
+                self.assertEqual(rc, 0)
+                self.assertEqual(out.getvalue(), verb + " ok\n")
+        self.assertEqual(seen["install"]["state_dir"], CONFIG_DIR_DEFAULT)
+        self.assertEqual(seen["install"]["source_root"], REPO)
+        self.assertEqual(seen["uninstall"]["state_dir"], CONFIG_DIR_DEFAULT)
+        self.assertEqual(seen["uninstall"]["plist_path"], launchd.plist_path_default())
 
 
 class TestBinEntrypoint(unittest.TestCase):

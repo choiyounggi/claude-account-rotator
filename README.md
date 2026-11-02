@@ -40,17 +40,29 @@ bin/rotator install            # run the daemon in the background (automatic swi
 ## Install / uninstall
 
 ```sh
-bin/rotator install      # writes the launchd user agent and starts it
-bin/rotator uninstall    # stops it and removes the plist
+bin/rotator install      # copies the app, writes the launchd user agent and starts it
+bin/rotator uninstall    # stops it and removes the plist and the app copy
 ```
 
-- `install` writes `~/Library/LaunchAgents/io.github.choiyounggi.claude-account-rotator.plist` and runs
+- `install` copies the runnable app — `bin/rotator` and `rotator/*.py`, nothing else (no tests, no `.git`) — into
+  `~/Library/Application Support/claude-account-rotator/app/`, and the agent runs that copy, not the checkout.
+  Why: macOS privacy protection (TCC) denies launchd-started processes access to `~/Desktop`, `~/Documents` and
+  `~/Downloads` even when your terminal has it, so an agent pointed at a checkout there crash-loops with
+  `can't open file ... Operation not permitted`. For the same reason `install` refuses a `--config` file in
+  those folders.
+- The copy is built next to the old one and swapped in only when complete; a failed copy leaves the old copy, the
+  plist and the running agent untouched. `app/VERSION` records the source commit and the copy time.
+- **Re-run `rotator install` after updating the code** (`git pull` or any edit): the agent keeps running the old
+  copy until then. `rotator status` shows `설치본이 오래됨 — rotator install 다시 실행` when the installed copy
+  came from a different commit than the checkout you run it from.
+- `install` then writes `~/Library/LaunchAgents/io.github.choiyounggi.claude-account-rotator.plist` and runs
   `launchctl bootstrap gui/<uid>` on it. Running it again replaces a loaded agent (`bootout`, then `bootstrap`).
 - `uninstall` runs `launchctl bootout gui/<uid>/io.github.choiyounggi.claude-account-rotator` (the exact label,
-  never a pattern) and removes the plist.
-- The agent runs `/usr/bin/python3 <repo>/bin/rotator --config <abs path> daemon` with `RunAtLoad` and
-  `KeepAlive`. Its `ExitTimeOut` is computed from `timeouts` at install time (440 s with the defaults: one full
-  switch plus margin), so re-run `rotator install` after changing `timeouts`.
+  never a pattern), removes the plist, then removes exactly `app/` under the state dir — only if it is a real
+  directory there; a symlink or file in its place is reported and left alone.
+- The agent runs `/usr/bin/python3 <state dir>/app/bin/rotator --config <abs path> daemon` from `<state dir>/app`
+  with `RunAtLoad` and `KeepAlive`. Its `ExitTimeOut` is computed from `timeouts` at install time (440 s with the
+  defaults: one full switch plus margin), so re-run `rotator install` after changing `timeouts`.
 - Run `rotator uninstall` before running `rotator daemon` in the foreground. Otherwise the second copy finds the
   daemon lock held and exits 1, and with `KeepAlive` launchd restarts the agent copy every 10 s
   (`ThrottleInterval` default, `man launchd.plist`).
@@ -363,7 +375,8 @@ Numbers must be finite and not `true`/`false`.
 
 - State dir `~/Library/Application Support/claude-account-rotator/`: `config.json` (the default config),
   `state.json` (daemon snapshot), `daemon.lock` (single instance, holds the daemon pid), `usage/` (the
-  shared usage readings, one file per account), `locks/` and `sessions/`. The state dir is fixed: `--config PATH` changes only which config file is read, so every daemon
+  shared usage readings, one file per account), `locks/`, `sessions/` and `app/` (the copy the launchd agent
+  runs, written by `install`). The state dir is fixed: `--config PATH` changes only which config file is read, so every daemon
   and `rotator switch` process uses the same locks and records whatever config it was started with.
 - `locks/` holds one empty file per switched session or pane; `sessions/` holds one small JSON record per
   switched session identity. The rotator never prunes either; delete them only while no rotator process runs.
