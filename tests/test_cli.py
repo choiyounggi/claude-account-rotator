@@ -1414,6 +1414,26 @@ class TestBuildStatus(StatusBase):
         self.assertEqual(att[781]["hint"], ORPHANED_HINT)
         self.assertEqual([a["pid"] for a in self.doc()["attention"]], [781, 777])
 
+    def test_attention_hides_failures_of_sessions_running_again(self):
+        cmd = "cd /x && claude --resume y"
+        hour_ago = (T0 - timedelta(hours=1)).isoformat()
+        sid_back, sid_gone = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+        self.put_record(stored_record(791, sid=sid_back, res=result("exited", "exit_timeout", cmd=cmd),
+                                      touched=True, updated_at=hour_ago))
+        self.put_record(stored_record(792, sid=sid_gone, res=result("exited", "exit_timeout", cmd=cmd),
+                                      touched=True, updated_at=hour_ago))
+        self.env.sessions = [sess(9101, ACC_A, sid=sid_back)]  # same session, new process
+        att = {a["pid"] for a in self.doc()["attention"]}
+        self.assertNotIn(791, att)
+        self.assertIn(792, att)
+
+    def test_attention_kept_when_no_session_runs(self):
+        hour_ago = (T0 - timedelta(hours=1)).isoformat()
+        self.put_record(stored_record(793, res=result("exited", "exit_timeout", cmd="cd /x"), touched=True,
+                                      updated_at=hour_ago))
+        self.env.sessions = []
+        self.assertEqual([a["pid"] for a in self.doc()["attention"]], [793])
+
     def test_usage_warnings_not_printed(self):
         self.env.usages[ACC_B] = limited(ACC_B)
         self.env.fetch_raises = {ACC_C}

@@ -334,6 +334,8 @@ def build_status(cfg: Config, deps: Deps, now: datetime, usage: Optional[UsageCa
     sessions: List[dict] = []
     unmanaged: List[dict] = []
     live_idents = set()
+    # A failed switch whose session now runs again (resumed by hand or by a later switch) is resolved.
+    live_session_ids = {s.session_id for s in found if s.session_id}
     for s in found:
         own = profile_for_config_dir(profiles, s.config_dir)
         if own is None:
@@ -369,6 +371,8 @@ def build_status(cfg: Config, deps: Deps, now: datetime, usage: Optional[UsageCa
     attention: List[dict] = []
     for ident, rec in records.items():
         if ident in live_idents or not touched(rec):
+            continue
+        if rec.get("session_id") in live_session_ids:
             continue
         res = rec.get("result")
         if isinstance(res, dict) and res.get("ok") is True:
