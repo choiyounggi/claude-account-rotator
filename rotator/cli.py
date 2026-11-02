@@ -193,7 +193,8 @@ _REASONS = {"token_expired": "토큰 만료", "token_missing": "토큰 없음", 
             "invalid_grant": "재로그인 필요", "invalid_scope": "재로그인 필요", "rejected": "갱신 거부",
             "malformed_response": "응답 이상", "outcome_unknown": "갱신 결과 불명", "network_error": "연결 실패",
             "server_error": "갱신 실패", "rate_limited": "호출 제한", "write_failed": "키체인 저장 실패",
-            "conflict": "갱신 충돌", "internal_error": "갱신 실패", "daemon_off": "데몬 꺼짐"}
+            "conflict": "갱신 충돌", "internal_error": "갱신 실패", "daemon_off": "데몬 꺼짐",
+            "warmup_failed": "세션 계정 갱신 실패"}
 
 
 def reason_text(error: object, sep: str = "·") -> str:
