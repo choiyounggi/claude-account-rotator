@@ -1307,12 +1307,26 @@ class TestPreflight(unittest.TestCase):
         w = self._subdir_world("/Users/user/proj/repo")
         assert_untouched(self, w.run(), "pane_not_claude", w)
 
-    def test_trust_above_git_root_untrusted(self):
+    def test_trust_above_git_root_passes(self):
+        # A worktree's only trusted entry is often the parent repository folder.
         w = self._subdir_world("/Users/user/proj")
+        assert_untouched(self, w.run(), "pane_not_claude", w)
+
+    def test_trust_parent_without_git_passes(self):
+        w = self._subdir_world("/Users/user/proj/repo", git=False)
+        assert_untouched(self, w.run(), "pane_not_claude", w)
+
+    def test_trust_sibling_only_untrusted(self):
+        w = self._subdir_world("/Users/user/proj/other")
         assert_untouched(self, w.run(), "target_untrusted", w)
 
-    def test_trust_parent_without_git_untrusted(self):
-        w = self._subdir_world("/Users/user/proj/repo", git=False)
+    def test_trust_descendant_only_untrusted(self):
+        w = self._subdir_world("/Users/user/proj/repo/sub/deeper")
+        assert_untouched(self, w.run(), "target_untrusted", w)
+
+    def test_trust_false_on_ancestor_untrusted(self):
+        w = self._subdir_world("/Users/user/proj/repo")
+        w.fs.files[TRUST_FILE] = json.dumps({"projects": {"/Users/user/proj/repo": {"hasTrustDialogAccepted": False}}})
         assert_untouched(self, w.run(), "target_untrusted", w)
 
     def test_pid_not_alive(self):
