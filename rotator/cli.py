@@ -33,7 +33,7 @@ from rotator.daemon import (
 )
 from rotator.policy import decide
 from rotator.sessions import session_homes
-from rotator.switcher import STATE_HINTS, build_relaunch_command
+from rotator.switcher import build_relaunch_command, result_hint
 
 STATUS_SCHEMA = 1
 STATUS_KEYS = ("schema", "generated_at", "daemon", "accounts", "pointer_account_id", "sessions",
@@ -1325,7 +1325,7 @@ def _switch(args: argparse.Namespace, cfg: Config, deps: Deps, out: TextIO, err:
     assert r is not None
     print("ok=%s step=%s reason=%s state=%s new_pid=%s recoverable=%s request_id=%s"
           % (r.ok, r.step, r.reason, r.state, r.new_pid, r.recoverable, r.request_id), file=out)
-    hint = STATE_HINTS.get(r.state, "")
+    hint = result_hint(r)
     if hint:
         print("hint: %s" % hint, file=out)
     if r.relaunch_command and not r.ok:

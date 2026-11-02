@@ -23,7 +23,7 @@ from unittest import mock
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Set
 
-from rotator import cli, daemon, launchd, refresh
+from rotator import cli, daemon, launchd, refresh, switcher
 from rotator.cli import STATUS_KEYS, build_status, main, render
 from rotator.daemon import UsageCache, UsageStore
 from rotator.config import (
@@ -123,6 +123,13 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertIs(cfg.session_token_warmup_request, False)
         self.assertIs(load('{"session_token_warmup_request": false}').session_token_warmup, True)
 
+    def test_exclusion_ttl_and_copy_trust(self):
+        self.assertEqual(load("{}").exclusion_ttl_s, 600.0)
+        self.assertIs(load("{}").copy_trust, True)
+        cfg = load('{"exclusion_ttl_s": 0, "copy_trust": false}')
+        self.assertEqual(cfg.exclusion_ttl_s, 0.0)
+        self.assertIs(cfg.copy_trust, False)
+
     def test_policy_config_carries_overrides(self):
         cfg = load('{"cooldown_s": 60, "stale_max_age_s": 120}')
         pc = cfg.policy_config()
@@ -153,6 +160,9 @@ class TestConfigValidation(unittest.TestCase):
         ('{"session_token_warmup": "yes"}', "session_token_warmup"),
         ('{"session_token_warmup": 0}', "session_token_warmup"),
         ('{"session_token_warmup_request": null}', "session_token_warmup_request"),
+        ('{"exclusion_ttl_s": -1}', "exclusion_ttl_s"),
+        ('{"exclusion_ttl_s": true}', "exclusion_ttl_s"),
+        ('{"copy_trust": 1}', "copy_trust"),
         ('{"profiles_root": "rel/x"}', "profiles_root"),
         ('{"continue_prompt": "a\\tb"}', "continue_prompt"),
     ]
@@ -525,13 +535,24 @@ def scratch(name):
 
 
 class FakeRunner:
+    """launchctl by verb. A list answers one call per item (the last repeats). Once a bootstrap succeeded, `print`
+    answers from "print_after" (default loaded, rc 0) like launchd would."""
+
     def __init__(self, script=None):
         self.script = script or {}
         self.calls: List[tuple] = []
+        self.bootstrapped = False
 
     def __call__(self, argv, timeout):
         self.calls.append((list(argv), timeout))
-        return self.script.get(argv[1], (0, "", ""))
+        verb = argv[1]
+        key = "print_after" if verb == "print" and self.bootstrapped else verb
+        v = self.script.get(key, (0, "", ""))
+        if isinstance(v, list):
+            v = v.pop(0) if len(v) > 1 else v[0]
+        if verb == "bootstrap" and v[0] == 0:
+            self.bootstrapped = True
+        return v
 
     def verbs(self):
         return [argv[1] for argv, _ in self.calls]
@@ -608,12 +629,13 @@ class TestLaunchd(LaunchdBase):
         self.assertIn(LABEL, msg)
         self.assertEqual([argv for argv, _ in r.calls], [
             ["/bin/launchctl", "print", "gui/501/" + LABEL],
-            ["/bin/launchctl", "bootstrap", "gui/501", self.plist]])
+            ["/bin/launchctl", "bootstrap", "gui/501", self.plist],
+            ["/bin/launchctl", "print", "gui/501/" + LABEL]])
         with open(self.plist, "rb") as f:
             pl = plistlib.load(f)
         self.assertEqual(pl["Label"], LABEL)
-        self.assertEqual(pl["ExitTimeOut"], 440)
-        self.assertGreaterEqual(pl["ExitTimeOut"], 380)
+        self.assertEqual(pl["ExitTimeOut"], 505)
+        self.assertGreaterEqual(pl["ExitTimeOut"], 445)
         self.assertEqual(pl["ProgramArguments"][0], "/usr/bin/python3")
         self.assertEqual(pl["ProgramArguments"][1], os.path.join(self.app, "bin", "rotator"))
         self.assertEqual(pl["WorkingDirectory"], self.app)
@@ -627,13 +649,20 @@ class TestLaunchd(LaunchdBase):
     def test_install_loaded_reinstalls(self):
         r = FakeRunner()
         self.assertEqual(self.install(r)[0], 0)
-        self.assertEqual(r.verbs(), ["print", "bootout", "bootstrap"])
-        self.assertEqual(r.calls[1][1], 440 + 30.0)
+        self.assertEqual(r.verbs(), ["print", "bootout", "bootstrap", "print"])
+        self.assertEqual(r.calls[1][1], 505 + 30.0)
         self.assertEqual(r.calls[1][0], ["/bin/launchctl", "bootout", "gui/501/" + LABEL])
 
     def test_install_bootstrap_failure(self):
         r = FakeRunner({"print": (113, "", ""), "bootstrap": (5, "", "Bootstrap failed: 5: Input/output error\n")})
         self.assertEqual(self.install(r), (1, "launchctl bootstrap failed: Bootstrap failed: 5: Input/output error"))
+
+    def test_install_not_loaded_bootstrap_io_error_not_retried(self):
+        sleeps = []
+        r = FakeRunner({"print": (113, "", ""), "bootstrap": (5, "", "Bootstrap failed: 5: Input/output error\n")})
+        self.assertEqual(self.install(r, sleep=sleeps.append)[0], 1)
+        self.assertEqual(r.verbs(), ["print", "bootstrap"])
+        self.assertEqual(sleeps, [])
 
     def test_install_bootout_failure(self):
         r = FakeRunner({"bootout": (3, "", "nope\n")})
@@ -647,7 +676,7 @@ class TestLaunchd(LaunchdBase):
         r = FakeRunner()
         self.assertEqual(self.uninstall(r)[0], 0)
         self.assertEqual(r.verbs(), ["print", "bootout"])
-        self.assertEqual(r.calls[1][1], 440 + 30.0)
+        self.assertEqual(r.calls[1][1], 505 + 30.0)
         self.assertFalse(os.path.exists(self.plist))
 
     def test_uninstall_not_loaded(self):
@@ -660,7 +689,7 @@ class TestLaunchd(LaunchdBase):
     def test_uninstall_absent_plist(self):
         r = FakeRunner()
         self.assertEqual(self.uninstall(r), (0, "uninstalled " + LABEL))
-        self.assertEqual(r.calls[1][1], 440 + 30.0)
+        self.assertEqual(r.calls[1][1], 505 + 30.0)
 
     def test_uninstall_bootout_failure_keeps_plist(self):
         self.install(FakeRunner({"print": (113, "", "")}))
@@ -674,7 +703,7 @@ class TestLaunchd(LaunchdBase):
         self.install(FakeRunner())
         self.uninstall(FakeRunner())
         self.uninstall(FakeRunner({"print": (113, "", "")}))
-        self.assertEqual(len(TestLaunchd.all_calls), 2 + 3 + 2 + 1)
+        self.assertEqual(len(TestLaunchd.all_calls), 3 + 4 + 2 + 1)  # each install ends with a verifying print
         for argv in TestLaunchd.all_calls:
             self.assertEqual(argv[0], "/bin/launchctl")
             if argv[1] == "bootstrap":
@@ -687,7 +716,7 @@ class TestLaunchd(LaunchdBase):
                     self.assertNotIn(bad, part)
 
     def test_exit_timeout_tracks_timeouts(self):
-        self.assertEqual(exit_timeout_for(Timeouts()), 440)
+        self.assertEqual(exit_timeout_for(Timeouts()), 505)
         self.assertEqual(exit_timeout_for(Timeouts(ready_s=120.0)), exit_timeout_for(Timeouts()) + 60)
 
     def test_required_seams(self):
@@ -715,6 +744,67 @@ def failing_copy(fail_at):
             raise OSError(28, "No space left on device")
         return shutil.copyfile(src, dst)
     return copy
+
+
+IO_ERR = (5, "", "Bootstrap failed: 5: Input/output error\n")
+
+
+class TestInstallRetry(LaunchdBase):
+    """bootstrap right after bootout races the old instance still exiting (launchctl rc 5, Input/output error)."""
+
+    def run_install(self, script):
+        self.sleeps = []
+        r = FakeRunner(script)
+        return r, self.install(r, sleep=self.sleeps.append)
+
+    def test_retried_until_success(self):
+        r, (rc, msg) = self.run_install({"bootstrap": [IO_ERR, IO_ERR, IO_ERR, (0, "", "")]})
+        self.assertEqual(rc, 0)
+        self.assertIn(LABEL, msg)
+        self.assertEqual(r.verbs(), ["print", "bootout"] + ["bootstrap"] * 4 + ["print"])
+        self.assertEqual(self.sleeps, [1.0, 1.0, 1.0])
+
+    def test_gives_up_after_ten_retries(self):
+        last = (5, "", "Bootstrap failed: 5: Input/output error (last)\n")
+        r, (rc, msg) = self.run_install({"bootstrap": [IO_ERR] * 10 + [last]})
+        self.assertEqual(rc, 1)
+        self.assertEqual(msg, "launchctl bootstrap failed: Bootstrap failed: 5: Input/output error (last)")
+        self.assertEqual(r.verbs().count("bootstrap"), 11)
+        self.assertEqual(self.sleeps, [1.0] * 10)
+        self.assertNotIn("print", r.verbs()[2:])
+
+    def test_success_on_last_retry(self):
+        r, (rc, _) = self.run_install({"bootstrap": [IO_ERR] * 10 + [(0, "", "")]})
+        self.assertEqual(rc, 0)
+        self.assertEqual(r.verbs().count("bootstrap"), 11)
+
+    def test_io_error_text_with_other_rc_is_retried(self):
+        r, (rc, _) = self.run_install({"bootstrap": [(1, "", "Bootstrap failed: Input/output error\n"), (0, "", "")]})
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.sleeps, [1.0])
+
+    def test_rc5_without_text_is_retried(self):
+        r, (rc, _) = self.run_install({"bootstrap": [(5, "", ""), (0, "", "")]})
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.sleeps, [1.0])
+
+    def test_other_error_not_retried(self):
+        r, (rc, msg) = self.run_install({"bootstrap": (37, "", "Operation already in progress\n")})
+        self.assertEqual((rc, msg), (1, "launchctl bootstrap failed: Operation already in progress"))
+        self.assertEqual(r.verbs(), ["print", "bootout", "bootstrap"])
+        self.assertEqual(self.sleeps, [])
+
+    def test_job_missing_after_bootstrap_is_an_error(self):
+        r, (rc, msg) = self.run_install({"print_after": (113, "", "Could not find service")})
+        self.assertEqual(rc, 1)
+        self.assertIn("launchctl print does not show %s" % LABEL, msg)
+        self.assertEqual(r.verbs(), ["print", "bootout", "bootstrap", "print"])
+        self.assertEqual(r.calls[-1][0], ["/bin/launchctl", "print", "gui/501/" + LABEL])
+
+    def test_job_shown_after_bootstrap(self):
+        r, (rc, _) = self.run_install({"print": (113, "", "")})
+        self.assertEqual(rc, 0)
+        self.assertEqual(r.verbs(), ["print", "bootstrap", "print"])
 
 
 class TestAppCopy(LaunchdBase):
@@ -3283,6 +3373,12 @@ class TestSwitchCommand(MainBase):
         self.assertEqual(self.sw(), 1)
         self.assertIn("relaunch: " + cmd, self.out.getvalue())
         self.assertIn("hint: " + STATE_HINTS["exited"], self.out.getvalue())
+
+    def test_switch_hint_notes_stopped_tasks(self):
+        r = dataclasses.replace(result("continued", None, ok=True, step="continue_prompt"), tasks_stopped=True)
+        self.env.results = [r]
+        self.assertEqual(self.sw(), 0)
+        self.assertIn("hint: " + switcher.TASKS_STOPPED_HINT, self.out.getvalue())
 
     def test_busy(self):
         self.env.held = {daemon.lock_paths(self.state_dir, self.s)[0]}

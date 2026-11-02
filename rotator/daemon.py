@@ -32,6 +32,7 @@ LEASE_MARGIN_S = 30.0
 STATE_FILENAME = "state.json"
 LOCK_FILENAME = "daemon.lock"
 SESSIONS_DIRNAME = "sessions"
+BACKUPS_DIRNAME = "backups"
 LOCKS_DIRNAME = "locks"
 USAGE_DIRNAME = "usage"
 SNAPSHOT_SCHEMA = 1
@@ -54,6 +55,9 @@ STRUCTURAL_REASONS = frozenset({
     "cwd_missing", "registry_mismatch", "pane_binding_unverified",
 })
 TARGET_REASONS = frozenset({"target_untrusted", "target_home_missing"})
+# Exclusions for these reasons expire after Config.exclusion_ttl_s: the cause (an untrusted folder, a transcript
+# not yet visible, a missing account folder) can be fixed while the session keeps running.
+EXPIRING_EXCLUSION_REASONS = frozenset({"target_untrusted", "transcript_not_visible", "target_home_missing"})
 TRANSIENT_REASONS = frozenset({
     "not_idle", "dialog_open", "input_not_empty", "screen_unreadable", "trust_dialog", "send_refused",
     "pane_not_claude", "transcript_not_visible",
@@ -74,6 +78,39 @@ def classify_untouched(reason: Optional[str]) -> str:
     if reason in GONE_REASONS:
         return "gone"
     return "structural"
+
+
+def active_exclusions(raw: Any, now: datetime, ttl_s: float, fallback_at: Any) -> List[dict]:
+    """The record's ``excluded`` entries still in force, as ``{"account_id", "reason", "at"}`` dicts.
+
+    A legacy plain account id reads as reason None with ``fallback_at`` (the record's updated_at) as its time; every
+    writer of that format excluded only for an expiring reason, so it expires like one. An entry whose time does not
+    parse has no age and is kept. Malformed entries are skipped; ``raw`` other than a list or None is ValueError.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("excluded must be a list")
+    out: Dict[str, dict] = {}
+    for item in raw:
+        if isinstance(item, str):
+            e = {"account_id": item, "reason": None, "at": fallback_at}
+        elif isinstance(item, dict) and isinstance(item.get("account_id"), str):
+            e = {"account_id": item["account_id"], "reason": item.get("reason"), "at": item.get("at")}
+        else:
+            continue
+        if e["reason"] is None or e["reason"] in EXPIRING_EXCLUSION_REASONS:
+            at = _parse_iso(e["at"])
+            if at is not None and (now - at).total_seconds() >= ttl_s:
+                out.pop(e["account_id"], None)
+                continue
+        out.pop(e["account_id"], None)
+        out[e["account_id"]] = e
+    return list(out.values())
+
+
+def exclusion_ids(entries: Sequence[Mapping[str, Any]]) -> FrozenSet[str]:
+    return frozenset(e["account_id"] for e in entries)
 
 
 def touched(record: Mapping[str, Any]) -> bool:
@@ -316,6 +353,7 @@ def result_dict(r: SwitchResult) -> dict:
         "request_id": r.request_id,
         "other_account_id": r.other_account_id,
         "relaunch_command": r.relaunch_command,
+        "tasks_stopped": r.tasks_stopped,
     }
 
 
@@ -365,7 +403,7 @@ def post_verify(new_pid: int, target: Profile, procs: ProcessProbe) -> str:
 
 
 def _new_record(session: Session, *, source: str, mode: str, target: Profile, attempt: int, now: datetime,
-                record_state: str, excluded: Sequence[str], hold: Optional[str],
+                record_state: str, excluded: Sequence[Mapping[str, Any]], hold: Optional[str],
                 result: Optional[SwitchResult] = None, unswitchable: Optional[str] = None) -> dict:
     rec = {
         "schema": RECORD_SCHEMA,
@@ -380,10 +418,10 @@ def _new_record(session: Session, *, source: str, mode: str, target: Profile, at
         "mode": mode,
         "target_account_id": target.account_id,
         "result": result_dict(result) if result is not None else None,
-        "hint": switcher.STATE_HINTS.get(result.state, "") if result is not None else "",
+        "hint": switcher.result_hint(result) if result is not None else "",
         "touched": None,
         "unswitchable": unswitchable,
-        "excluded": list(excluded),
+        "excluded": [dict(e) for e in excluded],
         "hard_hold_until": hold,
         "post_verify": None,
         "worker_error": None,
@@ -400,7 +438,7 @@ def _log_result(logger: logging.Logger, session: Session, source: str, mode: str
                 r.new_pid, r.recoverable, r.request_id, r.other_account_id)
     if r.relaunch_command and not r.ok:
         logger.warning("event=relaunch_pending pid=%d state=%s hint=%r command=%r",
-                       session.pid, r.state, switcher.STATE_HINTS.get(r.state, ""), r.relaunch_command)
+                       session.pid, r.state, switcher.result_hint(r), r.relaunch_command)
 
 
 def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cfg: Config, deps: Deps,
@@ -445,7 +483,8 @@ def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cf
             logger.warning("event=switch_refused pid=%d source=%s reason=touched", pid, source)
             return SwitchOutcome("refused_touched", prev, None)
 
-        excluded: List[str] = sorted(set(prev.get("excluded") or [])) if prev else []
+        excluded: List[dict] = (active_exclusions(prev.get("excluded"), deps.now(), cfg.exclusion_ttl_s,
+                                                  prev.get("updated_at")) if prev else [])
         hold: Optional[str] = prev.get("hard_hold_until") if prev else None
         attempt = 0
         calls = 0
@@ -473,7 +512,8 @@ def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cf
                         pid, source, cur_mode, cur_target.account_id, own.account_id, attempt)
             res = deps.switch(session, cur_target, cur_mode, driver=deps.make_driver(), procs=deps.procs,
                               timeouts=cfg.timeouts, continue_prompt=cfg.continue_prompt,
-                              profiles_root=cfg.profiles_root)
+                              profiles_root=cfg.profiles_root, copy_trust=cfg.copy_trust and not cfg.dry_run,
+                              trust_backup_dir=os.path.join(cfg.state_dir, BACKUPS_DIRNAME))
             calls = attempt
             last_mode, last_target = cur_mode, cur_target
             _log_result(logger, session, source, cur_mode, cur_target, attempt, res)
@@ -483,9 +523,12 @@ def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cf
                     unswitchable = res.reason if res.reason is not None else "unknown"
                     logger.warning("event=unswitchable pid=%d reason=%s", pid, unswitchable)
                 elif cls == "target":
-                    excluded = sorted(set(excluded) | {cur_target.account_id})
+                    excluded = [e for e in excluded if e["account_id"] != cur_target.account_id]
+                    excluded.append({"account_id": cur_target.account_id, "reason": res.reason,
+                                     "at": _iso(deps.now())})
+                    excluded.sort(key=lambda e: e["account_id"])
                     if next_target is not None and attempt < profiles_count:
-                        nxt = next_target(frozenset(excluded))
+                        nxt = next_target(exclusion_ids(excluded))
                         if nxt is not None:
                             cur_mode, cur_target = nxt
                             continue
@@ -1052,7 +1095,9 @@ class Daemon:
             return row
         if rec is not None and rec.get("unswitchable"):
             return row
-        excluded = set(rec.get("excluded") or []) if rec is not None else set()
+        excluded = (exclusion_ids(active_exclusions(rec.get("excluded"), now, self._cfg.exclusion_ttl_s,
+                                                    rec.get("updated_at")))
+                    if rec is not None else frozenset())
         candidates = [p for p in profiles if p.account_id == own.account_id or p.account_id not in excluded]
         ls = last_switch.get(s.session_id)
         d = decide(s, candidates, usages, now, config=pc, last_switch_at=ls)
