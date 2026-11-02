@@ -1205,7 +1205,8 @@ class TestSwitchArgs(unittest.TestCase):
 
 class TestPreflight(unittest.TestCase):
     def _shell_registry(self, w):
-        w.fs.files[OLD_REG] = reg(OLD_PID, "shell")
+        # Any status Claude Code does not write stops preflight at pane_not_claude.
+        w.fs.files[OLD_REG] = reg(OLD_PID, "bogus")
 
     def test_no_terminal_handle(self):
         w = World()
@@ -1380,10 +1381,14 @@ class TestPreflight(unittest.TestCase):
         w.fs.files[OLD_REG] = "[]"
         assert_untouched(self, w.run(), "pane_not_claude", w)
 
-    def test_registry_shell(self):
-        w = World()
-        self._shell_registry(w)
-        assert_untouched(self, w.run(), "pane_not_claude", w)
+    def test_registry_shell_runs_like_idle(self):
+        # "shell" = Claude Code idle at its prompt with background shells running.
+        idle = World()
+        shell = World()
+        shell.fs.files[OLD_REG] = reg(OLD_PID, "shell")
+        a, b = idle.run(), shell.run()
+        self.assertNotEqual(b.reason, "pane_not_claude")
+        self.assertEqual((a.ok, a.step, a.reason, a.state), (b.ok, b.step, b.reason, b.state))
 
     def test_registry_unknown_status(self):
         w = World()

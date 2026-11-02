@@ -708,7 +708,7 @@ def _preflight(run: _Run) -> Optional[SwitchResult]:
     if _binding_fault(run) is not None:
         return fail("pane_binding_unverified")
     reg = _read_registry(run.read_text, _registry_path(s))
-    if reg is None or reg.get("status") not in ("idle", "busy", "waiting"):
+    if reg is None or reg.get("status") not in ("idle", "busy", "waiting", "shell"):
         return fail("pane_not_claude")
     if reg.get("pid") != s.pid or reg.get("sessionId") != s.session_id:
         return fail("registry_mismatch")
@@ -748,6 +748,8 @@ def _interrupt(run: _Run) -> Optional[SwitchResult]:
         status = reg.get("status") if reg else None
         if status in ("idle", "waiting"):
             return status
+        if status == "shell":
+            return "idle"
         return None
 
     out = _wait_until(probe, t.idle_s, t.poll_s, run.clock, run.sleep)
@@ -773,7 +775,7 @@ def _exit(run: _Run) -> Optional[SwitchResult]:
         return _finish(run, "exit", "dialog_open", run.state)
     if status == "busy":
         return _finish(run, "exit", "not_idle", run.state)
-    if status != "idle":
+    if status not in ("idle", "shell"):
         return _finish(run, "exit", "pane_not_claude", run.state)
     if _binding_fault(run) is not None:
         return _finish(run, "exit", "pane_binding_unverified", run.state)

@@ -185,7 +185,8 @@ def decide(session: Session, profiles: Sequence[Profile], usages: Mapping[str, A
         label = "max(5h,7d,fable)"
     else:
         label = "max(5h,7d; fable unknown)"
-    if session.status not in ("idle", "busy"):
+    # "shell" is Claude Code idle at its prompt with background shells running; switch it like idle.
+    if session.status not in ("idle", "busy", "shell"):
         return Decision("none", None,
                         "session status %s: no running Claude turn to switch" % session.status, u)
     if u is None:
