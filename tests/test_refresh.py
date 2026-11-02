@@ -52,7 +52,7 @@ RESPONSE = '{"access_token":"A2","refresh_token":"R2","expires_in":28800,"scope"
 
 class TestConstants(TripwireCase):
     def test_reason_count(self):
-        self.assertEqual(len(refresh.REFRESH_REASONS), 30)
+        self.assertEqual(len(refresh.REFRESH_REASONS), 33)
 
     def test_daemon_off_record_keys(self):
         self.assertEqual(set(refresh.DAEMON_OFF_RECORD), {"state", "reason", "at", "last_refreshed_at"})
@@ -393,6 +393,10 @@ T0_MS = int(T0.timestamp() * 1000)
 ACC_A = "00000000-0000-4000-8000-000000000001"
 ACC_B = "00000000-0000-4000-8000-000000000002"
 ACCT = "alice"
+CLAUDE_BIN = "/opt/cc/bin/claude"
+BASE_ENV = {"HOME": "/Users/u", "PATH": "/usr/bin:/bin", "USER": "u", "LANG": "ko_KR.UTF-8", "TMPDIR": "/var/t/",
+            "CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_SSE_PORT": "1234",
+            "CLAUDE_CONFIG_DIR": "/other/home", "ANTHROPIC_API_KEY": "sk-should-not-pass", "SHELL": "/bin/zsh"}
 
 
 def prof(aid):
@@ -454,6 +458,35 @@ class FakeWorld:
         self.cc_reason = None
         self.now_v = T0
         self.mono_v = 1000.0
+        self.claude = CLAUDE_BIN
+        self.argv0s_seen = []
+        self.runs = []
+        self.run_effects = []
+        self.env_base = dict(BASE_ENV)
+
+    def find_claude(self, argv0s):
+        self.calls.append(("find_claude",))
+        self.argv0s_seen.append(list(argv0s))
+        return self.claude
+
+    def run_claude(self, argv, env, cwd, timeout):
+        self.calls.append(("run_claude",))
+        self.runs.append({"argv": list(argv), "env": dict(env), "cwd": cwd, "timeout": timeout})
+        effect = self.run_effects.pop(0) if self.run_effects else ("exited", None)
+        if isinstance(effect, Exception):
+            raise effect
+        outcome, new_item = effect
+        if new_item is not None:
+            key = next(iter(self.items)) if self.items else None
+            if key is not None:
+                if new_item == "<gone>":
+                    del self.items[key]
+                else:
+                    self.items[key] = new_item
+        return outcome
+
+    def environ(self):
+        return dict(self.env_base)
 
     def read_item(self, svc, acct):
         self.calls.append(("read", svc, acct))
@@ -541,13 +574,14 @@ class FakeWorld:
             item_exists=self.item_exists, account_name=self.account_name, write_item=self.write_item,
             post=self.post, discover=self.discover, list_dir=self.list_dir, pid_alive=self.pid_alive,
             exists=self.exists, lock=self.lock, cc_lock=self.cc_lock, now=self.now, monotonic=self.monotonic,
-            sleep=self.sleep, log=logging.getLogger("rotator.refresh"))
+            sleep=self.sleep, log=logging.getLogger("rotator.refresh"), find_claude=self.find_claude,
+            run_claude=self.run_claude, environ=self.environ)
 
     def kinds(self):
         return [c[0] for c in self.calls]
 
 
-NO_SIDE_EFFECTS = ("post", "write", "lock", "cc_lock")
+NO_SIDE_EFFECTS = ("post", "write", "lock", "cc_lock", "run_claude")
 
 
 class GateCase(TripwireCase):
@@ -1709,6 +1743,448 @@ class TestSecretChannels(TripwireCase):
                 logging.getLogger("rotator.refresh").info("leak %s", SECRET_R)
             for needle in NEEDLES:
                 self.assertNotIn(needle, "\n".join(cm.output))
+
+
+# --- session warm-up (Claude Code refreshes the token itself) --------------------------------------------
+
+STEP_A = [CLAUDE_BIN, "-p", "--no-session-persistence"]
+STEP_B = [CLAUDE_BIN, "-p", "Reply with OK", "--model", "haiku", "--no-session-persistence"]
+LATER = T0_MS + 8 * 3_600_000
+
+
+def moved(access="A9", expires=LATER):
+    return ("exited", item(access=access, refresh_="R9", expires=expires))
+
+
+class WarmCase(TripwireCase):
+    def setUp(self):
+        super().setUp()
+        self.w = FakeWorld()
+        self.p = prof(ACC_A)
+        self.svc = self.p.keychain_service
+        self.w.items[(self.svc, ACCT)] = item()
+        self.w.sessions = [Session(pid=10, session_id="s-10", cwd="/w", status="idle", config_dir=self.p.home,
+                                   argv=("/opt/cc/bin/claude", "--model", "opus"))]
+        self.cfg = dataclasses.replace(Config(), state_dir=BASE)
+        self.r = self.w.refresher(self.cfg)
+
+    def warm(self, network=True):
+        return self.r.refresh(self.p, [self.p], network=network, warm=True)
+
+    def pre(self):
+        return self.r.refresh(self.p, [self.p], network=False)
+
+    def state(self, rec):
+        return rec["state"], rec["reason"]
+
+    def advance(self, s):
+        self.w.mono_v += s
+
+
+class TestWarmUp(WarmCase):
+    def test_pre_call_never_runs(self):
+        rec = self.pre()
+        self.assertEqual(self.state(rec), ("skipped", "live_session"))
+        self.assertEqual(self.w.runs, [])
+
+    def test_network_refresh_without_warm_never_runs(self):
+        rec = self.r.refresh(self.p, [self.p])
+        self.assertEqual(self.state(rec), ("skipped", "live_session"))
+        self.assertEqual(self.w.runs, [])
+
+    def test_warm_without_network_never_runs(self):
+        self.assertEqual(self.state(self.warm(network=False)), ("skipped", "live_session"))
+        self.assertEqual(self.w.runs, [])
+
+    def test_step_a_success(self):
+        self.w.run_effects = [moved()]
+        rec = self.warm()
+        self.assertEqual(self.state(rec), ("refreshed", "claude_code_warmup"))
+        self.assertEqual(rec["last_refreshed_at"], T0.isoformat())
+        self.assertEqual(len(self.w.runs), 1)
+        run = self.w.runs[0]
+        self.assertEqual(run["argv"], STEP_A)
+        self.assertEqual(run["cwd"], BASE)
+        self.assertEqual(run["timeout"], 60.0)
+        self.assertNotIn("post", self.w.kinds())
+        self.assertNotIn("write", self.w.kinds())
+        self.assertNotIn("cc_lock", self.w.kinds())
+
+    def test_env_is_whitelist_plus_config_dir(self):
+        self.w.run_effects = [("exited", None), ("exited", None)]
+        self.warm()
+        for run in self.w.runs:
+            self.assertEqual(run["env"], {"HOME": "/Users/u", "PATH": "/usr/bin:/bin", "USER": "u",
+                                          "LANG": "ko_KR.UTF-8", "TMPDIR": "/var/t/",
+                                          "CLAUDE_CONFIG_DIR": self.p.home})
+            self.assertFalse([k for k in run["env"] if k == "CLAUDECODE" or k.startswith("CLAUDE_CODE_")])
+
+    def test_env_missing_keys_left_out(self):
+        self.w.env_base = {"PATH": "/usr/bin", "CLAUDECODE": "1"}
+        self.w.run_effects = [moved()]
+        self.warm()
+        self.assertEqual(self.w.runs[0]["env"], {"PATH": "/usr/bin", "CLAUDE_CONFIG_DIR": self.p.home})
+
+    def test_step_b_after_a_did_not_refresh(self):
+        self.w.run_effects = [("exited", None), moved()]
+        rec = self.warm()
+        self.assertEqual(self.state(rec), ("refreshed", "claude_code_request"))
+        self.assertEqual([r["argv"] for r in self.w.runs], [STEP_A, STEP_B])
+        b = self.w.runs[1]["argv"]
+        self.assertEqual(b[1:3], ["-p", "Reply with OK"])  # the prompt is never a flag's value
+        self.assertNotIn("--tools", b)
+        self.assertEqual(self.w.runs[1]["cwd"], BASE)
+        self.assertEqual(self.w.runs[1]["timeout"], 60.0)
+
+    def test_b_not_run_when_a_refreshed(self):
+        self.w.run_effects = [moved(), moved(expires=LATER + 1)]
+        self.warm()
+        self.assertEqual(len(self.w.runs), 1)
+
+    def test_both_fail(self):
+        self.w.run_effects = [("timeout", None), ("exited", None)]
+        with self.assertLogs("rotator.refresh", "INFO") as cm:
+            rec = self.warm()
+        self.assertEqual(self.state(rec), ("failed", "warmup_failed"))
+        self.assertIsNone(rec["last_refreshed_at"])
+        self.assertEqual(len(self.w.runs), 2)
+        line = [l for l in cm.output if "event=token_refresh " in l][-1]
+        self.assertIn("reason=warmup_failed", line)
+        self.assertIn("step=b outcome=exited", line)
+
+    def test_request_disabled(self):
+        self.r = self.w.refresher(dataclasses.replace(self.cfg, session_token_warmup_request=False))
+        self.w.run_effects = [("timeout", None)]
+        with self.assertLogs("rotator.refresh", "INFO") as cm:
+            rec = self.warm()
+        self.assertEqual(self.state(rec), ("failed", "warmup_failed"))
+        self.assertEqual([r["argv"] for r in self.w.runs], [STEP_A])
+        self.assertIn("step=a outcome=timeout", cm.output[-1])
+
+    def test_request_disabled_a_still_succeeds(self):
+        self.r = self.w.refresher(dataclasses.replace(self.cfg, session_token_warmup_request=False))
+        self.w.run_effects = [moved()]
+        self.assertEqual(self.state(self.warm()), ("refreshed", "claude_code_warmup"))
+
+    def test_warmup_disabled(self):
+        self.r = self.w.refresher(dataclasses.replace(self.cfg, session_token_warmup=False))
+        self.assertEqual(self.state(self.warm()), ("skipped", "live_session"))
+        self.assertEqual(self.w.runs, [])
+        self.assertNotIn("find_claude", self.w.kinds())
+
+    def test_warmup_disabled_via_parse_config(self):
+        cfg = config.parse_config({"session_token_warmup": False}, state_dir=BASE)
+        self.r = self.w.refresher(cfg)
+        self.assertEqual(self.state(self.warm()), ("skipped", "live_session"))
+        self.assertEqual(self.w.runs, [])
+
+    def test_dry_run(self):
+        self.r = self.w.refresher(dataclasses.replace(self.cfg, dry_run=True))
+        self.assertEqual(self.state(self.warm()), ("skipped", "dry_run"))
+        self.assertEqual(self.w.runs, [])
+
+    def test_token_refresh_off(self):
+        self.r = self.w.refresher(dataclasses.replace(self.cfg, token_refresh=False))
+        self.assertEqual(self.state(self.warm()), ("skipped", "disabled"))
+        self.assertEqual(self.w.runs, [])
+
+    def test_fresh_token_never_runs(self):
+        self.w.items[(self.svc, ACCT)] = item(expires=T0_MS + 3_600_000)
+        self.assertEqual(self.state(self.warm()), ("not_needed", "fresh"))
+        self.assertEqual(self.w.runs, [])
+
+    def test_within_margin_runs(self):
+        self.w.items[(self.svc, ACCT)] = item(expires=T0_MS + 60_000)
+        self.w.run_effects = [moved()]
+        self.assertEqual(self.state(self.warm()), ("refreshed", "claude_code_warmup"))
+
+    def test_no_live_session_never_runs(self):
+        self.w.sessions = []
+        self.assertEqual(self.state(self.warm(network=False)), ("skipped", "deferred"))
+        self.assertEqual(self.w.runs, [])
+
+    def test_discovery_failed_never_runs(self):
+        self.w.discover_raises = RuntimeError("x")
+        self.assertEqual(self.state(self.warm()), ("skipped", "discovery_failed"))
+        self.assertEqual(self.w.runs, [])
+
+    def test_registry_only_live_session_runs_with_no_argv0(self):
+        self.w.sessions = []
+        self.w.registry = {os.path.join(self.p.home, "sessions"): ["77.json"]}
+        self.w.alive = {77}
+        self.w.run_effects = [moved()]
+        self.assertEqual(self.state(self.warm()), ("refreshed", "claude_code_warmup"))
+        self.assertEqual(self.w.argv0s_seen, [[]])
+
+    def test_argv0_of_own_sessions_only(self):
+        other = prof(ACC_B)
+        self.w.sessions = [
+            Session(pid=10, session_id="s-10", cwd="/w", status="idle", config_dir=self.p.home,
+                    argv=("/opt/cc/bin/claude",)),
+            Session(pid=11, session_id="s-11", cwd="/w", status="idle", config_dir=other.home,
+                    argv=("/elsewhere/claude",)),
+            Session(pid=12, session_id="s-12", cwd="/w", status="idle", config_dir=self.p.home, argv=())]
+        self.w.run_effects = [moved()]
+        self.r.refresh(self.p, [self.p, other], warm=True)
+        self.assertEqual(self.w.argv0s_seen, [["/opt/cc/bin/claude"]])
+
+    def test_no_binary(self):
+        self.w.claude = None
+        with self.assertLogs("rotator.refresh", "INFO") as cm:
+            rec = self.warm()
+        self.assertEqual(self.state(rec), ("failed", "warmup_failed"))
+        self.assertEqual(self.w.runs, [])
+        self.assertIn("step=find", cm.output[-1])
+
+    def test_success_only_on_forward_expiry(self):
+        cases = [
+            ("same expiry, new access token", item(access="A9", expires=T0_MS - 3_600_000)),
+            ("earlier expiry", item(access="A9", expires=T0_MS - 7_200_000)),
+            ("later expiry, empty access token", item(access="", expires=LATER)),
+            ("item gone", "<gone>"),
+            ("item unparseable", "not json"),
+            ("refresh token missing", json.dumps({"claudeAiOauth": {"accessToken": "A9", "expiresAt": LATER}})),
+        ]
+        for name, after in cases:
+            with self.subTest(name):
+                self.setUp()
+                self.r = self.w.refresher(dataclasses.replace(self.cfg, session_token_warmup_request=False))
+                self.w.run_effects = [("exited", after)]
+                self.assertEqual(self.state(self.warm()), ("failed", "warmup_failed"))
+
+    def test_success_needs_no_exit_code(self):
+        self.w.run_effects = [("timeout", item(access="A9", expires=LATER))]
+        self.assertEqual(self.state(self.warm()), ("refreshed", "claude_code_warmup"))
+
+    def test_min_interval_after_success(self):
+        self.w.run_effects = [moved()]
+        self.warm()
+        self.w.items[(self.svc, ACCT)] = item()  # expired again (e.g. a server-side revoke)
+        self.advance(599)
+        reads = self.w.kinds().count("read")
+        self.warm()
+        self.assertEqual(len(self.w.runs), 1)
+        self.assertEqual(self.w.kinds().count("read"), reads)  # the wait is decided before any Keychain read
+        self.advance(1)
+        self.w.run_effects = [moved()]
+        self.assertEqual(self.state(self.warm()), ("refreshed", "claude_code_warmup"))
+        self.assertEqual(len(self.w.runs), 2)
+
+    def test_backoff_schedule(self):
+        r = self.r
+        for expect in (1200, 2400, 4800, 9600, 19200, 21600, 21600):
+            self.w.run_effects = [("exited", None), ("exited", None)]
+            n = len(self.w.runs)
+            self.warm()
+            self.assertEqual(len(self.w.runs), n + 2)
+            st = r._states[ACC_A]
+            self.assertEqual(st.warm_until - self.w.mono_v, expect)
+            self.advance(expect - 1)
+            self.warm()
+            self.assertEqual(len(self.w.runs), n + 2)
+            self.advance(1)
+
+    def test_success_resets_backoff(self):
+        self.w.run_effects = [("exited", None), ("exited", None)]
+        self.warm()
+        self.advance(1200)
+        self.w.run_effects = [moved()]
+        self.warm()
+        self.assertEqual(self.r._states[ACC_A].warm_until - self.w.mono_v, 600)
+        self.w.items[(self.svc, ACCT)] = item()
+        self.advance(600)
+        self.w.run_effects = [("exited", None), ("exited", None)]
+        self.warm()
+        self.assertEqual(self.r._states[ACC_A].warm_until - self.w.mono_v, 1200)
+
+    def test_pre_call_keeps_failure_visible_during_backoff(self):
+        self.w.run_effects = [("exited", None), ("exited", None)]
+        self.warm()
+        self.advance(100)
+        self.assertEqual(self.state(self.pre()), ("failed", "warmup_failed"))
+        self.advance(1100)
+        self.assertEqual(self.state(self.pre()), ("skipped", "live_session"))
+
+    def test_run_raising_still_waits(self):
+        self.w.run_effects = [OSError("spawn")]
+        with self.assertLogs("rotator.refresh", "ERROR"):
+            rec = self.warm()
+        self.assertEqual(self.state(rec), ("failed", "internal_error"))
+        self.advance(599)
+        self.warm()
+        self.assertEqual(len(self.w.runs), 1)
+
+    def test_no_secret_in_logs_or_record(self):
+        self.w.items[(self.svc, ACCT)] = item(access=SECRET_A, refresh_=SECRET_R)
+        self.w.run_effects = [("exited", item(access="NEW-" + SECRET_A, refresh_="NEW-" + SECRET_R,
+                                              expires=LATER))]
+        with self.assertLogs("rotator.refresh", "INFO") as cm:
+            rec = self.warm()
+        text = json.dumps(rec) + "\n".join(cm.output) + repr(self.w.runs)
+        for needle in (SECRET_A, SECRET_R, "sk-should-not-pass"):
+            self.assertNotIn(needle, text)
+
+
+class TestWarmUpReal(TripwireCase):
+    """The real seams, over a fake Popen / file system."""
+
+    def test_warmup_env(self):
+        env = refresh.warmup_env(BASE_ENV, "/p/h")
+        self.assertEqual(env, {"HOME": "/Users/u", "PATH": "/usr/bin:/bin", "USER": "u", "LANG": "ko_KR.UTF-8",
+                               "TMPDIR": "/var/t/", "CLAUDE_CONFIG_DIR": "/p/h"})
+
+    def test_warmup_env_empty_and_non_str(self):
+        self.assertEqual(refresh.warmup_env({}, "/p/h"), {"CLAUDE_CONFIG_DIR": "/p/h"})
+        self.assertEqual(refresh.warmup_env({"PATH": None, "HOME": 3}, "/p/h"), {"CLAUDE_CONFIG_DIR": "/p/h"})
+
+    def find(self, argv0s, execs, nvm=()):
+        return refresh.find_claude_binary(argv0s, is_exec=lambda p: p in execs, glob=lambda pat: list(nvm),
+                                          home="/Users/u")
+
+    def test_find_absolute_argv0(self):
+        self.assertEqual(self.find(["/a/bin/claude"], {"/a/bin/claude"}), "/a/bin/claude")
+        self.assertEqual(self.find(["/a/claude.exe"], {"/a/claude.exe"}), "/a/claude.exe")
+
+    def test_find_skips_bad_argv0(self):
+        nvm = ["/Users/u/.nvm/versions/node/v24.8.0/bin/claude"]
+        execs = {"/a/bin/node", "claude", "/a/bin/claude"} | set(nvm)
+        self.assertEqual(self.find(["claude", "/a/bin/node", "/b/bin/claude", "", None], execs, nvm), nvm[0])
+
+    def test_find_nvm_newest_executable(self):
+        root = "/Users/u/.nvm/versions/node/"
+        nvm = [root + "v9.11.2/bin/claude", root + "v24.8.0/bin/claude", root + "v24.10.0/bin/claude",
+               root + "weird/bin/claude", root + "v22.1.0/bin/claude"]
+        self.assertEqual(self.find([], set(nvm), nvm), root + "v24.10.0/bin/claude")
+        self.assertEqual(self.find([], set(nvm) - {root + "v24.10.0/bin/claude"}, nvm), root + "v24.8.0/bin/claude")
+        self.assertEqual(self.find([], {root + "weird/bin/claude"}, nvm), root + "weird/bin/claude")
+
+    def test_find_glob_pattern(self):
+        seen = []
+        refresh.find_claude_binary([], is_exec=lambda p: False, glob=lambda pat: seen.append(pat) or [],
+                                   home="/Users/u")
+        self.assertEqual(seen, ["/Users/u/.nvm/versions/node/*/bin/claude"])
+
+    def test_find_none(self):
+        self.assertIsNone(self.find([], set()))
+        self.assertIsNone(self.find(["/x/claude"], set(), ["/Users/u/.nvm/versions/node/v1.0.0/bin/claude"]))
+
+    def test_is_exec_file(self):
+        os.makedirs(BASE, exist_ok=True)
+        path = os.path.join(BASE, "fake-claude")
+        with open(path, "w") as f:
+            f.write("")
+        self.addCleanup(os.unlink, path)
+        os.chmod(path, 0o644)
+        self.assertFalse(refresh._is_exec_file(path))
+        os.chmod(path, 0o755)
+        self.assertTrue(refresh._is_exec_file(path))
+        self.assertFalse(refresh._is_exec_file(BASE))
+        self.assertFalse(refresh._is_exec_file(os.path.join(BASE, "missing")))
+
+    def popen(self, wait_effects, raises=None):
+        made = []
+
+        class P:
+            pid = 4242
+
+            def __init__(self, argv, **kw):
+                if raises is not None:
+                    raise raises
+                made.append((argv, kw))
+                self.waits = []
+
+            def wait(self, timeout=None):
+                self.waits.append(timeout)
+                eff = wait_effects.pop(0)
+                if isinstance(eff, BaseException):
+                    raise eff
+                return eff
+        return P, made
+
+    def test_run_exited(self):
+        P, made = self.popen([0])
+        kills = []
+        out = refresh.run_claude_quiet(["/c", "-p"], {"PATH": "/x"}, "/s", 60.0, popen=P,
+                                       killpg=lambda *a: kills.append(a))
+        self.assertEqual(out, "exited")
+        argv, kw = made[0]
+        self.assertEqual(argv, ["/c", "-p"])
+        self.assertEqual(kw["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kw["stdout"], subprocess.DEVNULL)
+        self.assertEqual(kw["stderr"], subprocess.DEVNULL)
+        self.assertEqual(kw["env"], {"PATH": "/x"})
+        self.assertEqual(kw["cwd"], "/s")
+        self.assertIs(kw["start_new_session"], True)
+        self.assertIs(kw["close_fds"], True)
+        self.assertEqual(kills, [])
+
+    def test_run_nonzero_exit_is_exited(self):
+        P, _ = self.popen([1])
+        self.assertEqual(refresh.run_claude_quiet(["/c"], {}, "/s", 60.0, popen=P, killpg=lambda *a: None),
+                         "exited")
+
+    def test_run_timeout_kills_group(self):
+        P, made = self.popen([subprocess.TimeoutExpired("/c", 60), -9])
+        kills = []
+        out = refresh.run_claude_quiet(["/c"], {}, "/s", 60.0, popen=P, killpg=lambda *a: kills.append(a))
+        self.assertEqual(out, "timeout")
+        import signal
+        self.assertEqual(kills, [(4242, signal.SIGKILL)])
+
+    def test_run_timeout_kill_failure_still_reaps(self):
+        P, _ = self.popen([subprocess.TimeoutExpired("/c", 60), -9])
+
+        def killpg(*a):
+            raise ProcessLookupError()
+        self.assertEqual(refresh.run_claude_quiet(["/c"], {}, "/s", 60.0, popen=P, killpg=killpg), "timeout")
+
+    def test_run_spawn_error(self):
+        P, _ = self.popen([], raises=FileNotFoundError("/c"))
+        self.assertEqual(refresh.run_claude_quiet(["/c"], {}, "/s", 60.0, popen=P, killpg=lambda *a: None),
+                         "error")
+
+    def test_run_real_process_output_discarded(self):
+        # A real child that writes to stdout/stderr: nothing reaches this process's streams.
+        script = os.path.join(BASE, "noisy.sh")
+        os.makedirs(BASE, exist_ok=True)
+        with open(script, "w") as f:
+            f.write("#!/bin/sh\necho SECRET-OUT\necho SECRET-ERR 1>&2\nexit 3\n")
+        os.chmod(script, 0o755)
+        self.addCleanup(os.unlink, script)
+        # Capture at the file-descriptor level: an inherited fd 1/2 would land in the capture file.
+        cap = os.path.join(BASE, "noisy.out")
+        self.addCleanup(lambda: os.path.exists(cap) and os.unlink(cap))
+        saved = [os.dup(1), os.dup(2)]
+        fd = os.open(cap, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+            res = refresh.run_claude_quiet([script], {"PATH": "/usr/bin:/bin"}, BASE, 10.0)
+        finally:
+            os.dup2(saved[0], 1)
+            os.dup2(saved[1], 2)
+            for f in saved + [fd]:
+                os.close(f)
+        self.assertEqual(res, "exited")
+        with open(cap) as f:
+            self.assertEqual(f.read(), "")
+        # control: the same capture does see a child that inherits the descriptors
+        fd = os.open(cap, os.O_WRONLY | os.O_TRUNC)
+        subprocess.Popen([script], stdout=fd, stderr=fd).wait()
+        os.close(fd)
+        with open(cap) as f:
+            self.assertIn("SECRET-OUT", f.read())
+
+    def test_run_real_timeout(self):
+        script = os.path.join(BASE, "sleepy.sh")
+        os.makedirs(BASE, exist_ok=True)
+        with open(script, "w") as f:
+            f.write("#!/bin/sh\nsleep 30\n")
+        os.chmod(script, 0o755)
+        self.addCleanup(os.unlink, script)
+        t = time.monotonic()
+        self.assertEqual(refresh.run_claude_quiet([script], {"PATH": "/usr/bin:/bin"}, BASE, 0.5), "timeout")
+        self.assertLess(time.monotonic() - t, 10)
 
 
 if __name__ == "__main__":

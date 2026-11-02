@@ -222,6 +222,34 @@ successful refresh the next poll fetches that account's live usage.
 
 **How to disable.** Set `"token_refresh": false` in `config.json`; every account then shows "자동 갱신 꺼짐".
 
+**Session warm-up (accounts with a live session).** The rotator never refreshes an account that has a live
+Claude session itself — Claude Code owns the token then — but an idle session only refreshes on its next
+request, so until then the account shows only its cached usage. For such an account (token expired or within 5
+minutes of expiry, at least one live session on it) the daemon lets Claude Code refresh the token its own way
+(its own lock and re-read protocol, the same thing that happens when a second session opens on the account); the
+rotator writes nothing to the Keychain:
+
+- **Step A (no model request).** It starts the Claude Code binary the account's sessions run (an absolute
+  `argv[0]` of a live session, else the newest `~/.nvm/versions/node/v*/bin/claude`) as
+  `claude -p --no-session-persistence` with empty stdin and no prompt. Claude Code refreshes the token while it
+  starts and then exits because there is no input — Step A sends no model request and writes no transcript
+  (measured on Claude Code 2.1.296).
+- **Step B (a tiny request).** Only if Step A did not refresh and `session_token_warmup_request` is true:
+  `claude -p "Reply with OK" --model haiku --no-session-persistence`. This sends one short request to haiku and
+  so may spend a tiny amount of that account's usage.
+- Both run in the rotator state dir with only `HOME`, `PATH`, `USER`, `LANG`, `TMPDIR` and
+  `CLAUDE_CONFIG_DIR=<the account's home>` in the environment (no `CLAUDECODE` / `CLAUDE_CODE_*` session
+  variables), their output discarded (it can contain the account's e-mail), each killed after 60 s.
+- Success is judged only by the Keychain item's `expiresAt` moving forward with an access token present:
+  `refreshed` / `claude_code_warmup` (Step A) or `claude_code_request` (Step B); otherwise `failed` /
+  `warmup_failed` ("세션 계정 갱신 실패"). The next poll then fetches that account's live usage.
+- Daemon only (never a CLI command), never in dry-run, at most one warm-up per tick and only when no idle-account
+  refresh is due that tick, not for an account in a switch in flight, at most once per 10 min per account; after
+  a failure it backs off 20 min doubling to 6 h. A daemon restart forgets the back-off.
+
+To turn it off set `"session_token_warmup": false` (or only Step B: `"session_token_warmup_request": false`);
+`"token_refresh": false` turns it off too.
+
 **Safety rules.**
 
 - Locks: the rotator's own `locks/r-*.lock` (so two rotator processes never refresh one account) plus Claude
@@ -272,7 +300,7 @@ in the JSON — with the daemon off an expired account reads `갱신 필요`):
 | `plaintext_store` | 갱신 불가 | the profile keeps a plaintext `.credentials.json` |
 | `keychain_item_unclear` | 갱신 불가 | the item was not found under Claude Code's account name |
 | `payload_too_large` | 갱신 불가 | the write line would exceed 4032 characters |
-| `live_session` | 세션이 갱신 | a Claude session runs on the account (Claude Code refreshes it) |
+| `live_session` | 세션이 갱신 | a Claude session runs on the account (Claude Code refreshes it; see "Session warm-up") |
 | `discovery_failed` | 세션 확인 실패 | sessions could not be listed, so nothing is refreshed |
 | `deferred` | 갱신 대기 | waiting for its turn (one network refresh per tick) |
 | `locked` | 갱신 중 | another rotator process holds the account's lock |
@@ -291,6 +319,10 @@ in the JSON — with the daemon off an expired account reads `갱신 필요`):
 | `write_failed` | 키체인 저장 실패 | the new tokens are held in memory, write retried |
 | `conflict` | 갱신 충돌 | the item holds another refresh token; the new set was dropped |
 | `internal_error` | 갱신 실패 | an unexpected error; backed off |
+| `warmup_failed` | 세션 계정 갱신 실패 | the session warm-up did not move `expiresAt`; backed off (20 min doubling to 6 h) |
+
+`refreshed` records of a session warm-up carry the reason `claude_code_warmup` (Step A) or
+`claude_code_request` (Step B).
 
 **Version note.** Every statement about Claude Code and Orca above was measured on Claude Code 2.1.296 and Orca
 1.4.241 (request, scopes, Keychain item and write, lock protocol, stored JSON shape); re-verify after either
@@ -350,6 +382,8 @@ starts with the key.
 | `auto_switch` | `true` | `true` / `false` |
 | `pointer_correction` | `true` | `true` / `false` |
 | `token_refresh` | `true` | `true` / `false`; `false` turns idle-account token refresh off (see "Idle-account token refresh") |
+| `session_token_warmup` | `true` | `true` / `false`; `false` turns the session warm-up off (see "Session warm-up") |
+| `session_token_warmup_request` | `true` | `true` / `false`; `false` keeps the warm-up to Step A (no model request) |
 | `profiles_root` | `~/Library/Application Support/orca/claude-profiles` | absolute path (`~` expanded) |
 
 Numbers must be finite and not `true`/`false`.
@@ -441,6 +475,14 @@ Numbers must be finite and not `true`/`false`.
     `Python-urllib` agent; the refresh POST therefore sends `User-Agent: claude-account-rotator/0.1`. If the edge
     blocks that agent too, refreshes end as `server_error` with `status=403 error=-` in `rotator.log` and are
     retried after a back-off rather than stopped.
+22. The session warm-up runs inside the daemon tick: one warm-up can hold the tick for up to 2 × 60 s (Step A
+    and Step B both timing out), delaying that tick's snapshot and the next switch decisions. A launchd stop
+    during a warm-up can leave its Claude Code child running until it exits by itself.
+23. The warm-up starts a real headless Claude Code with the account's home as `CLAUDE_CONFIG_DIR`, so that
+    home's hooks, plugins and MCP servers configured to start with a session may start too (Step B is a full
+    `-p` run). That Step A refreshes before validating its input, and sends no model request, was measured on
+    Claude Code 2.1.296 and is not guaranteed by later builds. A session whose `argv[0]` is a bare `claude`
+    gives no path, so the nvm fallback may pick a different Claude Code version than the session runs.
 
 ## License
 

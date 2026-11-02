@@ -5,13 +5,16 @@ redacting slot classes below; nothing here logs, raises or returns a token.
 """
 from __future__ import annotations
 
+import glob as _glob
 import hashlib
 import json
 import logging
 import math
 import os
 import re
+import signal
 import socket
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -44,6 +47,15 @@ BACKOFF_MAX_S = 3600.0
 FLUSH_BACKOFF_START_S = 30.0
 FLUSH_BACKOFF_MAX_S = 600.0
 CC_LOCK_STALE_S = 60.0
+# Session warm-up: Claude Code refreshes its own OAuth token while it starts, before it validates its input.
+WARMUP_TIMEOUT_S = 60.0
+WARMUP_INTERVAL_S = 600.0
+WARMUP_BACKOFF_MAX_S = 21600.0
+WARMUP_PROMPT = "Reply with OK"
+WARMUP_MODEL = "haiku"
+_WARMUP_ENV_KEYS = ("HOME", "PATH", "USER", "LANG", "TMPDIR")
+_WARMUP_OUTCOMES = frozenset({"exited", "timeout", "error"})
+_CLAUDE_NAMES = frozenset({"claude", "claude.exe"})
 ERROR_BODY_MAX = 65_536
 _LOGGABLE_OAUTH_ERROR = re.compile(r"[a-z0-9_]{1,64}")
 REFRESH_STATES = ("not_needed", "skipped", "refreshed", "failed", "stopped")
@@ -52,7 +64,8 @@ REFRESH_REASONS = frozenset({
     "plaintext_store", "live_session", "discovery_failed", "keychain_item_unclear", "payload_too_large", "deferred",
     "locked", "cc_lock_busy", "cc_lock_stale", "changed_under_lock", "keychain_write_unavailable", "invalid_grant",
     "invalid_scope", "rejected", "malformed_response", "outcome_unknown", "network_error", "server_error",
-    "rate_limited", "write_failed", "conflict", "internal_error",
+    "rate_limited", "write_failed", "conflict", "internal_error", "claude_code_warmup", "claude_code_request",
+    "warmup_failed",
 })
 DAEMON_OFF_RECORD = {"state": "skipped", "reason": "daemon_off", "at": None, "last_refreshed_at": None}
 
@@ -332,11 +345,13 @@ def _http_detail(status: int, err: Optional[str]) -> str:
 class _State:
     """Per-account in-memory refresh state (never persisted)."""
 
-    __slots__ = ("until", "step_s", "stop_fp", "record", "held", "last_ok_at")
+    __slots__ = ("until", "step_s", "stop_fp", "record", "held", "last_ok_at", "warm_until", "warm_step_s")
 
     def __init__(self) -> None:
         self.until = 0.0
         self.step_s = 0.0
+        self.warm_until = 0.0
+        self.warm_step_s = 0.0
         self.stop_fp: Optional[bytes] = None
         self.record: Optional[dict] = None
         self.held: Any = None
@@ -373,7 +388,10 @@ class Refresher:
                  discover: Callable[[Sequence[str]], Sequence[Any]], list_dir: Callable[[str], Sequence[str]],
                  pid_alive: Callable[[int], bool], exists: Callable[[str], bool], lock: Callable[[str], Any],
                  cc_lock: Callable[[str], Tuple[Optional[Any], Optional[str]]], now: Callable[[], datetime],
-                 monotonic: Callable[[], float], sleep: Callable[[float], None], log: logging.Logger) -> None:
+                 monotonic: Callable[[], float], sleep: Callable[[float], None], log: logging.Logger,
+                 find_claude: Callable[[Sequence[str]], Optional[str]],
+                 run_claude: Callable[[Sequence[str], Mapping[str, str], str, float], str],
+                 environ: Callable[[], Mapping[str, str]]) -> None:
         self._cfg = cfg
         self._read_item = read_item
         self._item_exists = item_exists
@@ -390,6 +408,9 @@ class Refresher:
         self._monotonic = monotonic
         self._sleep = sleep
         self._log = log
+        self._find_claude = find_claude
+        self._run_claude = run_claude
+        self._environ = environ
         self._states: Dict[str, _State] = {}
 
     def __repr__(self) -> str:
@@ -425,16 +446,24 @@ class Refresher:
         st.step_s = step
         st.until = self._monotonic() + step
 
-    def _live(self, profile: Profile, profiles: Sequence[Profile]) -> Optional[str]:
-        """"live_session" / "discovery_failed" when the account may be in use, None when certainly idle."""
+    def _live(self, profile: Profile, profiles: Sequence[Profile],
+              argv0s: Optional[List[str]] = None) -> Optional[str]:
+        """"live_session" / "discovery_failed" when the account may be in use, None when certainly idle.
+
+        ``argv0s`` (when given) collects argv[0] of every discovered session on the account."""
         try:
             found = self._discover(sessions.session_homes(profiles))
         except Exception:
             return "discovery_failed"
+        live = False
         for s in found:
             p = accounts.profile_for_config_dir(profiles, s.config_dir)
             if p is not None and p.account_id == profile.account_id:
-                return "live_session"
+                live = True
+                if argv0s is not None and s.argv and s.argv[0]:
+                    argv0s.append(s.argv[0])
+        if live:
+            return "live_session"
         # A session that registered but is not yet discoverable still owns its pid file.
         try:
             names = self._list_dir(os.path.join(profile.home, "sessions"))
@@ -448,13 +477,17 @@ class Refresher:
                 return "live_session"
         return None
 
-    def refresh(self, profile: Profile, profiles: Sequence[Profile], *, network: bool = True) -> dict:
-        """Gate, then (when ``network``) refresh one account; always returns a new 4-key record."""
+    def refresh(self, profile: Profile, profiles: Sequence[Profile], *, network: bool = True,
+                warm: bool = False) -> dict:
+        """Gate, then (when ``network``) refresh one account; always returns a new 4-key record.
+
+        ``warm`` with ``network`` lets Claude Code itself refresh an account that has a live session (the case
+        that is otherwise skipped/live_session) — see _warm_up."""
         aid = profile.account_id
         st = self._state(aid)
         kind = None
         try:
-            return self._refresh(profile, profiles, st, network)
+            return self._refresh(profile, profiles, st, network, warm)
         except Exception as e:
             # Assign only: the exception (which may quote a secret) is never chained or logged.
             kind = type(e).__name__
@@ -462,7 +495,8 @@ class Refresher:
         self._backoff(st)
         return self._record(aid, st, "failed", "internal_error")
 
-    def _refresh(self, profile: Profile, profiles: Sequence[Profile], st: _State, network: bool) -> dict:
+    def _refresh(self, profile: Profile, profiles: Sequence[Profile], st: _State, network: bool,
+                 warm: bool = False) -> dict:
         aid, svc = profile.account_id, profile.keychain_service
         # A held set is a restore of tokens the server already issued, so it ignores
         # the switch, dry-run and live-session checks below.
@@ -475,6 +509,8 @@ class Refresher:
         if self._cfg.dry_run:
             return self._record(aid, st, "skipped", "dry_run")
         if st.record is not None and self._monotonic() < st.until:
+            return self._previous(st)
+        if warm and st.record is not None and self._monotonic() < st.warm_until:
             return self._previous(st)
         acct = self._account_name()
         raw = self._read_item(svc, acct)
@@ -496,14 +532,68 @@ class Refresher:
             return self._record(aid, st, "skipped", "no_refresh_token")
         if self._exists(os.path.join(profile.home, ".credentials.json")):
             return self._record(aid, st, "skipped", "plaintext_store")
-        why = self._live(profile, profiles)
+        argv0s: List[str] = []
+        why = self._live(profile, profiles, argv0s)
         if why is not None:
+            if why == "live_session" and self._cfg.session_token_warmup:
+                if self._monotonic() < st.warm_until:
+                    if st.record is not None and st.record["reason"] == "warmup_failed":
+                        return self._previous(st)
+                elif warm and network:
+                    return self._warm_up(profile, st, svc, acct, oauth["expiresAt"], argv0s)
             return self._record(aid, st, "skipped", why)
         if len(accounts.security_add_line(svc, acct, raw)) + PAYLOAD_MARGIN_CHARS > accounts.SECURITY_STDIN_MAX:
             return self._record(aid, st, "skipped", "payload_too_large")
         if not network:
             return self._record(aid, st, "skipped", "deferred")
         return self._section(profile, profiles, st, acct, raw, oauth)
+
+    def _warm_up(self, profile: Profile, st: _State, svc: str, acct: str, old_expires_at: float,
+                 argv0s: Sequence[str]) -> dict:
+        """Start Claude Code on the account (its start-up refreshes the token under Claude Code's own lock and
+        re-read protocol, so the rotator writes nothing); if that did not move ``expiresAt``, optionally send
+        one tiny request. Success is judged only by a forward-moving ``expiresAt`` in the Keychain item."""
+        aid = profile.account_id
+        # Set before spawning, so an exception below cannot turn into a spawn on every tick.
+        st.warm_until = self._monotonic() + WARMUP_INTERVAL_S
+        claude = self._find_claude(argv0s)
+        if claude is None:
+            return self._warm_failed(aid, st, "step=find")
+        env = warmup_env(self._environ(), profile.home)
+        cwd = self._cfg.state_dir
+        outcome = self._run_claude([claude, "-p", "--no-session-persistence"], env, cwd, WARMUP_TIMEOUT_S)
+        if self._expiry_moved(svc, acct, old_expires_at):
+            return self._warm_ok(aid, st, "claude_code_warmup")
+        step = "a"
+        if self._cfg.session_token_warmup_request:
+            # The prompt sits right after -p: a variadic flag before it (e.g. --tools) would swallow it.
+            outcome = self._run_claude([claude, "-p", WARMUP_PROMPT, "--model", WARMUP_MODEL,
+                                        "--no-session-persistence"], env, cwd, WARMUP_TIMEOUT_S)
+            if self._expiry_moved(svc, acct, old_expires_at):
+                return self._warm_ok(aid, st, "claude_code_request")
+            step = "b"
+        return self._warm_failed(aid, st, "step=%s outcome=%s"
+                                 % (step, outcome if outcome in _WARMUP_OUTCOMES else "?"))
+
+    def _expiry_moved(self, svc: str, acct: str, old_expires_at: float) -> bool:
+        raw = self._read_item(svc, acct)
+        parsed = _parse_item(raw) if raw is not None else None
+        if parsed is None:
+            return False
+        oauth = parsed[1]
+        return oauth["expiresAt"] > old_expires_at and oauth["accessToken"] != ""
+
+    def _warm_ok(self, aid: str, st: _State, reason: str) -> dict:
+        st.warm_step_s = 0.0
+        st.warm_until = self._monotonic() + WARMUP_INTERVAL_S
+        st.last_ok_at = _iso(self._now())
+        return self._record(aid, st, "refreshed", reason)
+
+    def _warm_failed(self, aid: str, st: _State, detail: str) -> dict:
+        step = 2 * WARMUP_INTERVAL_S if st.warm_step_s <= 0 else min(st.warm_step_s * 2, WARMUP_BACKOFF_MAX_S)
+        st.warm_step_s = step
+        st.warm_until = self._monotonic() + step
+        return self._record(aid, st, "failed", "warmup_failed", detail)
 
     def _section(self, profile: Profile, profiles: Sequence[Profile], st: _State, acct: str, raw: str,
                  oauth: dict) -> dict:
@@ -746,3 +836,67 @@ class Refresher:
         now = self._monotonic()
         return sorted(aid for aid, st in self._states.items()
                       if st.held is not None and (not due_only or now >= st.held.flush_until))
+
+
+# --- session warm-up seams --------------------------------------------------------------------------------
+
+
+def warmup_env(base: Mapping[str, Any], home: str) -> Dict[str, str]:
+    """A whitelist of ``base`` plus CLAUDE_CONFIG_DIR; it never carries CLAUDECODE or CLAUDE_CODE_* (a daemon
+    started from a Claude session would otherwise make the child think it is nested) or anything else."""
+    env = {k: base[k] for k in _WARMUP_ENV_KEYS if isinstance(base.get(k), str)}
+    env["CLAUDE_CONFIG_DIR"] = home
+    return env
+
+
+def _is_exec_file(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+_NODE_DIR_RE = re.compile(r"v([0-9]+)\.([0-9]+)\.([0-9]+)")
+
+
+def _node_version_key(path: str) -> Tuple[int, Tuple[int, ...]]:
+    m = _NODE_DIR_RE.fullmatch(os.path.basename(os.path.dirname(os.path.dirname(path))))
+    return (1, tuple(int(x) for x in m.groups())) if m else (0, ())
+
+
+def find_claude_binary(argv0s: Sequence[Any], *, is_exec: Callable[[str], bool] = _is_exec_file,
+                       glob: Callable[[str], Sequence[str]] = _glob.glob, home: Optional[str] = None) -> Optional[str]:
+    """The Claude Code binary a live session runs (an absolute argv[0] named claude/claude.exe), else the
+    newest ``~/.nvm/versions/node/v*/bin/claude``; only executable files; None when there is none."""
+    for a in argv0s:
+        if isinstance(a, str) and os.path.isabs(a) and os.path.basename(a) in _CLAUDE_NAMES and is_exec(a):
+            return a
+    root = home if home is not None else os.path.expanduser("~")
+    for p in sorted(glob(os.path.join(root, ".nvm", "versions", "node", "*", "bin", "claude")),
+                    key=_node_version_key, reverse=True):
+        if is_exec(p):
+            return p
+    return None
+
+
+def run_claude_quiet(argv: Sequence[str], env: Mapping[str, str], cwd: str, timeout: float, *,
+                     popen: Callable[..., Any] = subprocess.Popen,
+                     killpg: Callable[[int, int], None] = os.killpg) -> str:
+    """Run ``argv`` with empty stdin and its output discarded (it can name the account's e-mail); kill its
+    whole process group on timeout. Returns "exited" (any exit code), "timeout" or "error" (could not start)."""
+    try:
+        proc = popen(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     env=dict(env), cwd=cwd, close_fds=True, start_new_session=True)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return "error"
+    try:
+        proc.wait(timeout=timeout)
+        return "exited"
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        pass
+    return "timeout"

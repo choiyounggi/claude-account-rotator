@@ -112,6 +112,17 @@ class TestConfigDefaults(unittest.TestCase):
     def test_token_refresh_false(self):
         self.assertIs(load('{"token_refresh": false}').token_refresh, False)
 
+    def test_session_token_warmup_defaults(self):
+        for cfg in (Config(), load("{}")):
+            self.assertIs(cfg.session_token_warmup, True)
+            self.assertIs(cfg.session_token_warmup_request, True)
+
+    def test_session_token_warmup_false(self):
+        cfg = load('{"session_token_warmup": false, "session_token_warmup_request": false}')
+        self.assertIs(cfg.session_token_warmup, False)
+        self.assertIs(cfg.session_token_warmup_request, False)
+        self.assertIs(load('{"session_token_warmup_request": false}').session_token_warmup, True)
+
     def test_policy_config_carries_overrides(self):
         cfg = load('{"cooldown_s": 60, "stale_max_age_s": 120}')
         pc = cfg.policy_config()
@@ -139,6 +150,9 @@ class TestConfigValidation(unittest.TestCase):
         ('{"dry_run": 1}', "dry_run"),
         ('{"token_refresh": "no"}', "token_refresh"),
         ('{"token_refresh": 1}', "token_refresh"),
+        ('{"session_token_warmup": "yes"}', "session_token_warmup"),
+        ('{"session_token_warmup": 0}', "session_token_warmup"),
+        ('{"session_token_warmup_request": null}', "session_token_warmup_request"),
         ('{"profiles_root": "rel/x"}', "profiles_root"),
         ('{"continue_prompt": "a\\tb"}', "continue_prompt"),
     ]
@@ -3371,7 +3385,8 @@ class TestStatusRefresh(StatusBase):
 
 class TestRefreshReasons(unittest.TestCase):
     def test_every_display_token_has_text(self):
-        for tok in sorted(refresh.REFRESH_REASONS - {"fresh", "ok", "write_recovered"}):
+        for tok in sorted(refresh.REFRESH_REASONS - {"fresh", "ok", "write_recovered", "claude_code_warmup",
+                                                      "claude_code_request"}):
             with self.subTest(tok=tok):
                 self.assertIn(tok, cli._REASONS)
 
@@ -3436,6 +3451,10 @@ class TestRefreshReasons(unittest.TestCase):
             # usable token: no state
             (("live", None, self.rec("skipped", "live_session"), True, (7,)), None),
             (("live", None, OFF, False, ()), None),
+            # the daemon's warm-up of a live-session account
+            (("cache", "token_expired", self.rec("failed", "warmup_failed"), True, (7,)), "세션 계정 갱신 실패"),
+            (("cache", "token_expired", self.rec("refreshed", "claude_code_warmup"), True, (7,)), "세션이 갱신"),
+            (("live", None, self.rec("refreshed", "claude_code_request"), True, (7,)), None),
             (("cache", "http_429", self.rec("not_needed", "fresh"), True, ()), None),
             (("cache", "http_429", OFF, False, ()), None),
             (("cache", None, None, True, ()), None),
@@ -3577,7 +3596,8 @@ class TestReadme(unittest.TestCase):
         for needle in ("token_refresh", "2.1.296", "1.4.241", "security -i", ".oauth_refresh.lock", "restart",
                        "invalid_grant", "dry-run", "status --watch", "re-login"):
             self.assertIn(needle, sec)
-        for tok in sorted(refresh.REFRESH_REASONS - {"fresh", "ok", "write_recovered"}):
+        for tok in sorted(refresh.REFRESH_REASONS - {"fresh", "ok", "write_recovered", "claude_code_warmup",
+                                                      "claude_code_request"}):
             self.assertIn(cli._REASONS[tok], sec, tok)
             self.assertIn("`%s`" % tok, sec, tok)
         self.assertIn("refresh", self.section("## Status JSON (schema 1)"))
@@ -3642,6 +3662,34 @@ class TestReadme(unittest.TestCase):
     def test_residual_risks_listed(self):
         section = self.section("## Known residual risks")
         self.assertGreaterEqual(len(re.findall(r"^\d+\. ", section, re.M)), 13)
+
+
+class TestReadmeWarmUp(unittest.TestCase):
+    """The session warm-up is documented where the token refresh is."""
+
+    setUpClass = classmethod(TestReadme.setUpClass.__func__)
+    section = TestReadme.section
+
+    def test_warmup_documented(self):
+        sec = self.section("## Idle-account token refresh")
+        for needle in ("session_token_warmup", "session_token_warmup_request", "Step A", "no model request",
+                       "Step B", "haiku", "--no-session-persistence", "CLAUDE_CONFIG_DIR", "10 min", "6 h",
+                       "`claude_code_warmup`", "`claude_code_request`", "`warmup_failed`", "세션 계정 갱신 실패",
+                       "never in dry-run"):
+            self.assertIn(needle, sec, needle)
+
+    def test_warmup_config_rows(self):
+        sec = self.section("## Configuration")
+        self.assertIn("| `session_token_warmup` | `true` |", sec)
+        self.assertIn("| `session_token_warmup_request` | `true` |", sec)
+
+    def test_warmup_residual_risks(self):
+        sec = self.section("## Known residual risks")
+        for needle in ("warm-up", "hooks"):
+            self.assertIn(needle, sec, needle)
+
+    def test_warmup_label(self):
+        self.assertEqual(cli._REASONS["warmup_failed"], "세션 계정 갱신 실패")
 
 
 if __name__ == "__main__":

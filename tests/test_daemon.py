@@ -177,6 +177,7 @@ class FakeEnv:
         self._logger: Optional[logging.Logger] = None
         self.refresh_calls: List[tuple] = []
         self.gate_results: Dict[str, dict] = {}
+        self.warm_results: Dict[str, dict] = {}
         self.refresh_results: Dict[str, dict] = {}
         self.held_ids: List[str] = []
         self.held_due: List[str] = []
@@ -286,9 +287,13 @@ class FakeEnv:
         def install_signals(handler):
             env.signal_handler = handler
 
-        def refresh_token(p, profiles, *, network=True):
-            env.refresh_calls.append(("refresh_token", p.account_id, network))
-            table = env.refresh_results if network else env.gate_results
+        def refresh_token(p, profiles, *, network=True, warm=False):
+            if warm:
+                env.refresh_calls.append(("warm_up", p.account_id, network))
+                table = env.warm_results
+            else:
+                env.refresh_calls.append(("refresh_token", p.account_id, network))
+                table = env.refresh_results if network else env.gate_results
             return dict(table.get(p.account_id, {"state": "not_needed", "reason": "fresh", "at": None,
                                                  "last_refreshed_at": None}))
 
@@ -2268,6 +2273,171 @@ class TestTickRefreshSkip(DispatchBase):
         self.assertEqual(self.switches(), [("switch", 101, ACC_B, "hard"), ("switch", 101, ACC_C, "hard")])
         self.assertEqual(self.seen[1], frozenset({ACC_A, ACC_B, ACC_C}))
         self.assertEqual(self.d._switch_accounts(), frozenset())
+
+
+class TestRefreshOneWarm(unittest.TestCase):
+    """refresh_one's warm-up source: idle live-session accounts, lowest priority, round-robin, one call."""
+
+    def setUp(self):
+        self.env = FakeEnv()
+        self.deps = self.env.deps()
+        self.log = self.deps.make_logger()
+        self.c = UsageCache(30.0)
+        self.profiles = [prof(ACC_A), prof(ACC_B), prof(ACC_C)]
+        for a in (ACC_A, ACC_B, ACC_C):
+            self.env.usages[a] = live(a, 20.0)
+        self.held_all: List[str] = []
+        self.held_due: List[str] = []
+        self.calls: List[tuple] = []
+        self.results: Dict[str, dict] = {}
+
+    def gate(self, recs):
+        def pre(p, profiles):
+            return dict(recs.get(p.account_id, rrec("fresh", "not_needed")))
+        self.c.refresh(self.profiles, fetch=self.deps.fetch_usage, monotonic=self.deps.monotonic,
+                       now=self.env.now_v, log=self.log, pre=pre)
+        self.env.advance(10)
+
+    def held(self, *, due_only=False):
+        return list(self.held_due if due_only else self.held_all)
+
+    def call(self, p, profiles, **kw):
+        self.calls.append((p.account_id, kw))
+        return dict(self.results.get(p.account_id, rrec("live_session")))
+
+    def one(self, warm=True, skip=frozenset()):
+        return self.c.refresh_one(self.profiles, call=self.call, held=self.held, skip=skip, warm=warm)
+
+    def test_off_by_default(self):
+        self.gate({ACC_A: rrec("live_session")})
+        self.assertIsNone(self.c.refresh_one(self.profiles, call=self.call, held=self.held))
+        self.assertIsNone(self.one(warm=False))
+        self.assertEqual(self.calls, [])
+
+    def test_live_session_picked_with_warm_flag(self):
+        self.gate({ACC_B: rrec("live_session")})
+        self.assertEqual(self.one(), ACC_B)
+        self.assertEqual(self.calls, [(ACC_B, {"warm": True})])
+
+    def test_warmup_failed_record_picked(self):
+        self.gate({ACC_A: rrec("warmup_failed", "failed")})
+        self.assertEqual(self.one(), ACC_A)
+
+    def test_other_records_not_picked(self):
+        self.gate({ACC_A: rrec("discovery_failed"), ACC_B: rrec("write_failed", "failed"),
+                   ACC_C: rrec("claude_code_warmup", "refreshed")})
+        self.assertIsNone(self.one())
+        self.assertEqual(self.calls, [])
+
+    def test_lowest_priority(self):
+        self.gate({ACC_A: rrec("live_session"), ACC_B: rrec("deferred")})
+        self.results[ACC_B] = rrec("ok", "refreshed")
+        self.assertEqual(self.one(), ACC_B)
+        self.assertEqual(self.calls, [(ACC_B, {})])
+        self.held_all = self.held_due = [ACC_C]
+        self.assertEqual(self.one(), ACC_C)
+        self.assertEqual(self.calls[-1], (ACC_C, {}))
+        self.held_all = self.held_due = []
+        self.assertEqual(self.one(), ACC_A)
+        self.assertEqual(self.calls[-1], (ACC_A, {"warm": True}))
+
+    def test_one_call_per_invocation(self):
+        self.gate({a: rrec("live_session") for a in (ACC_A, ACC_B, ACC_C)})
+        self.one()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_round_robin(self):
+        self.gate({ACC_A: rrec("live_session"), ACC_C: rrec("live_session")})
+        picks = [self.one() for _ in range(4)]
+        self.assertEqual(picks, [ACC_A, ACC_C, ACC_A, ACC_C])
+
+    def test_round_robin_after_last_pick_left(self):
+        self.gate({a: rrec("live_session") for a in (ACC_A, ACC_B, ACC_C)})
+        self.assertEqual(self.one(), ACC_A)
+        self.assertEqual(self.one(), ACC_B)
+        self.profiles = [prof(ACC_A), prof(ACC_C)]
+        self.assertEqual(self.one(), ACC_A)
+        self.assertEqual(self.one(), ACC_C)
+
+    def test_skip_excludes(self):
+        self.gate({ACC_A: rrec("live_session"), ACC_B: rrec("live_session")})
+        self.assertEqual(self.one(skip=frozenset({ACC_A})), ACC_B)
+        self.assertIsNone(self.one(skip=frozenset({ACC_A, ACC_B})))
+        self.assertEqual([c[0] for c in self.calls], [ACC_B])
+
+    def test_held_excluded(self):
+        self.gate({ACC_A: rrec("live_session")})
+        self.held_all = [ACC_A]
+        self.assertIsNone(self.one())
+        self.assertEqual(self.calls, [])
+
+    def test_result_stored_and_refreshed_marks_due(self):
+        self.gate({ACC_A: rrec("live_session")})
+        self.results[ACC_A] = rrec("claude_code_warmup", "refreshed")
+        self.c.refresh(self.profiles, fetch=self.deps.fetch_usage, monotonic=self.deps.monotonic,
+                       now=self.env.now_v, log=self.log)
+        self.one()
+        self.assertEqual(self.c.refresh_record(ACC_A), rrec("claude_code_warmup", "refreshed"))
+        self.env.calls.clear()
+        out = self.c.refresh(self.profiles, fetch=self.deps.fetch_usage, monotonic=self.deps.monotonic,
+                             now=self.env.now_v, log=self.log)
+        self.assertEqual(out, [ACC_A])
+
+    def test_call_raising(self):
+        self.gate({ACC_A: rrec("live_session")})
+
+        def boom(p, profiles, **kw):
+            raise RuntimeError("x")
+        with self.assertLogs("rotator.daemon", "ERROR"):
+            self.assertEqual(self.c.refresh_one(self.profiles, call=boom, held=self.held, warm=True), ACC_A)
+        self.assertEqual(self.c.refresh_record(ACC_A)["reason"], "internal_error")
+
+
+class TestTickWarm(TickBase):
+    def warm_flag(self, cfg):
+        self.make(cfg)
+        seen = []
+        with unittest.mock.patch.object(self.d._usage, "refresh_one",
+                                        side_effect=lambda *a, **kw: seen.append(kw.get("warm"))):
+            self.d.tick()
+        return seen
+
+    def test_flag_follows_config(self):
+        self.assertEqual(self.warm_flag(make_cfg(usage_poll_s=60.0)), [True])
+        self.assertEqual(self.warm_flag(make_cfg(usage_poll_s=60.0, dry_run=True)), [False])
+        self.assertEqual(self.warm_flag(make_cfg(usage_poll_s=60.0, session_token_warmup=False)), [False])
+
+    def test_live_session_account_warmed(self):
+        self.env.gate_results = {ACC_B: rrec("live_session")}
+        self.env.warm_results = {ACC_B: rrec("claude_code_warmup", "refreshed")}
+        self.d.tick()
+        self.assertEqual([c for c in self.env.refresh_calls if c[0] == "warm_up"], [("warm_up", ACC_B, True)])
+        self.assertEqual(self.account(ACC_B)["refresh"], rrec("claude_code_warmup", "refreshed"))
+
+    def test_real_deps_bind_warmup_seams(self):
+        r = real_deps(make_cfg()).refresh_token.__self__
+        self.assertIs(r._find_claude, refresh.find_claude_binary)
+        self.assertIs(r._run_claude, refresh.run_claude_quiet)
+        self.assertEqual(r._environ(), dict(os.environ))
+
+    def test_dry_run_never_warms(self):
+        self.make(make_cfg(usage_poll_s=60.0, dry_run=True))
+        self.env.gate_results = {ACC_B: rrec("live_session")}
+        self.d.tick()
+        self.assertEqual([c for c in self.env.refresh_calls if c[0] == "warm_up"], [])
+
+
+class TestTickWarmSkip(DispatchBase):
+    def setUp(self):
+        super().setUp()
+        self.env.gate_results = {a: rrec("live_session") for a in (ACC_A, ACC_B, ACC_C)}
+        self.env.results = [result("untouched", "target_untrusted"),
+                            result("continued", None, ok=True, step="continue_prompt")]
+
+    def test_in_flight_accounts_never_warmed(self):
+        self.d.tick()
+        self.assertEqual(self.d._switch_accounts(), frozenset({ACC_A, ACC_B}))
+        self.assertEqual([c[1] for c in self.env.refresh_calls if c[0] == "warm_up"], [ACC_C])
 
 
 class TestRefreshExitLog(RunDaemonBase):

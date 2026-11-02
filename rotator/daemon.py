@@ -668,6 +668,7 @@ class UsageCache:
         self._entries: Dict[str, _Entry] = {}
         self._refresh: Dict[str, dict] = {}
         self._flush_next: bool = True
+        self._warm_last: Optional[str] = None
 
     def _interval_after(self, u: AccountUsage, prev: Optional[float], log: logging.Logger) -> float:
         if not rate_limited(u):
@@ -810,9 +811,12 @@ class UsageCache:
             if entry is not None and not rate_limited(entry.latest):
                 entry.interval, entry.force = 0.0, True
 
-    def refresh_one(self, profiles: Sequence[Profile], *, call: Callable[[Profile, Sequence[Profile]], dict],
-                    held: Callable[..., List[str]], skip: FrozenSet[str] = frozenset()) -> Optional[str]:
-        """Run ``call`` for at most one account: a due held-set flush or a deferred refresh, alternating.
+    def refresh_one(self, profiles: Sequence[Profile], *, call: Callable[..., dict],
+                    held: Callable[..., List[str]], skip: FrozenSet[str] = frozenset(),
+                    warm: bool = False) -> Optional[str]:
+        """Run ``call`` for at most one account: a due held-set flush or a deferred refresh, alternating; with
+        ``warm`` and neither due, a session warm-up (``call(..., warm=True)``) of an account whose record says
+        live_session or warmup_failed, round-robin.
 
         Held ids come from ``held`` only (never from stored records); ``skip`` ids are never picked."""
         due = set(held(due_only=True))
@@ -831,11 +835,14 @@ class UsageCache:
         elif flush:
             pick, src = flush[0], "flush"
         else:
-            return None
+            pick = self._warm_pick(profiles, recs, every, skip) if warm else None
+            if pick is None:
+                return None
+            src = "warm"
         kind = None
         rec = None
         try:
-            rec = call(pick, profiles)
+            rec = call(pick, profiles, warm=True) if src == "warm" else call(pick, profiles)
         except Exception as e:
             kind = type(e).__name__
         if kind is not None:
@@ -843,10 +850,30 @@ class UsageCache:
             rec = {"state": "failed", "reason": "internal_error", "at": None, "last_refreshed_at": None}
         with self._lock:
             self._refresh[pick.account_id] = rec
-            self._flush_next = (src == "waiting")
+            if src == "warm":
+                self._warm_last = pick.account_id
+            else:
+                self._flush_next = (src == "waiting")
         if isinstance(rec, dict) and rec.get("state") == "refreshed":
             self.mark_due(pick.account_id)
         return pick.account_id
+
+
+    def _warm_pick(self, profiles: Sequence[Profile], recs: Mapping[str, Any], held: Set[str],
+                   skip: FrozenSet[str]) -> Optional[Profile]:
+        cands = [p for p in profiles
+                 if isinstance(recs.get(p.account_id), dict)
+                 and recs[p.account_id].get("reason") in ("live_session", "warmup_failed")
+                 and p.account_id not in held and p.account_id not in skip]
+        if not cands:
+            return None
+        with self._lock:
+            last = self._warm_last
+        ids = [p.account_id for p in profiles]
+        after = ids.index(last) if last in ids else -1
+        # The next candidate after the last pick in profile order (wrapping), so every account gets its turn.
+        later = [p for p in cands if ids.index(p.account_id) > after]
+        return (later or cands)[0]
 
 
 # --- the daemon ------------------------------------------------------------------------------------------
@@ -910,7 +937,8 @@ class Daemon:
         self._handle_sessions(profiles, usages, found, now)
         if not self.stopping():
             self._usage.refresh_one(profiles, call=self._deps.refresh_token, held=self._deps.refresh_held,
-                                    skip=self._switch_accounts())
+                                    skip=self._switch_accounts(),
+                                    warm=self._cfg.session_token_warmup and not self._cfg.dry_run)
         self._write_snapshot()
 
     def _refresh_usage(self, profiles: Sequence[Profile], now: datetime) -> None:
@@ -1369,7 +1397,8 @@ def real_deps(cfg: Config) -> Deps:
                           post=refresh._urllib_post, discover=sessions.discover_sessions, list_dir=os.listdir,
                           pid_alive=_pid_alive, exists=os.path.lexists, lock=try_lock, cc_lock=refresh.take_cc_lock,
                           now=_utc_now, monotonic=time.monotonic, sleep=time.sleep,
-                          log=logging.getLogger("rotator.refresh"))
+                          log=logging.getLogger("rotator.refresh"), find_claude=refresh.find_claude_binary,
+                          run_claude=refresh.run_claude_quiet, environ=os.environ.copy)
     return Deps(discover_profiles=accounts.discover_profiles, fetch_usage=usage.fetch_usage,
                 refresh_token=r.refresh, refresh_held=r.held_accounts,
                 discover_sessions=sessions.discover_sessions_with_model, switch=switcher.switch_session,
