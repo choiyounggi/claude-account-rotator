@@ -657,20 +657,16 @@ def _target_trusted(run: _Run) -> bool:
     projects = cfg.get("projects") if cfg else None
     if not isinstance(projects, dict):
         return False
-    # Claude Code accepts a trusted ancestor up to the git root.
+    # Claude Code accepts any trusted ancestor, git root or not: a session runs in a worktree
+    # (.git file) whose only trusted entry is the parent repository folder.
     d = s.cwd
-    dirs: List[str] = []
-    found = False
+    candidates: List[str] = []
     for _ in range(64):
-        dirs.append(d)
-        if run.glob_paths(os.path.join(glob.escape(d), ".git")):
-            found = True
-            break
+        candidates.append(d)
         parent = os.path.dirname(d)
         if parent == d:
             break
         d = parent
-    candidates = dirs if found else [s.cwd]
     for c in candidates:
         entry = projects.get(c)
         if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted") is True:
