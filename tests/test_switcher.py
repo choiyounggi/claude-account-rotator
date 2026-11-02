@@ -3,9 +3,12 @@ import fnmatch
 import io
 import json
 import os
+import stat
 import tempfile
 import tokenize
 import unittest
+from datetime import datetime, timezone
+from unittest import mock
 
 import rotator.switcher as sw
 from rotator.models import Profile, Session
@@ -247,12 +250,18 @@ class TestWaitUntil(unittest.TestCase):
 
 
 class TestSwitchBudget(unittest.TestCase):
-    def test_default_budget_is_380(self):
-        self.assertEqual(switch_budget_s(Timeouts()), 380.0)
+    def test_default_budget_is_445(self):
+        # 380 s before the exit-confirm dialog: + one screen read overrunning the exit wait + one confirm send.
+        self.assertEqual(switch_budget_s(Timeouts()), 445.0)
 
     def test_budget_tracks_timeouts(self):
         t = Timeouts(idle_s=0, exit_s=0, shell_s=0, ready_s=0, prompt_s=0)
-        self.assertEqual(switch_budget_s(t), 240.0)
+        self.assertEqual(switch_budget_s(t), 305.0)
+
+    def test_budget_covers_exit_confirm_calls(self):
+        base = 4 * sw.ORCA_CALL_TIMEOUT_S + 3 * sw.ORCA_SEND_TIMEOUT_S + 5.0 + 5 * sw.PS_TIMEOUT_S
+        t = Timeouts(idle_s=0, exit_s=0, shell_s=0, ready_s=0, prompt_s=0)
+        self.assertEqual(switch_budget_s(t) - base, sw.ORCA_CALL_TIMEOUT_S + sw.ORCA_SEND_TIMEOUT_S)
 
 
 # ---------------------------------------------------------------- Task 03
@@ -1009,6 +1018,10 @@ class FakeDriver:
     def _kind(text, interrupt):
         if interrupt:
             return "interrupt"
+        if text is None:
+            return "enter"
+        if text == "1":
+            return "digit"
         if text == "/exit":
             return "exit"
         if text.startswith("cd "):
@@ -1052,6 +1065,8 @@ class FakeProcs:
             NEW_PID: ProcEnv(config_dir=NEW_HOME, terminal_handle=HANDLE),
         }
         self.tables: list = [ORCA_TABLE]
+        # True: /exit alone leaves the old process alive until a confirm key (Enter or "1") is sent.
+        self.exit_needs_confirm = False
         self._alive_i = {}
         self._table_i = 0
 
@@ -1066,6 +1081,8 @@ class FakeProcs:
                 raise v
             return v
         if pid == OLD_PID:
+            if self.exit_needs_confirm:
+                return not (self.driver.sent("exit") and (self.driver.sent("enter") or self.driver.sent("digit")))
             return not self.driver.sent("exit")
         if pid == NEW_PID:
             return self.driver.sent("relaunch")
@@ -1154,7 +1171,8 @@ def assert_untouched(tc, res, reason, world):
     tc.assertEqual(world.driver.calls, [])
 
 
-def result(step, reason, state, *, new_pid=None, line=LINE, request_id=None, other_account_id=None):
+def result(step, reason, state, *, new_pid=None, line=LINE, request_id=None, other_account_id=None,
+           tasks_stopped=False):
     """Expected SwitchResult with the D3 invariants derived from ``state``."""
     return SwitchResult(
         ok=reason is None and state == "continued",
@@ -1166,6 +1184,7 @@ def result(step, reason, state, *, new_pid=None, line=LINE, request_id=None, oth
         recoverable=state in ("exited", "relaunched", "verified"),
         request_id=request_id,
         other_account_id=other_account_id,
+        tasks_stopped=tasks_stopped,
     )
 
 
@@ -1813,6 +1832,480 @@ class TestHappyPath(unittest.TestCase):
 
     def test_state_hint_for_success_empty(self):
         self.assertEqual(STATE_HINTS[HAPPY.state], "")
+
+
+EXIT_DIALOG = (
+    "Background work is running",
+    "The following will stop when you exit:",
+    "shell · until grep -q done build.log",
+    "",
+)
+DIALOG_FOOTER = ("", "Enter to confirm · Esc to cancel")
+
+
+def _dialog_screen(*options, above=("● earlier answer",), top_rule=False):
+    lines = tuple(above) + ((RULE,) if top_rule else ()) + EXIT_DIALOG + tuple(options) + DIALOG_FOOTER
+    return ScreenReceipt(ok=True, source="screen", tail=lines)
+
+
+DIALOG_HIGHLIGHTED = _dialog_screen("❯ 1. Exit and stop tasks", "  2. Move to background and exit", "  3. Stay")
+DIALOG_ON_STAY = _dialog_screen("  1. Exit and stop tasks", "  2. Move to background and exit", "❯ 3. Stay")
+# The dialog's words quoted verbatim in the transcript, with the normal empty input box below them: only the
+# split at the last horizontal rule tells this from the real dialog.
+LOOK_ALIKE = _screen("❯ ", above=("Background work is running", "❯ 1. Exit and stop tasks", "  3. Stay"))
+BULLETED_LOOK_ALIKE = _screen("❯ ", above=("● Background work is running", "❯ 1. Exit and stop tasks", "  3. Stay"))
+
+
+class TestExitConfirmChoice(unittest.TestCase):
+    def test_highlighted_option_one_is_enter(self):
+        self.assertEqual(sw.exit_confirm_choice(DIALOG_HIGHLIGHTED), "enter")
+
+    def test_other_option_highlighted_is_digit(self):
+        self.assertEqual(sw.exit_confirm_choice(DIALOG_ON_STAY), "digit")
+
+    def test_dialog_under_a_top_rule(self):
+        rec = _dialog_screen("❯ 1. Exit and stop tasks", "  3. Stay", top_rule=True)
+        self.assertEqual(sw.exit_confirm_choice(rec), "enter")
+
+    def test_box_border_characters_are_ignored(self):
+        rec = ScreenReceipt(ok=True, source="screen", tail=(
+            "│ Background work is running │", "│ ❯ 1. Exit and stop tasks │", "│   3. Stay │"))
+        self.assertEqual(sw.exit_confirm_choice(rec), "enter")
+
+    def test_transcript_look_alike_above_the_input_box(self):
+        self.assertIsNone(sw.exit_confirm_choice(LOOK_ALIKE))
+        self.assertIsNone(sw.exit_confirm_choice(BULLETED_LOOK_ALIKE))
+
+    def test_look_alike_lines_alone_would_match(self):
+        # Control: the quoted lines are the dialog's own words, so the rule split is what rejects LOOK_ALIKE.
+        quoted = LOOK_ALIKE.tail[:LOOK_ALIKE.tail.index("  3. Stay") + 1]
+        self.assertEqual(sw.exit_confirm_choice(ScreenReceipt(ok=True, source="screen", tail=quoted)), "enter")
+
+    def test_title_without_option_line(self):
+        rec = _dialog_screen("❯ 1. Move to background and exit", "  2. Stay")
+        self.assertIsNone(sw.exit_confirm_choice(rec))
+
+    def test_option_without_title(self):
+        rec = ScreenReceipt(ok=True, source="screen", tail=("Some other dialog", "❯ 1. Exit and stop tasks"))
+        self.assertIsNone(sw.exit_confirm_choice(rec))
+
+    def test_option_above_title_does_not_count(self):
+        rec = ScreenReceipt(ok=True, source="screen", tail=("❯ 1. Exit and stop tasks", "Background work is running",
+                                                             "  2. Stay"))
+        self.assertIsNone(sw.exit_confirm_choice(rec))
+
+    def test_looser_text_does_not_match(self):
+        for title, option in (("Background work is running!", "❯ 1. Exit and stop tasks"),
+                              ("Background work is running", "❯ 1. Exit and stop tasks now"),
+                              ("Background work is running", "❯ 2. Exit and stop tasks"),
+                              ("background work is running", "❯ 1. Exit and stop tasks")):
+            with self.subTest(title=title, option=option):
+                rec = ScreenReceipt(ok=True, source="screen", tail=(title, option))
+                self.assertIsNone(sw.exit_confirm_choice(rec))
+
+    def test_unreadable_screen(self):
+        self.assertIsNone(sw.exit_confirm_choice(ScreenReceipt(ok=False, tail=DIALOG_HIGHLIGHTED.tail)))
+        self.assertIsNone(sw.exit_confirm_choice(
+            ScreenReceipt(ok=True, source="scrollback", tail=DIALOG_HIGHLIGHTED.tail)))
+
+    def test_empty_tail(self):
+        self.assertIsNone(sw.exit_confirm_choice(ScreenReceipt(ok=True, source="screen", tail=())))
+
+    def test_dialog_far_above_the_bottom(self):
+        rec = _dialog_screen("❯ 1. Exit and stop tasks", "  3. Stay")
+        rec = ScreenReceipt(ok=True, source="screen", tail=rec.tail + tuple("line %d" % i for i in range(20)))
+        self.assertIsNone(sw.exit_confirm_choice(rec))
+
+
+class TestExitConfirm(unittest.TestCase):
+    def _world(self, *screens):
+        w = World()
+        w.procs.exit_needs_confirm = True
+        w.driver.screens = [EMPTY_SCREEN] + list(screens) + [EMPTY_SCREEN]
+        return w
+
+    def test_highlighted_dialog_is_confirmed_with_enter(self):
+        w = self._world(DIALOG_HIGHLIGHTED)
+        res = w.run("soft")
+        self.assertEqual(res, dataclasses.replace(HAPPY, tasks_stopped=True))
+        self.assertEqual(w.driver.calls, SOFT_LOG[:2] + [("read_screen", HANDLE), ("send", HANDLE, None, True, False)]
+                         + SOFT_LOG[2:])
+
+    def test_unhighlighted_dialog_gets_digit_then_enter(self):
+        w = self._world(DIALOG_ON_STAY)
+        res = w.run("soft")
+        self.assertEqual(res, dataclasses.replace(HAPPY, tasks_stopped=True))
+        self.assertIn(("send", HANDLE, "1", True, False), w.driver.calls)
+        self.assertIs(w.driver.sent("enter"), False)
+
+    def test_dialog_appears_after_a_first_poll(self):
+        w = self._world(EMPTY_SCREEN, DIALOG_HIGHLIGHTED)
+        res = w.run("soft")
+        self.assertEqual(res, dataclasses.replace(HAPPY, tasks_stopped=True))
+        self.assertEqual(len([c for c in w.driver.sends() if c[2] is None]), 1)
+
+    def test_look_alike_never_confirms(self):
+        w = self._world(*([LOOK_ALIKE] * 7))
+        res = w.run("soft")
+        self.assertEqual(res, result("wait_exit", "exit_timeout", "exit_pending"))
+        self.assertIs(w.driver.sent("enter"), False)
+        self.assertIs(w.driver.sent("digit"), False)
+        self.assertIs(w.driver.sent("relaunch"), False)
+
+    def test_other_dialog_stays_a_stop(self):
+        other = _screen("❯ 1. Yes", above=("Do you want to proceed?",))
+        w = self._world(*([other] * 7))
+        res = w.run("soft")
+        self.assertEqual(res, result("wait_exit", "exit_timeout", "exit_pending"))
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit"])
+
+    def test_confirms_at_most_once(self):
+        w = self._world(DIALOG_HIGHLIGHTED, DIALOG_HIGHLIGHTED, DIALOG_HIGHLIGHTED)
+        w.procs.alive[OLD_PID] = [True]
+        res = w.run("soft")
+        self.assertEqual(res, result("wait_exit", "exit_timeout", "exit_pending", tasks_stopped=True))
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None])
+        # No screen is read once the confirm key is out: the probe only checks the process.
+        self.assertEqual([c for c in w.driver.calls if c[0] == "read_screen"], [("read_screen", HANDLE)] * 2)
+
+    def test_refused_confirm_is_not_recorded_as_stopped(self):
+        w = self._world(DIALOG_HIGHLIGHTED)
+        w.driver.script["enter"] = [SendReceipt("refused", refused_reason="busy")]
+        w.procs.alive[OLD_PID] = [True]  # the refused key never reached the dialog
+        res = w.run("soft")
+        self.assertEqual(res, result("wait_exit", "exit_timeout", "exit_pending"))
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None])
+
+    def test_unreadable_screen_keeps_waiting(self):
+        w = self._world(ScreenReceipt(ok=False), DIALOG_HIGHLIGHTED)
+        res = w.run("soft")
+        self.assertEqual(res, dataclasses.replace(HAPPY, tasks_stopped=True))
+
+    def test_raising_screen_read_keeps_waiting(self):
+        w = self._world(RuntimeError("orca down"), DIALOG_HIGHLIGHTED)
+        res = w.run("soft")
+        self.assertEqual(res, dataclasses.replace(HAPPY, tasks_stopped=True))
+
+    def test_no_dialog_path_unchanged(self):
+        w = World()
+        self.assertEqual(w.run("soft"), HAPPY)
+        self.assertIs(HAPPY.tasks_stopped, False)
+        self.assertEqual(w.driver.calls, SOFT_LOG)
+
+    def test_log_line_without_screen_text(self):
+        w = self._world(DIALOG_HIGHLIGHTED)
+        with self.assertLogs("rotator.switcher", "DEBUG") as cm:
+            w.run("soft")
+        msgs = [r.getMessage() for r in cm.records]
+        self.assertIn("event=exit_confirm pid=1111 choice=stop_tasks", msgs)
+        self.assertFalse(any("grep" in m or "Background" in m or "Exit and stop" in m for m in msgs))
+
+    def test_hint_records_stopped_tasks(self):
+        r = dataclasses.replace(HAPPY, tasks_stopped=True)
+        self.assertEqual(sw.result_hint(HAPPY), "")
+        self.assertIn("background tasks", sw.result_hint(r).lower())
+        pending = result("wait_exit", "exit_timeout", "exit_pending", tasks_stopped=True)
+        self.assertTrue(sw.result_hint(pending).startswith(STATE_HINTS["exit_pending"]))
+        self.assertIn("background tasks", sw.result_hint(pending).lower())
+        self.assertEqual(sw.result_hint(result("wait_exit", "exit_timeout", "exit_pending")),
+                         STATE_HINTS["exit_pending"])
+
+
+TMP_BASE = os.path.join(REPO, ".claude", "tmp")
+STAMP_AT = datetime(2026, 11, 2, 7, 40, 1, 123456, tzinfo=timezone.utc)
+ACC_TARGET = "f26e0000-0000-0000-0000-000000000009"
+
+
+def _dump(obj):
+    return json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
+
+
+class TestMirrorTrust(unittest.TestCase):
+    def setUp(self):
+        os.makedirs(TMP_BASE, exist_ok=True)
+        self._td = tempfile.TemporaryDirectory(dir=TMP_BASE)
+        self.root = self._td.name
+        self.home = os.path.join(self.root, "home")
+        os.makedirs(self.home)
+        self.cfg = os.path.join(self.home, ".claude.json")
+        self.backups = os.path.join(self.root, "state", "backups")
+        self.cwd = "/Users/user/proj/repo-wt"
+
+    def tearDown(self):
+        os.chmod(self.home, 0o700)
+        self._td.cleanup()
+
+    def write(self, obj_or_text, mode=0o644):
+        text = obj_or_text if isinstance(obj_or_text, str) else _dump(obj_or_text)
+        with open(self.cfg, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(self.cfg, mode)
+        return text
+
+    def read(self):
+        with open(self.cfg, encoding="utf-8") as f:
+            return f.read()
+
+    def mirror(self, **kw):
+        kw.setdefault("now", lambda: STAMP_AT)
+        return sw.mirror_trust(self.cfg, self.cwd, self.backups, ACC_TARGET, **kw)
+
+    def backup_names(self):
+        return sorted(os.listdir(self.backups)) if os.path.isdir(self.backups) else []
+
+    def leftovers(self):
+        return [n for n in os.listdir(self.home) if n != ".claude.json"]
+
+    def test_creates_entry_and_keeps_every_other_key(self):
+        doc = {"numStartups": 5, "theme": "dark", "nested": {"a": [1, 2.5, None, True]}, "ünï": "é",
+               "projects": {"/Users/user/other": {"allowedTools": ["x"], "hasTrustDialogAccepted": False}},
+               "oauthAccount": {"emailAddress": "fixture@example.com"}}
+        original = self.write(doc)
+        self.assertIs(self.mirror(), True)
+        want = json.loads(original)
+        want["projects"][self.cwd] = {"hasTrustDialogAccepted": True}
+        self.assertEqual(self.read(), _dump(want))
+        self.assertEqual(list(json.loads(self.read())), list(doc))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_existing_entry_flips_only_the_trust_key(self):
+        doc = {"projects": {self.cwd: {"allowedTools": [], "hasTrustDialogAccepted": False, "lastCost": 0.25}}}
+        self.write(doc)
+        self.assertIs(self.mirror(), True)
+        got = json.loads(self.read())
+        self.assertEqual(got, {"projects": {self.cwd: {"allowedTools": [], "hasTrustDialogAccepted": True,
+                                                         "lastCost": 0.25}}})
+        self.assertEqual(list(got["projects"][self.cwd]), ["allowedTools", "hasTrustDialogAccepted", "lastCost"])
+
+    def test_projects_created_when_missing(self):
+        self.write({"numStartups": 1})
+        self.assertIs(self.mirror(), True)
+        self.assertEqual(json.loads(self.read()),
+                         {"numStartups": 1, "projects": {self.cwd: {"hasTrustDialogAccepted": True}}})
+
+    def test_no_trailing_newline_kept_that_way(self):
+        self.write(json.dumps({"projects": {}}, indent=2))
+        self.assertIs(self.mirror(), True)
+        self.assertFalse(self.read().endswith("\n"))
+
+    def test_mode_preserved(self):
+        for i, mode in enumerate((0o600, 0o644)):
+            with self.subTest(mode=mode):
+                self.write({"projects": {}}, mode=mode)
+                self.assertIs(self.mirror(now=lambda i=i: STAMP_AT.replace(microsecond=i)), True)
+                self.assertEqual(stat.S_IMODE(os.stat(self.cfg).st_mode), mode)
+
+    def test_backup_keeps_previous_bytes_0600(self):
+        original = self.write({"projects": {}, "k": "v"})
+        self.assertIs(self.mirror(), True)
+        name = "claude.json.%s.20261102T074001123456Z" % ACC_TARGET[:8]
+        self.assertEqual(self.backup_names(), [name])
+        with open(os.path.join(self.backups, name), encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.backups, name)).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(self.backups).st_mode), 0o700)
+
+    def test_backups_pruned_to_newest_20(self):
+        os.makedirs(self.backups)
+        old = ["claude.json.%s.2026100%dT0000%02d000000Z" % ("abcdef12", i % 9 + 1, i) for i in range(25)]
+        for n in old:
+            with open(os.path.join(self.backups, n), "w") as f:
+                f.write("{}")
+        with open(os.path.join(self.backups, "unrelated.txt"), "w") as f:
+            f.write("keep")
+        self.write({"projects": {}})
+        self.assertIs(self.mirror(), True)
+        names = self.backup_names()
+        kept = [n for n in names if n.startswith("claude.json.")]
+        self.assertEqual(len(kept), 20)
+        self.assertIn("claude.json.%s.20261102T074001123456Z" % ACC_TARGET[:8], kept)
+        by_stamp = sorted(old, key=lambda n: n.rsplit(".", 1)[1])
+        for n in by_stamp[:6]:
+            self.assertNotIn(n, kept)
+        for n in by_stamp[6:]:
+            self.assertIn(n, kept)
+        self.assertIn("unrelated.txt", names)
+
+    def test_already_trusted_writes_nothing(self):
+        text = self.write({"projects": {self.cwd: {"hasTrustDialogAccepted": True}}})
+        self.assertIs(self.mirror(), True)
+        self.assertEqual(self.read(), text)
+        self.assertEqual(self.backup_names(), [])
+
+    def test_unusable_documents_untouched(self):
+        for text in ("not json", "[1, 2]", '{"projects": []}', '{"projects": {"%s": 5}}' % "/Users/user/proj/repo-wt",
+                     '{"projects": {"/Users/user/proj/repo-wt": {"hasTrustDialogAccepted": "yes"}}}'):
+            with self.subTest(text=text):
+                self.write(text)
+                self.assertIs(self.mirror(), False)
+                self.assertEqual(self.read(), text)
+                self.assertEqual(self.backup_names(), [])
+                self.assertEqual(self.leftovers(), [])
+
+    def test_missing_file(self):
+        self.assertIs(self.mirror(), False)
+        self.assertFalse(os.path.exists(self.cfg))
+
+    def test_symlink_refused(self):
+        real = os.path.join(self.root, "real.json")
+        with open(real, "w") as f:
+            f.write('{"projects": {}}')
+        os.symlink(real, self.cfg)
+        self.assertIs(self.mirror(), False)
+        self.assertTrue(os.path.islink(self.cfg))
+        with open(real) as f:
+            self.assertEqual(f.read(), '{"projects": {}}')
+
+    def test_concurrent_change_aborts(self):
+        original = self.write({"projects": {}})
+        changed = _dump({"projects": {}, "numStartups": 9})
+        reads = []
+
+        def read_bytes(path):
+            reads.append(path)
+            if len(reads) == 2:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(changed)
+            with open(path, "rb") as f:
+                return f.read()
+
+        self.assertIs(self.mirror(read_bytes=read_bytes), False)
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(self.read(), changed)
+        self.assertNotEqual(self.read(), original)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_unwritable_folder_leaves_file_unchanged(self):
+        text = self.write({"projects": {}})
+        os.chmod(self.home, 0o500)
+        self.assertIs(self.mirror(), False)
+        os.chmod(self.home, 0o700)
+        self.assertEqual(self.read(), text)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_backup_name_collision_writes_nothing(self):
+        self.write({"projects": {}})
+        self.assertIs(self.mirror(), True)
+        text = self.write({"projects": {}, "again": 1})
+        self.assertIs(self.mirror(), False)
+        self.assertEqual(self.read(), text)
+        self.assertEqual(len(self.backup_names()), 1)
+
+    def test_backup_failure_writes_nothing(self):
+        text = self.write({"projects": {}})
+        os.makedirs(os.path.dirname(self.backups))
+        with open(self.backups, "w") as f:
+            f.write("a file where the backup folder should be")
+        self.assertIs(self.mirror(), False)
+        self.assertEqual(self.read(), text)
+        self.assertEqual(self.leftovers(), [])
+
+
+SOURCE_TRUST = OLD_HOME + "/.claude.json"
+BACKUP_DIR = "/Users/user/state/backups"
+
+
+class TestTrustCopyPreflight(unittest.TestCase):
+    def world(self, source=trust("/Users/user/proj"), target=json.dumps({"projects": {}})):
+        w = World()
+        if source is not None:
+            w.fs.files[SOURCE_TRUST] = source
+        w.fs.files[TRUST_FILE] = target
+        self.calls = []
+
+        def mirror(path, cwd, backup_dir, account_id):
+            self.calls.append((path, cwd, backup_dir, account_id))
+            w.fs.files[TRUST_FILE] = trust(cwd)
+            return True
+
+        w.mirror = mirror
+        return w
+
+    def run_world(self, w, **kw):
+        kw.setdefault("copy_trust", True)
+        kw.setdefault("trust_backup_dir", BACKUP_DIR)
+        kw.setdefault("trust_mirror", w.mirror)
+        return w.run("soft", **kw)
+
+    def test_source_trust_of_an_ancestor_is_copied(self):
+        w = self.world()
+        with self.assertLogs("rotator.switcher", "INFO") as cm:
+            res = self.run_world(w)
+        self.assertEqual(res, HAPPY)
+        self.assertEqual(self.calls, [(TRUST_FILE, CWD, BACKUP_DIR, ACC_NEW)])
+        self.assertIn("event=trust_copied account=%s path=%s" % (ACC_NEW, CWD), [r.getMessage() for r in cm.records])
+
+    def test_source_trust_of_the_folder_itself(self):
+        w = self.world(source=trust(CWD))
+        self.assertEqual(self.run_world(w), HAPPY)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_source_does_not_trust(self):
+        for source in (trust("/Users/user/elsewhere"), None, "not json",
+                       json.dumps({"projects": {CWD: {"hasTrustDialogAccepted": "true"}}})):
+            with self.subTest(source=source):
+                w = self.world(source=source)
+                assert_untouched(self, self.run_world(w), "target_untrusted", w)
+                self.assertEqual(self.calls, [])
+
+    def test_copy_trust_off(self):
+        w = self.world()
+        assert_untouched(self, self.run_world(w, copy_trust=False), "target_untrusted", w)
+        self.assertEqual(self.calls, [])
+
+    def test_off_by_default(self):
+        w = self.world()
+        assert_untouched(self, w.run("soft", trust_mirror=w.mirror, trust_backup_dir=BACKUP_DIR),
+                         "target_untrusted", w)
+        self.assertEqual(self.calls, [])
+
+    def test_no_backup_dir_no_copy(self):
+        w = self.world()
+        assert_untouched(self, self.run_world(w, trust_backup_dir=None), "target_untrusted", w)
+        self.assertEqual(self.calls, [])
+
+    def test_write_failure_stays_untrusted(self):
+        for outcome in (False, OSError("disk full")):
+            with self.subTest(outcome=outcome):
+                w = self.world()
+
+                def mirror(*a, outcome=outcome):
+                    self.calls.append(a)
+                    return _raise_or_return(outcome)
+
+                assert_untouched(self, self.run_world(w, trust_mirror=mirror), "target_untrusted", w)
+                self.assertEqual(len(self.calls), 1)
+
+    def test_recheck_still_untrusted(self):
+        w = self.world()
+
+        def mirror(*a):
+            self.calls.append(a)
+            return True  # claims success but the file did not change
+
+        with self.assertLogs("rotator.switcher", "DEBUG") as cm:
+            res = self.run_world(w, trust_mirror=mirror)
+        assert_untouched(self, res, "target_untrusted", w)
+        self.assertFalse(any("trust_copied" in r.getMessage() for r in cm.records))
+
+    def test_already_trusted_target_never_copies(self):
+        w = self.world(target=trust(CWD))
+        self.assertEqual(self.run_world(w), HAPPY)
+        self.assertEqual(self.calls, [])
+
+    def test_default_mirror_is_module_function(self):
+        w = self.world()
+        seen = []
+
+        def fake(path, cwd, backup_dir, account_id):
+            seen.append(account_id)
+            w.fs.files[TRUST_FILE] = trust(cwd)
+            return True
+
+        with mock.patch.object(sw, "mirror_trust", fake):
+            res = w.run("soft", copy_trust=True, trust_backup_dir=BACKUP_DIR)
+        self.assertEqual(res, HAPPY)
+        self.assertEqual(seen, [ACC_NEW])
 
 
 class TestProceedPaths(unittest.TestCase):

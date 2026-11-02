@@ -57,11 +57,15 @@ bin/rotator uninstall    # stops it and removes the plist and the app copy
   came from a different commit than the checkout you run it from.
 - `install` then writes `~/Library/LaunchAgents/io.github.choiyounggi.claude-account-rotator.plist` and runs
   `launchctl bootstrap gui/<uid>` on it. Running it again replaces a loaded agent (`bootout`, then `bootstrap`).
+  Right after `bootout` the old instance may still be exiting, and `bootstrap` then fails with
+  `5: Input/output error`; `install` retries it up to 10 times, 1 s apart, and reports the last error if it never
+  succeeds. After a successful `bootstrap` it checks `launchctl print gui/<uid>/<label>` and fails if the job is
+  not there.
 - `uninstall` runs `launchctl bootout gui/<uid>/io.github.choiyounggi.claude-account-rotator` (the exact label,
   never a pattern), removes the plist, then removes exactly `app/` under the state dir — only if it is a real
   directory there; a symlink or file in its place is reported and left alone.
 - The agent runs `/usr/bin/python3 <state dir>/app/bin/rotator --config <abs path> daemon` from `<state dir>/app`
-  with `RunAtLoad` and `KeepAlive`. Its `ExitTimeOut` is computed from `timeouts` at install time (440 s with the
+  with `RunAtLoad` and `KeepAlive`. Its `ExitTimeOut` is computed from `timeouts` at install time (505 s with the
   defaults: one full switch plus margin), so re-run `rotator install` after changing `timeouts`.
 - Run `rotator uninstall` before running `rotator daemon` in the foreground. Otherwise the second copy finds the
   daemon lock held and exits 1, and with `KeepAlive` launchd restarts the agent copy every 10 s
@@ -354,6 +358,37 @@ Every `accounts[]` entry also has `refresh`: `{state, reason, at, last_refreshed
 `not_needed`, `skipped`, `refreshed`, `failed`, `stopped`; see "Idle-account token refresh") or null; the schema
 stays 1.
 
+## Getting past refusals
+
+Three things used to stop an automatic switch until someone stepped in by hand.
+
+- **The exit dialog.** When the session has background work (registry status `shell`), Claude Code 2.1.296
+  answers `/exit` with a dialog titled `Background work is running` (options `1. Exit and stop tasks`,
+  `2. Move to background and exit`, `3. Stay`). While waiting for the process to exit, the switcher reads the
+  bottom of the screen (below the last horizontal rule, so the same words quoted in the transcript never count);
+  when it finds that title and the option line `1. Exit and stop tasks`, it sends exactly one key: Enter when
+  option 1 is highlighted (`❯ 1.`), else `1` then Enter. It never reads the screen again after that key and keeps
+  waiting for the exit. The log says `event=exit_confirm choice=stop_tasks` (no screen text) and the switch hint
+  adds that the session's background tasks were stopped. Any other dialog gets no key: the wait ends as
+  `exit_timeout` as before.
+- **Exclusions expire.** A target refused at preflight is excluded for that session and the next target is
+  tried. Each exclusion is stored as `{"account_id", "reason", "at"}`; those for `target_untrusted`,
+  `transcript_not_visible` and `target_home_missing` are ignored after `exclusion_ttl_s` (600 s) and dropped
+  the next time the session's record is written, so fixing the cause lets the session move again. Records
+  written before this change hold plain account ids; they are still read, aged from the record's `updated_at`.
+- **Trust follows the session** (`copy_trust`). Claude Code trusts a folder per account, so a new git worktree
+  is trusted only in the account where it was first opened, and every other target refuses it
+  (`target_untrusted`). When the target does not trust the session's folder but the session's **own** account
+  (`<its CLAUDE_CONFIG_DIR>/.claude.json`) trusts that folder or one of its parents, preflight sets
+  `projects[<session cwd>].hasTrustDialogAccepted = true` in the target's `.claude.json` and checks again. It
+  only mirrors a trust the user already granted for the same folder in the account the session runs on, so it
+  never trusts a folder the user has not. The write re-reads the file just before replacing it (and gives up if
+  Claude Code changed it meanwhile), changes that one key (creating the project entry if missing) and keeps
+  every other key, writes a temp file in the same folder and renames it over the old one with the same mode,
+  and keeps the previous file as `<state dir>/backups/claude.json.<account8>.<UTC stamp>` (0600, newest 20
+  kept). The log says `event=trust_copied account=<id> path=<cwd>`. Any failure leaves the file as it was and
+  the result stays `target_untrusted`. `dry_run` never writes it.
+
 ## Configuration
 
 One JSON object at `~/Library/Application Support/claude-account-rotator/config.json` (or `--config PATH`). An
@@ -384,6 +419,8 @@ starts with the key.
 | `token_refresh` | `true` | `true` / `false`; `false` turns idle-account token refresh off (see "Idle-account token refresh") |
 | `session_token_warmup` | `true` | `true` / `false`; `false` turns the session warm-up off (see "Session warm-up") |
 | `session_token_warmup_request` | `true` | `true` / `false`; `false` keeps the warm-up to Step A (no model request) |
+| `exclusion_ttl_s` | `600` | number >= 0; how long a target refused for `target_untrusted`, `transcript_not_visible` or `target_home_missing` stays excluded for a session (see "Getting past refusals") |
+| `copy_trust` | `true` | `true` / `false`; mirror the session's own folder trust into the target account (see "Getting past refusals") |
 | `profiles_root` | `~/Library/Application Support/orca/claude-profiles` | absolute path (`~` expanded) |
 
 Numbers must be finite and not `true`/`false`.
@@ -430,7 +467,8 @@ Numbers must be finite and not `true`/`false`.
 5. Hard mode may restore the cancelled prompt into the input box after Ctrl-C, which ends the attempt as
    `interrupted` (touched), so that process is never retried.
 6. Workspace trust inherited from a parent directory is not verified; sessions in a subdirectory may fail closed
-   as `target_untrusted`, and the rotator then excludes that target for the session and tries the next one.
+   as `target_untrusted`, and the rotator then excludes that target for the session for `exclusion_ttl_s` and
+   tries the next one.
 7. The shape of a real accepted Orca send receipt has not been sampled live.
 8. Under launchd the daemon is expected to see the same `PATH` and Keychain access as an interactive shell;
    Keychain access from a launchd job context is not measured; token refresh probes the write path first and
@@ -483,6 +521,13 @@ Numbers must be finite and not `true`/`false`.
     `-p` run). That Step A refreshes before validating its input, and sends no model request, was measured on
     Claude Code 2.1.296 and is not guaranteed by later builds. A session whose `argv[0]` is a bare `claude`
     gives no path, so the nvm fallback may pick a different Claude Code version than the session runs.
+24. The exit dialog is recognised by its text as rendered by Claude Code 2.1.296; a later build that renames it
+    or draws a horizontal rule below it is not recognised, and the switch ends as `exit_timeout` with the dialog
+    still open. Answering it stops the session's background tasks (a running `shell` command is killed).
+25. `copy_trust` rewrites the target account's `.claude.json`, which Claude Code also rewrites. The re-read just
+    before the rename narrows the window but cannot close it: a Claude Code write that lands between the re-read
+    and the rename is lost (the previous file is in `<state dir>/backups/`). Keys are kept as a JSON round trip
+    allows (2-space indent, key order kept); number formatting may differ from Claude Code's.
 
 ## License
 

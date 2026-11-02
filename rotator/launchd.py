@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone
 from typing import Callable, List, Optional, Tuple
 
@@ -23,6 +24,11 @@ PYTHON = "/usr/bin/python3"
 LAUNCHCTL_TIMEOUT_S = 30.0
 EXIT_TIMEOUT_SLACK_S = 30
 GIT_TIMEOUT_S = 5.0
+# bootstrap right after bootout fails with EIO while the previous instance is still exiting.
+BOOTSTRAP_RETRIES = 10
+BOOTSTRAP_RETRY_SLEEP_S = 1.0
+BOOTSTRAP_BUSY_RC = 5
+BOOTSTRAP_BUSY_TEXT = "Input/output error"
 APP_DIRNAME = "app"
 VERSION_FILENAME = "VERSION"
 UNKNOWN_COMMIT = "unknown"
@@ -233,7 +239,8 @@ def _utc_now() -> datetime:
 
 def install(*, runner: Runner, uid: int, plist_path: str, source_root: str, state_dir: str, config_path: str,
             log_dir: str, timeouts: Timeouts, commit_of: Callable[[str], Optional[str]] = source_commit,
-            now: Callable[[], datetime] = _utc_now, copy_file: CopyFile = shutil.copyfile) -> Tuple[int, str]:
+            now: Callable[[], datetime] = _utc_now, copy_file: CopyFile = shutil.copyfile,
+            sleep: Callable[[float], None] = time.sleep) -> Tuple[int, str]:
     """Copy the app out of ``source_root`` into ``<state_dir>/app``, point the plist at that copy and (re)load
     the agent; returns (exit code, message). Nothing is written when the copy fails."""
     folder = protected_dir(config_path)
@@ -252,13 +259,24 @@ def install(*, runner: Runner, uid: int, plist_path: str, source_root: str, stat
     target = _target(uid)
     # `print` tells loaded from not-loaded; bootout's own rc for "not loaded" is not documented.
     rc, _, _ = runner([LAUNCHCTL, "print", target], LAUNCHCTL_TIMEOUT_S)
-    if rc == 0:
+    booted_out = rc == 0
+    if booted_out:
         rc2, _, err2 = runner([LAUNCHCTL, "bootout", target], xt + LAUNCHCTL_TIMEOUT_S)
         if rc2 != 0:
             return (1, "launchctl bootout failed: " + err2.strip())
-    rc3, _, err3 = runner([LAUNCHCTL, "bootstrap", "gui/%d" % uid, plist_path], LAUNCHCTL_TIMEOUT_S)
-    if rc3 != 0:
-        return (1, "launchctl bootstrap failed: " + err3.strip())
+    retries = 0
+    while True:
+        rc3, _, err3 = runner([LAUNCHCTL, "bootstrap", "gui/%d" % uid, plist_path], LAUNCHCTL_TIMEOUT_S)
+        if rc3 == 0:
+            break
+        busy = rc3 == BOOTSTRAP_BUSY_RC or BOOTSTRAP_BUSY_TEXT in err3
+        if not (booted_out and busy and retries < BOOTSTRAP_RETRIES):
+            return (1, "launchctl bootstrap failed: " + err3.strip())
+        retries += 1
+        sleep(BOOTSTRAP_RETRY_SLEEP_S)
+    rc4, _, _ = runner([LAUNCHCTL, "print", target], LAUNCHCTL_TIMEOUT_S)
+    if rc4 != 0:
+        return (1, "launchctl print does not show %s after bootstrap (rc %d); see launchd.err.log" % (LABEL, rc4))
     return (0, "installed %s (%s); app copy %s at %s" % (LABEL, plist_path, app_root, commit))
 
 

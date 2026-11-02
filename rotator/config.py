@@ -37,6 +37,8 @@ TOP_KEYS = (
     "token_refresh",
     "session_token_warmup",
     "session_token_warmup_request",
+    "exclusion_ttl_s",
+    "copy_trust",
     "profiles_root",
 )
 TIMEOUT_KEYS = ("idle_s", "exit_s", "shell_s", "ready_s", "prompt_s", "poll_s")
@@ -69,6 +71,8 @@ class Config:
     token_refresh: bool = True
     session_token_warmup: bool = True
     session_token_warmup_request: bool = True
+    exclusion_ttl_s: float = 600.0
+    copy_trust: bool = True
     profiles_root: str = PROFILES_ROOT_DEFAULT
     # Not a JSON key: where state, locks and records live. load_config always uses CONFIG_DIR_DEFAULT
     # whatever --config names, so every daemon and CLI process contends on the same lock files.
@@ -122,7 +126,7 @@ def parse_config(obj: object, *, state_dir: str) -> Config:
             if not 0 <= v <= 100:
                 raise ConfigError("%s: must be between 0 and 100" % key)
             vals[key] = v
-        elif key in ("stale_max_age_s", "cooldown_s", "clock_skew_tolerance_s"):
+        elif key in ("stale_max_age_s", "cooldown_s", "clock_skew_tolerance_s", "exclusion_ttl_s"):
             v = _num(key, value)
             if v < 0:
                 raise ConfigError("%s: must be >= 0" % key)
@@ -160,7 +164,7 @@ def parse_config(obj: object, *, state_dir: str) -> Config:
                 raise ConfigError(_PROMPT_MESSAGE)
             vals[key] = value
         elif key in ("dry_run", "auto_switch", "pointer_correction", "token_refresh", "session_token_warmup",
-                     "session_token_warmup_request"):
+                     "session_token_warmup_request", "copy_trust"):
             if type(value) is not bool:
                 raise ConfigError("%s: must be true or false" % key)
             vals[key] = value

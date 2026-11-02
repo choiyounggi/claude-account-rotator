@@ -524,7 +524,7 @@ class TestSerializers(unittest.TestCase):
     def test_result_dict_and_no_secrets(self):
         r = result_dict(result("exited", "exit_timeout", cmd="cd /x && claude"))
         self.assertEqual(set(r), {"ok", "step", "reason", "state", "new_pid", "recoverable", "request_id",
-                                  "other_account_id", "relaunch_command"})
+                                  "other_account_id", "relaunch_command", "tasks_stopped"})
         self.assertEqual(r["relaunch_command"], "cd /x && claude")
         text = daemon._dump([usage_summary(live(ACC_A, 42.0)), r])
         for s in SECRETS:
@@ -675,7 +675,8 @@ class TestRunSwitch(RunSwitchBase):
         self.assertEqual(rec["result"]["state"], "continued")
         self.assertEqual(rec["target_account_id"], ACC_B)
         kw = self.env.switch_kwargs[0]
-        self.assertEqual(set(kw), {"driver", "procs", "timeouts", "continue_prompt", "profiles_root"})
+        self.assertEqual(set(kw), {"driver", "procs", "timeouts", "continue_prompt", "profiles_root", "copy_trust",
+                                   "trust_backup_dir"})
         self.assertIs(kw["timeouts"], self.cfg.timeouts)
         self.assertEqual(kw["profiles_root"], ROOT)
         self.assertEqual(self.env.driver_calls, [])
@@ -849,7 +850,7 @@ class TestRunSwitchOutcomes(RunSwitchBase):
         self.assertEqual([c[2] for c in self.switch_calls()], [ACC_B, ACC_C])
         self.assertEqual(self.writes_between_switches(), [1, 1])
         self.assertEqual(received, [frozenset({ACC_B}), frozenset({ACC_B, ACC_C})])
-        self.assertEqual(out.record["excluded"], [ACC_B, ACC_C])
+        self.assertEqual(out.record["excluded"], [excl(ACC_B), excl(ACC_C)])
         self.assertIs(out.record["touched"], False)
         self.assertEqual(out.record["attempt"], 2)
         self.assertEqual(out.record["target_account_id"], ACC_C)
@@ -865,7 +866,7 @@ class TestRunSwitchOutcomes(RunSwitchBase):
         self.env.results = [result("untouched", "target_untrusted")]
         out = self.run_switch(next_target=None)
         self.assertEqual(len(self.switch_calls()), 1)
-        self.assertEqual(out.record["excluded"], [ACC_B])
+        self.assertEqual(out.record["excluded"], [excl(ACC_B)])
 
     def test_second_intent_failure_stops(self):
         self.env.results = [result("untouched", "target_untrusted"), result()]
@@ -883,7 +884,7 @@ class TestRunSwitchOutcomes(RunSwitchBase):
         self.assertEqual(len(self.switch_calls()), 1)
         self.assertEqual(out.status, "done")
         self.assertEqual(out.record["result"]["reason"], "target_untrusted")
-        self.assertEqual(out.record["excluded"], [ACC_B])
+        self.assertEqual(out.record["excluded"], [excl(ACC_B)])
         self.assertEqual(out.record["target_account_id"], ACC_B)
         self.assertEqual(self.stored()["record_state"], "final")
 
@@ -916,7 +917,8 @@ class TestRunSwitchOutcomes(RunSwitchBase):
         self.env.results = [result("untouched", "not_idle")]
         out = self.run_switch()
         self.assertEqual(out.record["hard_hold_until"], hold)
-        self.assertEqual(out.record["excluded"], [ACC_C])
+        # A legacy entry without the record's updated_at has no age, so it is kept.
+        self.assertEqual(out.record["excluded"], [{"account_id": ACC_C, "reason": None, "at": None}])
 
     def test_touched_result_no_effects(self):
         self.env.results = [result("interrupted", "input_not_empty", step="exit")]
@@ -1832,6 +1834,188 @@ class TestDispatch(DispatchBase):
         self.assertEqual(self.switches(), [("switch", 101, ACC_C, "soft")])
 
 
+def _iso_at(seconds_before_t0):
+    return (T0 - timedelta(seconds=seconds_before_t0)).isoformat()
+
+
+def excl(aid, reason="target_untrusted", ago=0):
+    return {"account_id": aid, "reason": reason, "at": _iso_at(ago)}
+
+
+class TestActiveExclusions(unittest.TestCase):
+    def active(self, raw, ttl=600.0, fallback=None):
+        return daemon.active_exclusions(raw, T0, ttl, fallback)
+
+    def test_fresh_entry_kept(self):
+        self.assertEqual(self.active([excl(ACC_B, ago=599)]), [excl(ACC_B, ago=599)])
+
+    def test_expired_entry_dropped(self):
+        for reason in ("target_untrusted", "transcript_not_visible", "target_home_missing"):
+            with self.subTest(reason=reason):
+                self.assertEqual(self.active([excl(ACC_B, reason, ago=600)]), [])
+                self.assertEqual(self.active([excl(ACC_B, reason, ago=599.5)]), [excl(ACC_B, reason, ago=599.5)])
+
+    def test_other_reason_never_expires(self):
+        e = excl(ACC_B, "some_other_reason", ago=10 ** 6)
+        self.assertEqual(self.active([e]), [e])
+
+    def test_zero_ttl_expires_at_once(self):
+        self.assertEqual(self.active([excl(ACC_B, ago=0)], ttl=0.0), [])
+
+    def test_legacy_plain_id_uses_record_time(self):
+        self.assertEqual(self.active([ACC_B], fallback=_iso_at(60)),
+                         [{"account_id": ACC_B, "reason": None, "at": _iso_at(60)}])
+        self.assertEqual(self.active([ACC_B], fallback=_iso_at(600)), [])
+
+    def test_legacy_plain_id_without_record_time_is_kept(self):
+        self.assertEqual(self.active([ACC_B], fallback=None), [{"account_id": ACC_B, "reason": None, "at": None}])
+        self.assertEqual(self.active([ACC_B], fallback="not a time"),
+                         [{"account_id": ACC_B, "reason": None, "at": "not a time"}])
+
+    def test_unparseable_time_is_kept(self):
+        e = {"account_id": ACC_B, "reason": "target_untrusted", "at": "garbage"}
+        self.assertEqual(self.active([e]), [e])
+
+    def test_malformed_entries_skipped(self):
+        self.assertEqual(self.active([5, None, {"reason": "x"}, {"account_id": 7}, excl(ACC_C)]), [excl(ACC_C)])
+
+    def test_empty_and_missing(self):
+        self.assertEqual(self.active(None), [])
+        self.assertEqual(self.active([]), [])
+
+    def test_not_a_list_raises(self):
+        for raw in (5, "abc", {"account_id": ACC_B}):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    self.active(raw)
+
+    def test_later_duplicate_wins(self):
+        self.assertEqual(self.active([excl(ACC_B, ago=100), excl(ACC_B, ago=5)]), [excl(ACC_B, ago=5)])
+
+    def test_ids_helper(self):
+        self.assertEqual(daemon.exclusion_ids([excl(ACC_C), excl(ACC_B)]), frozenset({ACC_B, ACC_C}))
+
+
+class TestExclusionExpiry(RunSwitchBase):
+    def test_target_reason_stored_with_reason_and_time(self):
+        self.env.results = [result("untouched", "target_untrusted")]
+        out = self.run_switch(next_target=None)
+        self.assertEqual(out.record["excluded"], [excl(ACC_B, "target_untrusted")])
+        self.assertEqual(self.stored()["excluded"], [excl(ACC_B, "target_untrusted")])
+
+    def test_expired_entry_dropped_on_write(self):
+        self.env.files[self.path] = json.dumps(record(101, excluded=[excl(ACC_C, ago=601)]))
+        self.env.results = [result("untouched", "not_idle")]
+        out = self.run_switch()
+        self.assertEqual(out.record["excluded"], [])
+
+    def test_active_entry_kept_on_write(self):
+        self.env.files[self.path] = json.dumps(record(101, excluded=[excl(ACC_C, ago=30)]))
+        self.env.results = [result("untouched", "not_idle")]
+        out = self.run_switch()
+        self.assertEqual(out.record["excluded"], [excl(ACC_C, ago=30)])
+
+    def test_legacy_list_read_and_rewritten(self):
+        self.env.files[self.path] = json.dumps(record(101, excluded=[ACC_C], updated_at=_iso_at(60)))
+        self.env.results = [result("untouched", "not_idle")]
+        out = self.run_switch()
+        self.assertEqual(out.record["excluded"], [{"account_id": ACC_C, "reason": None, "at": _iso_at(60)}])
+
+    def test_legacy_expired_dropped(self):
+        self.env.files[self.path] = json.dumps(record(101, excluded=[ACC_C], updated_at=_iso_at(900)))
+        self.env.results = [result("untouched", "not_idle")]
+        out = self.run_switch()
+        self.assertEqual(out.record["excluded"], [])
+
+    def test_retarget_excludes_active_ids_only(self):
+        self.env.files[self.path] = json.dumps(record(101, excluded=[excl(ACC_C, ago=900)]))
+        self.env.results = [result("untouched", "target_home_missing"), result()]
+        received = []
+
+        def next_target(ids):
+            received.append(ids)
+            return ("soft", prof(ACC_C))
+
+        out = self.run_switch(next_target=next_target)
+        self.assertEqual(received, [frozenset({ACC_B})])
+        self.assertEqual(out.record["excluded"], [excl(ACC_B, "target_home_missing")])
+
+    def test_ttl_from_config(self):
+        self.cfg = make_cfg(exclusion_ttl_s=30.0)
+        self.env.files[self.path] = json.dumps(record(101, excluded=[excl(ACC_C, ago=31)]))
+        self.env.results = [result("untouched", "not_idle")]
+        self.assertEqual(self.run_switch().record["excluded"], [])
+
+
+class TestExclusionExpiryDispatch(DispatchBase):
+    def test_active_exclusion_skips_target(self):
+        self.env.files[self.rec_path()] = json.dumps(record(101, excluded=[excl(ACC_B, ago=10)]))
+        self.env.results = [result()]
+        self.d.tick()
+        self.assertEqual(self.row(101)["decision"]["target_account_id"], ACC_C)
+
+    def test_expired_exclusion_target_picked_again(self):
+        self.env.files[self.rec_path()] = json.dumps(record(101, excluded=[excl(ACC_B, ago=10)]))
+        self.env.results = [result()]
+        self.env.advance(600)
+        self.d.tick()
+        self.assertEqual(self.row(101)["decision"]["target_account_id"], ACC_B)
+        self.env.run_worker(0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_B, "hard")])
+
+    def test_legacy_exclusion_expires_from_record_time(self):
+        self.env.files[self.rec_path()] = json.dumps(record(101, excluded=[ACC_B], updated_at=_iso_at(0)))
+        self.env.results = [result()]
+        self.d.tick()
+        self.assertEqual(self.row(101)["decision"]["target_account_id"], ACC_C)
+
+
+class TestStoppedTasksHint(RunSwitchBase):
+    def test_record_and_result_note_stopped_tasks(self):
+        r = dataclasses.replace(result("continued", None, ok=True, step="continue_prompt"), tasks_stopped=True)
+        self.env.results = [r]
+        out = self.run_switch()
+        self.assertIs(out.record["result"]["tasks_stopped"], True)
+        self.assertEqual(out.record["hint"], switcher.result_hint(r))
+        self.assertIn(switcher.TASKS_STOPPED_HINT, out.record["hint"])
+
+    def test_no_note_without_stopped_tasks(self):
+        self.env.results = [result("exited", "ready_timeout", step="wait_ready")]
+        out = self.run_switch()
+        self.assertIs(out.record["result"]["tasks_stopped"], False)
+        self.assertEqual(out.record["hint"], switcher.STATE_HINTS["exited"])
+
+    def test_relaunch_pending_log_carries_note(self):
+        r = dataclasses.replace(result("exit_pending", "exit_timeout", step="wait_exit", cmd="cd /x && claude"),
+                                tasks_stopped=True)
+        self.env.results = [r]
+        self.run_switch()
+        pending = self.env.logs("relaunch_pending")
+        self.assertEqual(len(pending), 1)
+        self.assertIn(switcher.TASKS_STOPPED_HINT, pending[0])
+
+
+class TestTrustCopyWiring(RunSwitchBase):
+    def test_copy_trust_passed_with_backup_dir(self):
+        self.env.results = [result()]
+        self.run_switch()
+        kw = self.env.switch_kwargs[0]
+        self.assertIs(kw["copy_trust"], True)
+        self.assertEqual(kw["trust_backup_dir"], os.path.join(self.cfg.state_dir, "backups"))
+
+    def test_copy_trust_off_in_config(self):
+        self.cfg = make_cfg(copy_trust=False)
+        self.env.results = [result()]
+        self.run_switch()
+        self.assertIs(self.env.switch_kwargs[0]["copy_trust"], False)
+
+    def test_dry_run_never_copies(self):
+        self.cfg = make_cfg(dry_run=True)
+        self.env.results = [result()]
+        self.run_switch()
+        self.assertIs(self.env.switch_kwargs[0]["copy_trust"], False)
+
+
 class TestInFlight(DispatchBase):
     def test_lease_boundary(self):
         self.d.tick()
@@ -1852,7 +2036,7 @@ class TestInFlight(DispatchBase):
     def test_lease_follows_configured_timeouts(self):
         self.make(make_cfg(timeouts=switcher.Timeouts(ready_s=120.0)))
         self.d.tick()
-        self.assertEqual(self.d._inflight[SID1].deadline, 1000.0 + 440.0 + 30.0)
+        self.assertEqual(self.d._inflight[SID1].deadline, 1000.0 + 505.0 + 30.0)
 
     def test_on_attempt_refreshes_deadline(self):
         self.env.results = [result("untouched", "target_untrusted"),
@@ -1869,7 +2053,7 @@ class TestInFlight(DispatchBase):
         self.d = Daemon(self.cfg, self.deps, self.deps.make_logger())
         self.d.tick()
         self.env.run_worker(0)
-        self.assertEqual(seen, [1410.0, 1510.0])
+        self.assertEqual(seen, [1475.0, 1575.0])
 
 
 class TestTouchedNeverRetried(DispatchBase):
@@ -2143,7 +2327,7 @@ class TestRunDaemon(RunDaemonBase):
         self.assertEqual(len(self.env.logs("worker_abandoned")), 1)
 
     def test_drain_waits_remaining_lease(self):
-        self._stop_on_first_wait(310.0)
+        self._stop_on_first_wait(375.0)
         self.assertEqual(self.run_d(), 0)
         self.assertEqual(self.env.spawned[0].joins, [100.0])
         self.assertEqual(len(self.env.logs("worker_abandoned")), 1)
