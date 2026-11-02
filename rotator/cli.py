@@ -411,6 +411,7 @@ TITLE = "Claude 계정 사용량"
 NO_ACCOUNTS = "계정 없음 (Orca 프로필 폴더 설정과 데몬 실행 여부를 확인하세요)"
 QUIT_HINT = "q 또는 Ctrl-C 종료"
 REFRESH_FOOTER = "토큰 만료 계정은 데몬이 자동 갱신해: rotator install (또는 rotator daemon)"
+STALE_INSTALL = "설치본이 오래됨 — rotator install 다시 실행"
 # Caps a flexible cell shrinks to only when the natural (uncut) table is wider than the terminal.
 _LABEL_CAP = 18
 _AGE_CAP = 20
@@ -881,7 +882,7 @@ def _detail_lines(pid: object, hint: object, last_result: object) -> List[Tuple[
 
 def render(doc: Optional[dict], now: datetime, tz: tzinfo, width: int, *, color: bool = False,
            soft_pct: float = 85.0, hard_pct: float = 95.0, ambiguous_wide: bool = False,
-           ascii: bool = False) -> List[str]:
+           ascii: bool = False, stale_install: bool = False) -> List[str]:
     """Pure table view of a status document; no line is wider than ``width`` terminal columns, except a
     relaunch command, which is printed whole on its own line."""
     w = max(1, width)
@@ -900,13 +901,14 @@ def render(doc: Optional[dict], now: datetime, tz: tzinfo, width: int, *, color:
         gap = max(2, span - display_width(TITLE, amb) - display_width(right, amb))
         return clip(TITLE + " " * gap + right, w, amb, "")
 
+    stale = [clip(STALE_INSTALL, w, amb, g.ell)] if stale_install else []
     accounts = [a for a in d.get("accounts") or [] if isinstance(a, dict)]
     if not accounts:
-        return [title(0), clip(NO_ACCOUNTS, w, amb, g.ell)]
+        return [title(0)] + stale + [clip(NO_ACCOUNTS, w, amb, g.ell)]
     running = daemon.get("running") is True
     table = _fit_accounts(accounts, now, ctx, w, running, soft_pct, hard_pct)
     legend = "* = Orca 선택 계정   노랑 %s%g%%  빨강 %s%g%%" % (g.ge, soft_pct, g.ge, hard_pct)
-    lines = [title(display_width(table[0], amb))] + table + [clip(legend, w, amb, g.ell)]
+    lines = [title(display_width(table[0], amb))] + stale + table + [clip(legend, w, amb, g.ell)]
     if not running and any(_token_state(a, running, now) == NEEDS_REFRESH for a in accounts):
         lines += _wrap(REFRESH_FOOTER, w, amb, g.ell)
 
@@ -1110,19 +1112,33 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _install_kwargs(cfg: Config, config_path: str) -> dict:
-    return {"plist_path": launchd.plist_path_default(), "repo_root": launchd.repo_root(),
-            "config_path": config_path, "log_dir": LOG_DIR_DEFAULT, "timeouts": cfg.timeouts}
+    return {"plist_path": launchd.plist_path_default(), "source_root": launchd.repo_root(),
+            "state_dir": cfg.state_dir, "config_path": config_path, "log_dir": LOG_DIR_DEFAULT,
+            "timeouts": cfg.timeouts}
+
+
+def _real_stale_check(cfg: Config) -> Callable[[], bool]:
+    return lambda: launchd.install_stale(launchd.plist_path_default(), cfg.state_dir, launchd.repo_root())
+
+
+def _stale_install(check: Optional[Callable[[], bool]]) -> bool:
+    try:
+        return check is not None and check() is True
+    except Exception:  # best effort: the hint must never take the status view down
+        return False
 
 
 def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[Config], Deps]] = None,
          launchctl: Optional[launchd.Runner] = None, uid: Optional[Callable[[], int]] = None,
          stdout: Optional[TextIO] = None, stderr: Optional[TextIO] = None, tz: Optional[tzinfo] = None,
          term_ctl: Optional[Any] = None, read_key: Optional[Callable[[float], Optional[str]]] = None,
-         stdin: Optional[Any] = None) -> int:
+         stdin: Optional[Any] = None, stale_check: Optional[Callable[[], bool]] = None) -> int:
     """Entry point; returns 0 ok, 1 runtime failure, 2 usage or config error.
 
     ``term_ctl`` / ``read_key`` replace the terminal seams of ``status`` (RealTerm on a TTY). Keys and the
     width probe read ``stdin``, which defaults to sys.stdin only when ``stdout`` is not injected either.
+    ``stale_check`` says whether the installed app copy is outdated; it defaults to the real filesystem and git
+    check only when ``make_deps`` is not injected either.
     """
     out = stdout or sys.stdout
     inp = stdin if stdin is not None else (sys.stdin if stdout is None else None)
@@ -1148,7 +1164,8 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
         if args.command == "install":
             rc, msg = launchd.install(runner=run, uid=u, **_install_kwargs(cfg, config_path))
         else:
-            rc, msg = launchd.uninstall(runner=run, uid=u, plist_path=launchd.plist_path_default())
+            rc, msg = launchd.uninstall(runner=run, uid=u, plist_path=launchd.plist_path_default(),
+                                        state_dir=cfg.state_dir)
         print(msg, file=out if rc == 0 else err)
         return rc
     if args.command == "daemon" and args.dry_run:
@@ -1157,13 +1174,16 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
     if args.command == "daemon":
         return run_daemon(cfg, deps)
     if args.command == "status":
-        return _status(args, cfg, deps, out, err, tz or datetime.now().astimezone().tzinfo, term_ctl, read_key, inp)
+        if stale_check is None and make_deps is None:
+            stale_check = _real_stale_check(cfg)
+        return _status(args, cfg, deps, out, err, tz or datetime.now().astimezone().tzinfo, term_ctl, read_key, inp,
+                       stale_check)
     return _switch(args, cfg, deps, out, err)
 
 
 def _status(args: argparse.Namespace, cfg: Config, deps: Deps, out: TextIO, err: TextIO, tz: tzinfo,
             term_ctl: Optional[Any] = None, read_key: Optional[Callable[[float], Optional[str]]] = None,
-            inp: Optional[Any] = None) -> int:
+            inp: Optional[Any] = None, stale_check: Optional[Callable[[], bool]] = None) -> int:
     interval = args.interval
     if args.watch and not interval > 0:  # before any probe: a usage error must not touch the terminal
         print("--interval must be > 0", file=err)
@@ -1174,7 +1194,8 @@ def _status(args: argparse.Namespace, cfg: Config, deps: Deps, out: TextIO, err:
             return 0
         term = term_ctl if term_ctl is not None else (RealTerm(out, inp) if _isatty(out) else None)
         opts: Dict[str, Any] = {"color": _isatty(out) and not os.environ.get("NO_COLOR"),  # no-color.org
-                                "soft_pct": cfg.soft_pct, "hard_pct": cfg.hard_pct, "ascii": args.ascii}
+                                "soft_pct": cfg.soft_pct, "hard_pct": cfg.hard_pct, "ascii": args.ascii,
+                                "stale_install": _stale_install(stale_check)}
         if not args.watch:
             opts["ambiguous_wide"] = _probe(term, args.ascii)
             now = deps.now()
