@@ -416,13 +416,24 @@ class TestDecideThresholds(unittest.TestCase):
 
 
 class TestDecideStatusAndIdentity(unittest.TestCase):
-    def test_shell_never_switches(self):
+    def test_shell_switches_like_idle(self):
         d = _decide("shell", _usage(1, 99), _usage(2, 40))
+        i = _decide("idle", _usage(1, 99), _usage(2, 40))
+        self.assertEqual(d.action, "hard")
+        self.assertEqual(d.target, i.target)
+        self.assertIsNotNone(d.target)
+        self.assertEqual(d.utilization, 99.0)
+
+    def test_shell_soft_not_held_like_busy(self):
+        d = _decide("shell", _usage(1, 90), _usage(2, 40))
+        self.assertEqual(d.action, "soft")
+        self.assertNotIn("waiting for idle", d.reason)
+
+    def test_unknown_status_never_switches(self):
+        d = _decide("unknown", _usage(1, 99), _usage(2, 40))
         self.assertEqual(d.action, "none")
         self.assertIsNone(d.target)
-        self.assertEqual(d.reason, "session status shell: no running Claude turn to switch")
-        self.assertNotIn("hard", d.reason)
-        self.assertEqual(d.utilization, 99.0)
+        self.assertEqual(d.reason, "session status unknown: no running Claude turn to switch")
 
     def test_unknown_beats_unavailable(self):
         d = _decide("unknown", _usage(1, None, source="unavailable"), _usage(2, 40))
@@ -587,9 +598,9 @@ class TestDecideCooldown(unittest.TestCase):
         self.assertNotIn("cooldown", d.reason)
 
     def test_status_gate_beats_cooldown(self):
-        d = self._hot(NOW - timedelta(minutes=1), status="shell")
+        d = self._hot(NOW - timedelta(minutes=1), status="unknown")
         self.assertEqual(d.action, "none")
-        self.assertIn("session status shell", d.reason)
+        self.assertIn("session status unknown", d.reason)
         self.assertNotIn("cooldown", d.reason)
 
     def test_cooldown_follows_config(self):
@@ -879,8 +890,8 @@ class TestFableTrigger(unittest.TestCase):
         own = _fusage(1, 10.0, 20.0, 90.0)
         d = _decide("idle", own, self.cand(), session=_fsession("idle", config_dir="/x/other/.claude"))
         self.assertEqual(d.reason, "unmanaged session: config_dir maps to no profile")
-        d = _decide("shell", own, self.cand(), session=_fsession("shell"))
-        self.assertTrue(d.reason.startswith("session status shell"), d.reason)
+        d = _decide("unknown", own, self.cand(), session=_fsession("unknown"))
+        self.assertTrue(d.reason.startswith("session status unknown"), d.reason)
         d = _decide("idle", self.cand(), profiles=[_profile(1), _profile(2)], session=_fsession("idle"))
         self.assertTrue(d.reason.startswith("current account "), d.reason)
         d = _decide("idle", own, self.cand(), session=_fsession("idle"), last_switch_at=NOW - timedelta(minutes=2))
