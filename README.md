@@ -417,11 +417,10 @@ Three things used to stop an automatic switch until someone stepped in by hand.
   when it finds that title and the option line `1. Exit and stop tasks`, it sends exactly one key: Enter when
   option 1 is highlighted (`❯ 1.`), else `1` then Enter. It never reads the screen again after that key and keeps
   waiting for the exit. Claude Code first stops the session's background agents, which can take longer than
-  `timeouts.exit_s`. So when the first window ends with no exit and no dialog, the switcher waits one more
-  `exit_s` for either (`event=exit_wait_extended`). The log says `event=exit_confirm choice=stop_tasks` (no
-  screen text) and the switch hint
-  adds that the session's background tasks were stopped. Any other dialog gets no key: the wait ends as
-  `exit_timeout` as before.
+  `timeouts.exit_s`. So when the first window ends with no exit and no key sent, the switcher waits one more
+  `exit_s` (`event=exit_wait_extended`). The log says `event=exit_confirm choice=stop_tasks` (no screen text)
+  and the switch hint adds that the session's background tasks were stopped. Any other dialog gets no key: the
+  wait ends as `exit_timeout`, now after up to 2 × `exit_s`.
 - **Exclusions expire.** A target refused at preflight is excluded for that session and the next target is
   tried. Each exclusion is stored as `{"account_id", "reason", "at"}`; those for `target_untrusted`,
   `transcript_not_visible` and `target_home_missing` are ignored after `exclusion_ttl_s` (600 s) and dropped
@@ -473,7 +472,7 @@ starts with the key.
 | `usage_poll_s` | `30` | number >= 15 and < `stale_max_age_s` |
 | `timeouts` | see below | object with only the keys below |
 | `timeouts.idle_s` | `30` | number >= 0 |
-| `timeouts.exit_s` | `30` | number >= 0 |
+| `timeouts.exit_s` | `30` | number >= 0; the exit wait lasts up to twice this when no exit-confirm key was sent |
 | `timeouts.shell_s` | `5` | number >= 0 |
 | `timeouts.ready_s` | `60` | number >= 0 |
 | `timeouts.prompt_s` | `15` | number >= 0 |
