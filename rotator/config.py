@@ -10,7 +10,7 @@ from datetime import timedelta
 from typing import Any, Dict, Optional
 
 from rotator.models import PROFILES_ROOT_DEFAULT, ReadText
-from rotator.policy import PolicyConfig
+from rotator.policy import WEEKLY_TO_5H_RATIO_DEFAULT, WEEKLY_TO_5H_RATIO_MAX, PolicyConfig
 from rotator.switcher import DEFAULT_CONTINUE_PROMPT, MAX_PROMPT_CHARS, Timeouts
 
 CONFIG_DIR_DEFAULT = os.path.expanduser("~/Library/Application Support/claude-account-rotator")
@@ -24,6 +24,7 @@ TOP_KEYS = (
     "soft_pct",
     "hard_pct",
     "target_headroom_pct",
+    "weekly_to_5h_ratio",
     "stale_max_age_s",
     "cooldown_s",
     "clock_skew_tolerance_s",
@@ -59,6 +60,7 @@ class Config:
     soft_pct: float = 85.0
     hard_pct: float = 95.0
     target_headroom_pct: float = 10.0
+    weekly_to_5h_ratio: float = WEEKLY_TO_5H_RATIO_DEFAULT
     stale_max_age_s: float = 900.0
     cooldown_s: float = 300.0
     clock_skew_tolerance_s: float = 300.0
@@ -85,6 +87,7 @@ class Config:
             soft_pct=self.soft_pct,
             hard_pct=self.hard_pct,
             target_headroom_pct=self.target_headroom_pct,
+            weekly_to_5h_ratio=self.weekly_to_5h_ratio,
             stale_max_age=timedelta(seconds=self.stale_max_age_s),
             cooldown=timedelta(seconds=self.cooldown_s),
             clock_skew_tolerance=timedelta(seconds=self.clock_skew_tolerance_s),
@@ -132,6 +135,11 @@ def parse_config(obj: object, *, state_dir: str) -> Config:
             v = _num(key, value)
             if v < 0:
                 raise ConfigError("%s: must be >= 0" % key)
+            vals[key] = v
+        elif key == "weekly_to_5h_ratio":
+            v = _num(key, value)
+            if not 1 <= v <= WEEKLY_TO_5H_RATIO_MAX:
+                raise ConfigError("weekly_to_5h_ratio: must be between 1 and %g" % WEEKLY_TO_5H_RATIO_MAX)
             vals[key] = v
         elif key == "session_poll_s":
             v = _num(key, value)

@@ -634,6 +634,8 @@ def setup_logging(log_dir: str, stderr_is_tty: bool) -> logging.Logger:
 USAGE_BACKOFF_MAX_S = 300.0
 _cache_log = logging.getLogger("rotator.daemon")
 RETRY_AFTER_MAX_S = 900.0
+DECISION_RELOG_S = 600.0
+DECISION_KEYS_KEPT = 8
 RATE_LIMITED_TOKEN = "http_429"
 
 
@@ -983,7 +985,8 @@ class Daemon:
         self._pointer: Tuple[Optional[str], Optional[str]] = (None, None)
         self._orphans_logged: Set[Identity] = set()
         self._hold_logged: Dict[str, str] = {}
-        self._decision_logged: Dict[str, Tuple[str, Optional[str], str]] = {}
+        # session_id -> {decision key: monotonic time it was last logged}
+        self._decision_logged: Dict[str, Dict[Tuple[str, Optional[str], str], float]] = {}
         self._would: Dict[str, Tuple[str, str]] = {}
         self._excluded_logged: Dict[str, Tuple[str, str]] = {}
 
@@ -1020,6 +1023,9 @@ class Daemon:
             self._write_snapshot()
             return
         self._handle_sessions(profiles, usages, found, now)
+        live = {s.session_id for s in found}
+        for sid in [k for k in self._decision_logged if k not in live]:
+            del self._decision_logged[sid]
         if not self.stopping():
             self._usage.refresh_one(profiles, call=self._deps.refresh_token, held=self._deps.refresh_held,
                                     skip=self._switch_accounts(),
@@ -1183,12 +1189,18 @@ class Daemon:
         return row
 
     def _log_decision(self, s: Session, decision: Mapping[str, Any]) -> None:
-        """Log a session's decision when it changes, ignoring numbers so moving percentages do not repeat it:
-        a session that is never switched leaves the reason in the log."""
+        """Log a session's decision when it changes, so a session that is never switched leaves the reason in
+        the log. Numbers are ignored (moving percentages), and a decision logged within DECISION_RELOG_S is not
+        logged again (a session flipping between idle and busy alternates two reasons every turn)."""
         key = (decision["action"], decision["target_account_id"], re.sub(r"\d+(\.\d+)?", "#", decision["reason"]))
-        if self._decision_logged.get(s.session_id) == key:
+        seen = self._decision_logged.setdefault(s.session_id, {})
+        mono = self._deps.monotonic()
+        last = seen.get(key)
+        if last is not None and mono - last < DECISION_RELOG_S:
             return
-        self._decision_logged[s.session_id] = key
+        seen[key] = mono
+        if len(seen) > DECISION_KEYS_KEPT:
+            del seen[min(seen, key=lambda k: seen[k])]
         self._log.info("event=decision pid=%d action=%s target=%s reason=%r", s.pid, decision["action"],
                        decision["target_account_id"], decision["reason"])
 

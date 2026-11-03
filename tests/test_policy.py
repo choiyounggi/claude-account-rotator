@@ -128,6 +128,12 @@ class TestPolicyConfig(unittest.TestCase):
         c = PolicyConfig(soft_pct=90, hard_pct=90)
         self.assertEqual((c.soft_pct, c.hard_pct), (90.0, 90.0))
 
+    def test_weekly_ratio_range(self):
+        self.assertEqual(PolicyConfig(weekly_to_5h_ratio=1).weekly_to_5h_ratio, 1.0)
+        for bad in (0.99, 50.01, True, "6", float("nan")):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "weekly_to_5h_ratio"):
+                PolicyConfig(weekly_to_5h_ratio=bad)
+
     def test_headroom_equal_soft_allowed(self):
         c = PolicyConfig(soft_pct=10, target_headroom_pct=10)
         self.assertEqual((c.soft_pct, c.target_headroom_pct), (10.0, 10.0))
@@ -232,12 +238,13 @@ def _decide(status, *usages, profiles=None, session=None, now=NOW, **kw):
 
 
 H2 = timedelta(hours=2)
+RAW = PolicyConfig(weekly_to_5h_ratio=1)
 D3 = timedelta(days=3)
 
 
 class TestDecideUsability(unittest.TestCase):
     def test_past_reset_window_counts_zero(self):
-        d = _decide("idle", _usage(1, 90, 85, five_resets_at=NOW), _usage(2, 40))
+        d = _decide("idle", _usage(1, 90, 85, five_resets_at=NOW), _usage(2, 40), config=RAW)
         self.assertEqual(d.action, "soft")
         self.assertEqual(d.target.account_id, _pid(2))
         self.assertEqual(d.utilization, 85.0)
@@ -299,7 +306,7 @@ class TestDecideUsability(unittest.TestCase):
     def test_stale_own_with_passed_reset_reads_lower(self):
         own = _usage(1, 96, 10, source="cache", fetched_at=NOW - timedelta(minutes=20),
                      five_resets_at=NOW - timedelta(minutes=1), seven_resets_at=NOW + D3)
-        d = _decide("idle", own, _usage(2, 40))
+        d = _decide("idle", own, _usage(2, 40), config=RAW)
         self.assertEqual(d.action, "none")
         self.assertIsNone(d.target)
         self.assertIn("below soft", d.reason)
@@ -537,8 +544,11 @@ class TestDecideHardTier(unittest.TestCase):
         d = _decide("busy", _usage(1, 97), _usage(2, 80), _usage(3, 90))
         self.assertEqual((d.action, d.target), ("hard", _profile(2)))
 
-    def test_weekly_counts_toward_room(self):
+    def test_weekly_room_is_scaled_to_5h(self):
+        # 3% / 93%: 7 weekly points hold 42 points of a 5-hour window (ratio 6), more room than 81% / 62%.
         d = _decide("idle", _usage(1, 100), _usage(2, 3, 93), _usage(3, 81, 62))
+        self.assertEqual(d.target, _profile(2))
+        d = _decide("idle", _usage(1, 100), _usage(2, 3, 93), _usage(3, 81, 62), config=RAW)
         self.assertEqual(d.target, _profile(3))
 
     def test_any_room_beats_a_limit(self):
@@ -554,8 +564,42 @@ class TestDecideHardTier(unittest.TestCase):
         d = _decide("idle", _usage(1, 100, five_resets_at=NOW + H2),
                     _usage(2, 100, five_resets_at=NOW + timedelta(minutes=20)),
                     _usage(3, 50, 100, seven_resets_at=NOW + timedelta(minutes=10)))
-        self.assertEqual((d.action, d.target), ("hard", _profile(3)))
+        self.assertEqual((d.action, d.target), ("soft", _profile(3)))
         self.assertIn("all accounts at the limit", d.reason)
+
+    def test_reset_wait_never_interrupts_a_turn(self):
+        d = _decide("busy", _usage(1, 100, five_resets_at=NOW + H2),
+                    _usage(2, 100, five_resets_at=NOW + timedelta(minutes=10)))
+        self.assertEqual(d.action, "none")
+        self.assertIn("waiting for idle", d.reason)
+
+    def test_reset_wait_skips_an_account_still_hot_after_the_lift(self):
+        d = _decide("idle", _usage(1, 100, 20, five_resets_at=NOW + H2, seven_resets_at=NOW + D3),
+                    _usage(2, 100, 99.5, five_resets_at=NOW + timedelta(minutes=10), seven_resets_at=NOW + D3))
+        self.assertEqual(d.action, "none")
+
+    def test_reset_wait_ignores_a_limit_already_reset(self):
+        d = _decide("idle", _usage(1, 100, five_resets_at=NOW + H2),
+                    _usage(2, 100, five_resets_at=NOW - timedelta(minutes=1)))
+        self.assertEqual((d.action, d.target), ("hard", _profile(2)))
+
+    def test_reset_wait_counts_the_fable_window_for_fable(self):
+        own = _fusage(1, 100.0, 20.0, 50.0)
+        own = dataclasses.replace(own, five_hour=UsageWindow(100.0, NOW + H2))
+        cand = dataclasses.replace(_fusage(2, 50.0, 20.0, 100.0), fable=UsageWindow(100.0, NOW + timedelta(minutes=10)),
+                                   five_hour=UsageWindow(100.0, NOW + timedelta(minutes=10)))
+        d = _decide("idle", own, cand, session=_fsession("idle"))
+        self.assertEqual((d.action, d.target), ("soft", _profile(2)))
+
+    def test_no_ping_pong_inside_the_hard_tier(self):
+        d = _decide("busy", _usage(1, 96.1), _usage(2, 96.0))
+        self.assertEqual(d.action, "none")
+        d = _decide("busy", _usage(1, 96.1), _usage(2, 94.9))
+        self.assertEqual(d.target, _profile(2))
+
+    def test_at_the_limit_any_room_will_do(self):
+        d = _decide("idle", _usage(1, 100), _usage(2, 99))
+        self.assertEqual((d.action, d.target), ("hard", _profile(2)))
 
     def test_all_limited_stays_when_own_resets_first(self):
         d = _decide("idle", _usage(1, 100, five_resets_at=NOW + timedelta(minutes=9)),
@@ -917,15 +961,15 @@ class TestFableTrigger(unittest.TestCase):
 
     def test_reset_fable_counts_zero(self):
         own = _fusage(1, 10.0, 20.0, 99.0, fable_resets_at=NOW - timedelta(minutes=1))
-        d = _decide("idle", own, self.cand(), session=_fsession("idle"))
+        d = _decide("idle", own, self.cand(), session=_fsession("idle"), config=RAW)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.utilization, 20.0)
         self.assertTrue(d.reason.startswith("max(5h,7d,fable)=20.0%"), d.reason)
 
     def test_non_fable_unchanged(self):
         own = _fusage(1, 10.0, 20.0, 85.0)
-        opus = _decide("idle", own, self.cand(), session=_fsession("idle", model="claude-opus-5-5"))
-        plain = _decide("idle", own, self.cand())
+        opus = _decide("idle", own, self.cand(), session=_fsession("idle", model="claude-opus-5-5"), config=RAW)
+        plain = _decide("idle", own, self.cand(), config=RAW)
         self.assertEqual(opus, plain)
         self.assertEqual(plain.reason, "max(5h,7d)=20.0% below soft 85.0%")
 

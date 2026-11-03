@@ -13,14 +13,22 @@ Orca's global `selected-host` pointer on a usable account.
   with the terminal.
 - **Automatic per-session rotation** — soft switch when idle, hard switch near the limit, then the session
   continues on the new account with `--resume`.
+  - Every account is scored by its load: how close it is to being blocked, in percent of a 5-hour window.
+    The load is `max(5h, 100 - weekly_to_5h_ratio × (100 - 7d))`, plus the raw Fable window for Fable sessions.
+    The weekly window is scaled because its remaining room lasts longer. With the measured ratio 6, an account at
+    3% / 93% (7 weekly points ≈ 42 points of a 5-hour window) has more room than one at 81% / 62%.
+    `weekly_to_5h_ratio: 1` restores the plain `max(5h, 7d)`.
   - Soft tier (`soft_pct` to `hard_pct`): only to an account at or below `soft_pct - target_headroom_pct`.
-  - Hard tier (`hard_pct` and up): to the account with the most room (lowest of max(5h, 7d)) that is below the
-    session's own account, with no headroom line.
-  - When the session's account and every other account are at 100%, the session moves to the account whose
-    limit lifts first, and waits there. This happens only if that account lifts at least 5 minutes sooner
-    than its own; otherwise it stays.
-  - The daemon logs each session's decision whenever it changes (`event=decision`), including why it does not
-    switch.
+  - Hard tier (`hard_pct` and up): to the account with the most room (lowest load) below the session's own
+    account. While the own account is below 100%, the target must also be below `hard_pct`, so two accounts in
+    the hard tier never trade a session back and forth. At 100%, any account with room will do.
+  - When the session's account is at 100% and every fresh account is at 100% too, the session moves to the
+    account whose limit lifts first, and waits there. The move happens only if that account lifts at least
+    5 minutes sooner than its own (any known time when its own is unknown), and only if its load after the
+    lift is below `hard_pct`. It is soft, so a running turn is never interrupted for it. Accounts with stale or
+    unavailable usage are not considered.
+  - The daemon logs each session's decision when it changes (`event=decision`), including why it does not
+    switch. Numbers are ignored, and a decision seen within the last 10 minutes is not logged again.
 - **Fable-aware** — Fable sessions are judged by the highest of the 5-hour, weekly and Fable windows.
 - **Idle-account token refresh** — the daemon refreshes OAuth tokens of accounts with no live session, the same
   way Claude Code does, and writes them back to the same Keychain item.
@@ -438,7 +446,8 @@ starts with the key.
 |-----|---------|------------|
 | `soft_pct` | `85` | number 0-100, <= `hard_pct` |
 | `hard_pct` | `95` | number 0-100, >= `soft_pct` |
-| `target_headroom_pct` | `10` | number 0-100, <= `soft_pct`; a soft-tier target must be at or below `soft_pct - target_headroom_pct` (the hard tier has no line) |
+| `weekly_to_5h_ratio` | `6` | number 1-50; percent of a 5-hour window that one percent of the weekly window holds (see the load above) |
+| `target_headroom_pct` | `10` | number 0-100, <= `soft_pct`; a soft-tier target must be at or below `soft_pct - target_headroom_pct` (the hard tier follows the rules under Features) |
 | `stale_max_age_s` | `900` | number >= 0; older usage is not trusted for a target |
 | `cooldown_s` | `300` | number >= 0; minimum time between switches of one session, and the hard-mode hold after an aborted hard switch |
 | `clock_skew_tolerance_s` | `300` | number >= 0 |

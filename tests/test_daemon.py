@@ -2230,6 +2230,19 @@ class TestTouchedNeverRetried(DispatchBase):
         self.assertEqual(self.switches(), [])
 
 
+class TestResetWaitDispatch(DispatchBase):
+    def test_all_limited_dispatches_soft_to_soonest_reset(self):
+        self.env.pcts = {}
+        for aid, mins in ((ACC_A, 120), (ACC_B, 10), (ACC_C, 60)):
+            self.env.usages[aid] = dataclasses.replace(
+                live(aid, 100.0), five_hour=UsageWindow(100.0, T0 + timedelta(minutes=mins)))
+        self.d.tick()
+        self.assertEqual(self.row(101)["decision"]["action"], "soft")
+        self.assertEqual(self.row(101)["decision"]["target_account_id"], ACC_B)
+        self.env.run_worker(0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_B, "soft")])
+
+
 class TestDecisionLog(DispatchBase):
     def decisions(self):
         return self.env.logs("decision")
@@ -2246,6 +2259,24 @@ class TestDecisionLog(DispatchBase):
         self.tick_after(40)
         self.assertEqual(len(self.decisions()), 2)
         self.assertIn("action=hard target=%s" % ACC_B, self.decisions()[1])
+
+    def test_idle_busy_flip_is_not_relogged(self):
+        self.env.pcts = {ACC_A: 90.0, ACC_B: 80.0, ACC_C: 88.0}
+        for status in ("idle", "busy", "idle", "busy", "idle"):
+            self.env.sessions = [sess(101, ACC_A, status=status)]
+            self.tick_after(10)
+        self.assertEqual(len(self.decisions()), 2)
+        self.env.advance(600)
+        self.env.sessions = [sess(101, ACC_A, status="busy")]
+        self.d.tick()
+        self.assertEqual(len(self.decisions()), 3)
+
+    def test_gone_session_is_forgotten(self):
+        self.d.tick()
+        self.assertIn(SID1, self.d._decision_logged)
+        self.env.sessions = []
+        self.tick_after(10)
+        self.assertNotIn(SID1, self.d._decision_logged)
 
     def test_no_target_reason_is_logged(self):
         self.env.pcts = {ACC_A: 97.0, ACC_B: 99.0, ACC_C: 98.0}
