@@ -1199,8 +1199,9 @@ def _adopt(run: _Run, path: str, entry: dict, *, wait_s: float) -> Optional[Swit
 
     Not adopted: a process on the session's own account (it is the account being left, so the daemon switches
     that new process later), on the default home (not a managed account), or one that never shows an idle
-    registry entry with this account's folder. The continue prompt then runs the same checks as after a relaunch
-    of our own; if our relaunch line landed in that process's input box, the screen check stops it."""
+    registry entry with this account's folder in this same pane. The continue prompt then runs the same checks as
+    after a relaunch of our own; if our relaunch line landed in that process's input box, the screen check stops
+    it."""
     home = os.path.normpath(_home_of(path))
     other = _account_of(run, path)
     if home == os.path.normpath(run.session.config_dir) or other == "default":
@@ -1217,6 +1218,9 @@ def _adopt(run: _Run, path: str, entry: dict, *, wait_s: float) -> Optional[Swit
     ok, env = _guarded(run.procs.read_env, pid)
     env = env if ok and isinstance(env, ProcEnv) else None
     if env is None or not isinstance(env.config_dir, str) or os.path.normpath(env.config_dir) != home:
+        return None
+    if env.terminal_handle != run.session.terminal_handle:
+        # Resumed in another pane: the prompt would be typed into this pane's shell.
         return None
     logger.info("event=adopted pid=%d new_pid=%d account=%s", run.session.pid, pid, other or run.target.account_id)
     run.new_pid = pid

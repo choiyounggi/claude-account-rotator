@@ -2982,6 +2982,12 @@ class TestAdoptForeignResume(unittest.TestCase):
         self.assertEqual(w.run().reason, "launched_elsewhere")
         self.assertIs(w.driver.sent("prompt"), False)
 
+    def test_resumed_in_another_pane_is_left_alone(self):
+        w = self._launched_on_other()
+        w.procs.envs[NEW_PID] = ProcEnv(config_dir=OTHER_HOME, terminal_handle="term_99999999")
+        self.assertEqual(w.run().reason, "launched_elsewhere")
+        self.assertIs(w.driver.sent("prompt"), False)
+
     def test_resumed_on_its_own_account_is_left_alone(self):
         w = World()
         w.fs.files[OLD_HOME + "/sessions/5555.json"] = reg(5555, "idle")
