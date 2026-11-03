@@ -103,8 +103,8 @@ rotator doctor
 - `[fail]` means the rotator cannot run here and the exit code is 1: not macOS, Python older than 3.9, a config
   file other commands refuse (the remaining checks then use the defaults), Orca missing or older than 1.4.224
   (read from `/Applications/Orca.app/Contents/Info.plist`; a suffix after the third number, such as
-  `1.4.250-beta.1`, is ignored), or the `orca` CLI missing. `[warn]` never fails: fewer than two accounts (switching needs two) or a background agent that is not
-  installed or runs an older copy.
+  `1.4.250-beta.1`, is ignored), or the `orca` CLI missing. `[warn]` never fails: fewer than two accounts
+  (switching needs two) or a background agent that is not installed or runs an older copy.
 - The npm `postinstall` step, when npm runs it, does the same: it fails the install when the Xcode Command Line
   Tools are missing (`/usr/bin/python3` is only an installer stub until then) or on a `[fail]` line, and on a
   global install (`npm install -g`) with the background agent already installed (an upgrade) it runs
