@@ -2941,3 +2941,60 @@ class TestTrustDialogOnResume(unittest.TestCase):
         msgs = [r.getMessage() for r in cm.records]
         self.assertIn("event=trust_accepted account=%s path=%s" % (ACC_NEW, CWD), msgs)
         self.assertFalse(any("Quick safety" in m or "Accessing" in m for m in msgs))
+
+
+class TestAdoptForeignResume(unittest.TestCase):
+    """A session something else resumed on another managed account gets the continue prompt instead of idling."""
+
+    def _launched_on_other(self, status="idle", home=OTHER_HOME):
+        w = World()
+        w.fs.files.pop(NEW_REG)
+        w.fs.files[OTHER_REG] = lambda: reg(NEW_PID, status, started_at=2000) if w.driver.sent("relaunch") else None
+        w.procs.envs[NEW_PID] = ProcEnv(config_dir=home, terminal_handle=HANDLE)
+        return w
+
+    def test_launched_elsewhere_idle_is_continued(self):
+        w = self._launched_on_other()
+        res = w.run()
+        self.assertEqual((res.ok, res.step, res.state, res.new_pid, res.other_account_id),
+                         (True, "continue_prompt", "continued", NEW_PID, ACC_OTHER))
+        self.assertIs(w.driver.sent("prompt"), True)
+
+    def test_already_running_elsewhere_is_continued_without_the_line(self):
+        w = World()
+        w.fs.files[OTHER_HOME + "/sessions/5555.json"] = reg(5555, "idle")
+        w.procs.alive[5555] = [True]
+        w.procs.envs[5555] = ProcEnv(config_dir=OTHER_HOME, terminal_handle=HANDLE)
+        res = w.run()
+        self.assertEqual((res.ok, res.state, res.new_pid, res.other_account_id), (True, "continued", 5555, ACC_OTHER))
+        self.assertIs(w.driver.sent("relaunch"), False)
+        self.assertIs(w.driver.sent("prompt"), True)
+
+    def test_busy_foreign_process_is_left_alone(self):
+        w = self._launched_on_other(status="busy")
+        res = w.run()
+        self.assertEqual(res, result("wait_ready", "launched_elsewhere", "relaunched", new_pid=NEW_PID,
+                                     other_account_id=ACC_OTHER))
+        self.assertIs(w.driver.sent("prompt"), False)
+
+    def test_env_on_another_folder_is_left_alone(self):
+        w = self._launched_on_other(home=NEW_HOME)
+        self.assertEqual(w.run().reason, "launched_elsewhere")
+        self.assertIs(w.driver.sent("prompt"), False)
+
+    def test_resumed_on_its_own_account_is_left_alone(self):
+        w = World()
+        w.fs.files[OLD_HOME + "/sessions/5555.json"] = reg(5555, "idle")
+        w.procs.alive[5555] = [True]
+        w.procs.envs[5555] = ProcEnv(config_dir=OLD_HOME, terminal_handle=HANDLE)
+        res = w.run()
+        self.assertEqual(res.reason, "session_already_running")
+        self.assertIs(w.driver.sent("prompt"), False)
+
+    def test_typed_input_stops_the_prompt(self):
+        w = self._launched_on_other()
+        w.driver.screens = [EMPTY_SCREEN] + [_screen("❯ cd /x && claude --resume")] * 20
+        res = w.run()
+        self.assertEqual((res.step, res.reason, res.other_account_id), ("continue_prompt", "input_not_empty",
+                                                                        ACC_OTHER))
+        self.assertIs(w.driver.sent("prompt"), False)

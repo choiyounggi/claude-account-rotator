@@ -1114,8 +1114,9 @@ def _relaunch_onward(run: _Run) -> SwitchResult:
     if live:
         # Something else already resumed this session; the line would land in its input box.
         p, e = _pick(live)
-        return _finish(run, "relaunch", "session_already_running", "relaunched", new_pid=e["pid"],
-                       other_account_id=_account_of(run, p))
+        adopted = _adopt(run, p, e, wait_s=t.ready_s)
+        return adopted or _finish(run, "relaunch", "session_already_running", "relaunched", new_pid=e["pid"],
+                                  other_account_id=_account_of(run, p))
     r = run.driver.send(h, run.line, enter=True, interrupt=False)
     if r.delivery == "refused":
         return _finish(run, "relaunch", "send_refused", "exited")
@@ -1166,8 +1167,10 @@ def _relaunch_onward(run: _Run) -> SwitchResult:
                   for e in [_matching_entry(run, p, exclude=snapshot, dead_is_alive=False)] if e is not None]
         if others:
             p, e = _pick(others)
-            return _finish(run, "wait_ready", "launched_elsewhere", "relaunched", new_pid=e["pid"],
-                           other_account_id=_account_of(run, p))
+            # The ready wait is spent: adopt only a process that is idle right now.
+            adopted = _adopt(run, p, e, wait_s=0.0)
+            return adopted or _finish(run, "wait_ready", "launched_elsewhere", "relaunched", new_pid=e["pid"],
+                                      other_account_id=_account_of(run, p))
         v = _screen_verdict(run)
         if v == "trust_dialog":
             return _finish(run, "wait_ready", "trust_dialog", "relaunched", new_pid=seen[-1] if seen else None)
@@ -1190,16 +1193,49 @@ def _relaunch_onward(run: _Run) -> SwitchResult:
     return _continue_prompt(run)
 
 
-def _continue_prompt(run: _Run) -> SwitchResult:
+def _adopt(run: _Run, path: str, entry: dict, *, wait_s: float) -> Optional[SwitchResult]:
+    """Continue a session that something else (Orca, the user) resumed on another managed account, or on the
+    target, instead of leaving it idle; None when it must not be adopted.
+
+    Not adopted: a process on the session's own account (it is the account being left, so the daemon switches
+    that new process later), on the default home (not a managed account), or one that never shows an idle
+    registry entry with this account's folder. The continue prompt then runs the same checks as after a relaunch
+    of our own; if our relaunch line landed in that process's input box, the screen check stops it."""
+    home = os.path.normpath(_home_of(path))
+    other = _account_of(run, path)
+    if home == os.path.normpath(run.session.config_dir) or other == "default":
+        return None
+    pid = entry["pid"]
+    t = run.timeouts
+
+    def idle() -> bool:
+        e = _matching_entry(run, path, exclude=frozenset(), dead_is_alive=False)
+        return e is not None and e.get("pid") == pid and e.get("status") == "idle"
+
+    if not _wait_until(idle, wait_s, t.poll_s, run.clock, run.sleep):
+        return None
+    ok, env = _guarded(run.procs.read_env, pid)
+    env = env if ok and isinstance(env, ProcEnv) else None
+    if env is None or not isinstance(env.config_dir, str) or os.path.normpath(env.config_dir) != home:
+        return None
+    logger.info("event=adopted pid=%d new_pid=%d account=%s", run.session.pid, pid, other or run.target.account_id)
+    run.new_pid = pid
+    run.state = "verified"
+    return _continue_prompt(run, home=home, other_account_id=other)
+
+
+def _continue_prompt(run: _Run, *, home: Optional[str] = None,
+                     other_account_id: Optional[str] = None) -> SwitchResult:
     h, t = run.session.terminal_handle, run.timeouts
     v = _screen_verdict(run)
     if v:
-        return _finish(run, "continue_prompt", v, "verified", new_pid=run.new_pid)
+        return _finish(run, "continue_prompt", v, "verified", new_pid=run.new_pid, other_account_id=other_account_id)
     r = run.driver.send(h, run.prompt, enter=True, interrupt=False)
     rid = r.request_id
 
     def fail(reason: str) -> SwitchResult:
-        return _finish(run, "continue_prompt", reason, "verified", new_pid=run.new_pid, request_id=rid)
+        return _finish(run, "continue_prompt", reason, "verified", new_pid=run.new_pid, request_id=rid,
+                       other_account_id=other_account_id)
 
     if r.delivery == "refused":
         return fail("send_refused")
@@ -1210,7 +1246,7 @@ def _continue_prompt(run: _Run) -> SwitchResult:
         return fail("prompt_unconfirmed")
     stages = r.stages if isinstance(r.stages, tuple) else ()
     if not (accepted and "turn_started" in stages):
-        reg_path = os.path.join(run.target.home, "sessions", "%d.json" % run.new_pid)
+        reg_path = os.path.join(home or run.target.home, "sessions", "%d.json" % run.new_pid)
 
         def busy() -> bool:
             reg = _read_registry(run.read_text, reg_path)
@@ -1219,7 +1255,8 @@ def _continue_prompt(run: _Run) -> SwitchResult:
         if not _wait_until(busy, t.prompt_s, t.poll_s, run.clock, run.sleep):
             return fail("prompt_unconfirmed")
     run.state = "continued"
-    return _finish(run, "continue_prompt", None, "continued", new_pid=run.new_pid, request_id=rid)
+    return _finish(run, "continue_prompt", None, "continued", new_pid=run.new_pid, request_id=rid,
+                   other_account_id=other_account_id)
 
 
 def switch_session(session: Session, target: Profile, mode: str, *, driver: TerminalDriver,
