@@ -28,6 +28,11 @@ Orca's global `selected-host` pointer on a usable account.
     5 minutes sooner than its own (any known time when its own is unknown), and only if its load after the
     lift is below `hard_pct`. It is soft, so a running turn is never interrupted for it. Accounts with stale or
     unavailable usage are not considered.
+  - Sometimes something else resumes the session first, such as Orca respawning the pane or the user, either
+    before the rotator types its relaunch line or instead of it. If that process runs on another managed account
+    (or the target), is idle, and its environment shows that account's folder, the rotator sends it the continue
+    prompt (`event=adopted`). The prompt goes through the same screen checks, so it stops if text is already in
+    the input box. A resume on the account being left, or on the default `~/.claude`, is left alone.
   - A session refused by a usage limit marks its account at 100% until the reset, even when the usage API is
     unreachable (HTTP 429) and the last reading is older and lower.
     - The daemon reads the latest rate-limit entry in the session's transcript that is newer than the process
