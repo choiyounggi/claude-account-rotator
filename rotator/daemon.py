@@ -513,7 +513,8 @@ def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cf
             res = deps.switch(session, cur_target, cur_mode, driver=deps.make_driver(), procs=deps.procs,
                               timeouts=cfg.timeouts, continue_prompt=cfg.continue_prompt,
                               profiles_root=cfg.profiles_root, copy_trust=cfg.copy_trust and not cfg.dry_run,
-                              trust_backup_dir=os.path.join(cfg.state_dir, BACKUPS_DIRNAME))
+                              trust_backup_dir=os.path.join(cfg.state_dir, BACKUPS_DIRNAME),
+                              accept_trust=cfg.accept_trust_dialog and not cfg.dry_run)
             calls = attempt
             last_mode, last_target = cur_mode, cur_target
             _log_result(logger, session, source, cur_mode, cur_target, attempt, res)

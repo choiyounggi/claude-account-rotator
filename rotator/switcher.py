@@ -44,6 +44,12 @@ DIALOG_MARKERS = ("Do you want to proceed?",)
 # Claude Code 2.1.296 asks this after /exit while background work (a `shell` task) runs; option 1 stops it.
 EXIT_CONFIRM_TITLE = "Background work is running"
 EXIT_CONFIRM_OPTION_RE = re.compile(r"^(❯\s*)?1\.\s+Exit and stop tasks$")
+# Claude Code 2.1.296 opens this on a resume in a folder the account never stored as trusted (the home
+# folder is never stored); the cursor starts on "No, exit" and the options carry no digit shortcut.
+TRUST_TITLE = "Accessing workspace:"
+TRUST_YES_RE = re.compile(r"^(❯\s*)?(\d+\.\s+)?Yes, I trust this folder$")
+TRUST_PATH_MAX_LINES = 4
+KEY_DOWN = "\x1b[B"
 TASKS_STOPPED_HINT = "Background tasks running in the session were stopped at /exit (Exit and stop tasks)."
 RULE_CHARS = frozenset("─━")
 RULE_MIN_LEN = 10
@@ -213,8 +219,9 @@ def _wait_until(probe: Callable[[], Any], budget_s: float, poll_s: float,
 
 def switch_budget_s(timeouts: Timeouts) -> float:
     """Upper bound in seconds for one ``switch_session`` run with these timeouts."""
-    # The exit wait may overrun by one screen read and send one exit-confirm key.
-    return float(5 * ORCA_CALL_TIMEOUT_S + 4 * ORCA_SEND_TIMEOUT_S + timeouts.idle_s + timeouts.exit_s
+    # The exit wait may overrun by one screen read and send one exit-confirm key; the ready wait by one
+    # screen read and one trust-dialog key.
+    return float(6 * ORCA_CALL_TIMEOUT_S + 5 * ORCA_SEND_TIMEOUT_S + timeouts.idle_s + timeouts.exit_s
                  + timeouts.shell_s + 5.0 + timeouts.ready_s + timeouts.prompt_s + 5 * PS_TIMEOUT_S)
 
 
@@ -531,6 +538,39 @@ def exit_confirm_choice(receipt: ScreenReceipt) -> Optional[str]:
     return None
 
 
+def trust_dialog_state(receipt: ScreenReceipt, cwd: str) -> Optional[str]:
+    """"yes" or "no" (where the cursor is) when the bottom of the screen is the trust dialog for ``cwd``, else None.
+
+    The folder line under the title must spell ``cwd`` exactly (a long path may wrap over several lines), so
+    a dialog for any other folder is never answered. Only the lines below the last horizontal rule count.
+    """
+    if not receipt.ok or receipt.source != "screen":
+        return None
+    lines = list(receipt.tail)
+    rules = [i for i, line in enumerate(lines) if _is_rule(line)]
+    region = lines[rules[-1] + 1:] if rules else lines
+    region = [line.replace("│", "").strip() for line in region if line.strip()]
+    try:
+        title = region.index(TRUST_TITLE)
+    except ValueError:
+        return None
+    path, want = "", os.path.normpath(cwd)
+    for line in region[title + 1:title + 1 + TRUST_PATH_MAX_LINES]:
+        path += line
+        if os.path.normpath(path) == want:
+            break
+    else:
+        return None
+    cursors = [line for line in region[title + 1:] if line.startswith("❯")]
+    for line in region[title + 1:]:
+        m = TRUST_YES_RE.match(line)
+        if m:
+            if m.group(1):
+                return "yes"
+            return "no" if cursors else None
+    return None
+
+
 def check_pane_binding(pid: int, handle: str, table: Mapping[int, Tuple[int, str]],
                        env: Optional[ProcEnv]) -> Optional[str]:
     """None when the pane named by ``handle`` directly hosts ``pid``, else one BINDING_FAULTS token."""
@@ -642,7 +682,8 @@ class _Run:
                  procs: ProcessProbe, read_text: ReadText, glob_paths: Callable[[str], List[str]],
                  isdir: Callable[[str], bool], clock: Callable[[], float], sleep: Callable[[float], None],
                  timeouts: Timeouts, prompt: str, profiles_root: str, copy_trust: bool = False,
-                 trust_backup_dir: Optional[str] = None, trust_mirror: Optional[MirrorTrust] = None) -> None:
+                 trust_backup_dir: Optional[str] = None, trust_mirror: Optional[MirrorTrust] = None,
+                 accept_trust: bool = False) -> None:
         self.session = session
         self.target = target
         self.mode = mode
@@ -659,6 +700,7 @@ class _Run:
         self.copy_trust = copy_trust
         self.trust_backup_dir = trust_backup_dir
         self.trust_mirror = trust_mirror
+        self.accept_trust = accept_trust
         self.line = ""
         self.state = "untouched"
         self.status: Optional[str] = None
@@ -704,6 +746,10 @@ def _binding_fault(run: _Run) -> Optional[str]:
 
 def _target_trusted(run: _Run) -> bool:
     return _trusts(run.read_text, os.path.join(run.target.home, ".claude.json"), run.session.cwd)
+
+
+def _source_trusted(run: _Run) -> bool:
+    return _trusts(run.read_text, os.path.join(run.session.config_dir, ".claude.json"), run.session.cwd)
 
 
 def _trusts(read_text: ReadText, config_path: str, cwd: str) -> bool:
@@ -825,7 +871,7 @@ def _copy_trust(run: _Run) -> bool:
     s = run.session
     if not run.copy_trust or run.trust_backup_dir is None:
         return False
-    if not _trusts(run.read_text, os.path.join(s.config_dir, ".claude.json"), s.cwd):
+    if not _source_trusted(run):
         return False
     ok, wrote = _guarded(run.trust_mirror, os.path.join(run.target.home, ".claude.json"), s.cwd,
                          run.trust_backup_dir, run.target.account_id)
@@ -861,7 +907,7 @@ def _preflight(run: _Run) -> Optional[SwitchResult]:
     if not run.glob_paths(os.path.join(glob.escape(target.home), "projects", "*",
                                        glob.escape(s.session_id) + ".jsonl")):
         return fail("transcript_not_visible")
-    if not _target_trusted(run) and not _copy_trust(run):
+    if not _target_trusted(run) and not _copy_trust(run) and not (run.accept_trust and not _source_trusted(run)):
         return fail("target_untrusted")
     ok, alive = _guarded(run.procs.is_alive, s.pid)
     if not ok or not alive:
@@ -1072,11 +1118,29 @@ def _relaunch_onward(run: _Run) -> SwitchResult:
 
     target_glob = os.path.join(glob.escape(run.target.home), "sessions", "*.json")
     seen: List[int] = []
+    trust = {"moved": False, "answered": False}
+
+    def answer_trust() -> None:
+        """Answer the trust dialog for the session's folder, one key per poll."""
+        if not run.accept_trust or trust["answered"]:
+            return
+        state = trust_dialog_state(run.driver.read_screen(h), run.session.cwd)
+        if state == "no" and not trust["moved"]:
+            # One Down only: from "No, exit" it can reach nothing but "Yes", and a second press could wrap
+            # back. Enter waits for a later read that shows the cursor on "Yes".
+            trust["moved"] = True
+            run.driver.send(h, KEY_DOWN, enter=False, interrupt=False)
+        elif state == "yes":
+            if run.driver.send(h, None, enter=True, interrupt=False).delivery != "refused":
+                trust["answered"] = True
+                logger.info("event=trust_accepted account=%s path=%s", run.target.account_id, run.session.cwd)
 
     def probe() -> Optional[Tuple[str, int]]:
         found = [(p, e) for p in run.glob_paths(target_glob)
                  for e in [_matching_entry(run, p, exclude=snapshot, dead_is_alive=False)] if e is not None]
         if not found:
+            # Claude Code 2.1.296 writes no registry entry until the trust dialog is answered.
+            answer_trust()
             return None
         _, e = _pick(found)
         seen.append(e["pid"])
@@ -1164,7 +1228,8 @@ def switch_session(session: Session, target: Profile, mode: str, *, driver: Term
                    profiles_root: Optional[str] = None,
                    copy_trust: bool = False,
                    trust_backup_dir: Optional[str] = None,
-                   trust_mirror: Optional[MirrorTrust] = None) -> SwitchResult:
+                   trust_mirror: Optional[MirrorTrust] = None,
+                   accept_trust: bool = False) -> SwitchResult:
     """Restart ``session`` in its Orca pane on ``target``'s account folder.
 
     ValueError only for caller bugs (mode, continue_prompt, timeouts), raised before any step.
@@ -1175,6 +1240,9 @@ def switch_session(session: Session, target: Profile, mode: str, *, driver: Term
     unverifiable process), so the run ends fail-closed with the state of the step where it happened.
     With ``copy_trust`` and a ``trust_backup_dir``, a target that does not trust the session's folder gets the
     trust the session's own account already has for it (``trust_mirror``, default ``mirror_trust``).
+    With ``accept_trust`` a target is still switched when neither it nor the session's own account stores
+    trust for the folder (Claude Code never stores it for the home folder), and the trust dialog Claude Code opens for
+    exactly the session's folder after the relaunch is answered "Yes, I trust this folder".
     """
     if mode not in MODES:
         raise ValueError("mode must be one of MODES")
@@ -1202,6 +1270,7 @@ def switch_session(session: Session, target: Profile, mode: str, *, driver: Term
         copy_trust=copy_trust,
         trust_backup_dir=trust_backup_dir,
         trust_mirror=mirror_trust if trust_mirror is None else trust_mirror,
+        accept_trust=accept_trust,
     )
     res = _preflight(run)
     if res is not None:
