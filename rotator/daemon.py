@@ -125,9 +125,14 @@ def touched(record: Mapping[str, Any]) -> bool:
     return res.get("state") != "untouched"
 
 
-# Results where the only input the session received was one Ctrl-C: nothing was typed, so a later soft switch
-# (which never interrupts) cannot collide with the user's input.
-INTERRUPT_ONLY_REASONS = frozenset({"interrupt_timeout", "dialog_open"})
+# Per step, the reasons of an ``interrupted`` result where the only input the session received was one Ctrl-C:
+# the interrupt step stopped waiting for idle, and the exit step stopped before sending /exit (or the send was
+# refused). Nothing was typed, so a later soft switch (which never interrupts) cannot collide with the user's input.
+INTERRUPT_ONLY_REASONS: Mapping[str, FrozenSet[str]] = {
+    "interrupt": frozenset({"interrupt_timeout", "dialog_open"}),
+    "exit": frozenset({"input_not_empty", "dialog_open", "screen_unreadable", "trust_dialog", "not_idle",
+                       "pane_not_claude", "pane_binding_unverified", "send_refused"}),
+}
 
 
 def interrupt_only(record: Mapping[str, Any]) -> bool:
@@ -135,8 +140,8 @@ def interrupt_only(record: Mapping[str, Any]) -> bool:
     if record.get("record_state") != "final" or record.get("worker_error") is not None:
         return False
     res = record.get("result")
-    return (isinstance(res, dict) and res.get("step") == "interrupt" and res.get("state") == "interrupted"
-            and res.get("reason") in INTERRUPT_ONLY_REASONS)
+    return (isinstance(res, dict) and res.get("state") == "interrupted"
+            and res.get("reason") in INTERRUPT_ONLY_REASONS.get(res.get("step"), frozenset()))
 
 
 def soft_only(record: Optional[Mapping[str, Any]]) -> bool:
@@ -522,6 +527,7 @@ def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cf
         last_mode, last_target = mode, target
         while True:
             attempt += 1
+            asked_hard = cur_mode == "hard"
             if soft and cur_mode == "hard":
                 logger.info("event=hard_downgraded pid=%d reason=interrupted_before", pid)
                 cur_mode = "soft"
@@ -564,7 +570,8 @@ def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cf
                         if nxt is not None:
                             cur_mode, cur_target = nxt
                             continue
-                elif cur_mode == "hard":
+                elif asked_hard:
+                    # Also after a downgrade to soft: without the hold the daemon re-dispatches every tick.
                     hold = _iso(deps.now() + timedelta(seconds=cfg.cooldown_s))
                     logger.warning("event=hard_hold pid=%d until=%s reason=%s", pid, hold, res.reason)
             break
@@ -574,6 +581,7 @@ def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cf
         final = _new_record(session, source=source, mode=last_mode, target=last_target, attempt=calls,
                             now=deps.now(), record_state="final", excluded=excluded, hold=hold, result=res,
                             unswitchable=unswitchable, soft=soft)
+        final["soft_only"] = soft_only(final)
         try:
             deps.write_text(path, _dump(final))
         except Exception as e:
@@ -1154,9 +1162,12 @@ class Daemon:
                 self._hold_logged[s.session_id] = rec["hard_hold_until"]
                 self._log.warning("event=hard_hold_active pid=%d until=%s", s.pid, rec["hard_hold_until"])
             return row
-        if soft_only(rec) and s.status not in ("idle", "shell"):
-            # Soft would fail not_idle; a hard switch would send this identity a second Ctrl-C.
-            return row
+        if soft_only(rec):
+            if d.action == "hard":
+                row["decision"]["action"] = "soft"
+            if s.status not in ("idle", "shell"):
+                # Soft would fail not_idle; a hard switch would send this identity a second Ctrl-C.
+                return row
         if not self._may_switch():
             pair = (d.action, d.target.account_id)
             row["would_switch"] = {"action": pair[0], "target_account_id": pair[1]}

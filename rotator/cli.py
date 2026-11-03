@@ -1391,6 +1391,9 @@ def _switch(args: argparse.Namespace, cfg: Config, deps: Deps, out: TextIO, err:
         return 1
     r = o.result
     assert r is not None
+    if args.mode == "hard" and (o.record or {}).get("mode") == "soft":
+        print("ran as soft: an earlier switch already sent this session a Ctrl-C, so it is never interrupted again",
+              file=out)
     print("ok=%s step=%s reason=%s state=%s new_pid=%s recoverable=%s request_id=%s"
           % (r.ok, r.step, r.reason, r.state, r.new_pid, r.recoverable, r.request_id), file=out)
     hint = result_hint(r)

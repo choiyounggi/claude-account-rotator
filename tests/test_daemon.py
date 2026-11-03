@@ -370,8 +370,11 @@ def interrupted_rec(reason="interrupt_timeout", step="interrupt", state="interru
 
 class TestInterruptOnly(unittest.TestCase):
     def test_ctrl_c_only_results_may_retry_soft(self):
-        for reason in ("interrupt_timeout", "dialog_open"):
-            rec = interrupted_rec(reason)
+        cases = [("interrupt", r) for r in ("interrupt_timeout", "dialog_open")] + [
+            ("exit", r) for r in ("input_not_empty", "dialog_open", "screen_unreadable", "trust_dialog", "not_idle",
+                                  "pane_not_claude", "pane_binding_unverified", "send_refused")]
+        for step, reason in cases:
+            rec = interrupted_rec(reason, step=step)
             self.assertTrue(touched(rec))
             self.assertTrue(daemon.interrupt_only(rec))
             self.assertTrue(daemon.may_retry(rec))
@@ -380,7 +383,9 @@ class TestInterruptOnly(unittest.TestCase):
     def test_other_touched_results_stay_blocked(self):
         for rec in (interrupted_rec("pid_not_alive", state="exited"),
                     interrupted_rec("exit_timeout", step="wait_exit", state="exit_pending"),
-                    interrupted_rec("input_not_empty", step="exit"),
+                    interrupted_rec("screen_unreadable"),
+                    interrupted_rec("pid_not_alive", step="exit"),
+                    interrupted_rec("input_not_empty", step="wait_exit"),
                     interrupted_rec(record_state="in_progress"),
                     interrupted_rec(worker_error="RuntimeError"),
                     {"record_state": "final", "worker_error": None, "result": None}, {}):
@@ -792,7 +797,26 @@ class TestRunSwitch(RunSwitchBase):
         rec = self.stored()
         self.assertIs(rec["soft_only"], True)
         self.assertEqual(rec["mode"], "soft")
-        self.assertIsNone(rec["hard_hold_until"])
+        self.assertIsNotNone(rec["hard_hold_until"])
+
+    def test_soft_request_after_ctrl_c_sets_no_hold(self):
+        self._store(record(101, soft_only=True))
+        self.env.results = [result("untouched", "not_idle")]
+        self.run_switch(mode="soft")
+        self.assertIsNone(self.stored()["hard_hold_until"])
+
+    def test_interrupted_record_itself_is_soft_only(self):
+        self.env.results = [result("interrupted", "interrupt_timeout", step="interrupt")]
+        self.run_switch(mode="hard")
+        self.assertEqual(self.switch_calls(), [("switch", 101, ACC_B, "hard")])
+        self.assertIs(self.stored()["soft_only"], True)
+
+    def test_retarget_after_downgrade_stays_soft(self):
+        self._store(record(101, soft_only=True))
+        self.env.results = [result("untouched", "target_untrusted"), result("untouched", "not_idle")]
+        self.run_switch(mode="hard", next_target=lambda excluded: ("hard", prof(ACC_C)))
+        self.assertEqual(self.switch_calls(), [("switch", 101, ACC_B, "soft"), ("switch", 101, ACC_C, "soft")])
+        self.assertEqual(len(self.env.logs("hard_downgraded")), 2)
 
     def test_soft_only_survives_an_untouched_retry(self):
         self._store(record(101, soft_only=True))
@@ -2228,7 +2252,7 @@ class TestRetryAfterInterrupt(DispatchBase):
         for _ in range(40):
             self.tick_after(10)
         self.assertEqual(len(self.spawns()), 1)
-        self.assertIsNotNone(self.row(101)["decision"])
+        self.assertEqual(self.row(101)["decision"]["action"], "soft")
         self.env.sessions = [sess(101, ACC_A)]
         self.tick_after(10)
         self.assertEqual(len(self.spawns()), 2)
@@ -2245,6 +2269,20 @@ class TestRetryAfterInterrupt(DispatchBase):
         fresh._load_state()
         fresh.tick()
         self.assertEqual(len(self.spawns()), 2)
+        self.env.run_worker(1)
+        self.assertEqual(self.switches()[1], ("switch", 101, ACC_B, "soft"))
+
+    def test_failed_soft_retry_is_held_not_redispatched_each_tick(self):
+        self.env.results = [result("interrupted", "interrupt_timeout", step="interrupt"),
+                            result("untouched", "input_not_empty", step="interrupt")]
+        self.d.tick()
+        self.env.run_worker(0)
+        self.tick_after(400)
+        self.env.run_worker(1)
+        for _ in range(10):
+            self.tick_after(10)
+        self.assertEqual(len(self.spawns()), 2)
+        self.assertIsNotNone(self.stored()["hard_hold_until"])
 
 
 class TestRetryRules(DispatchBase):
