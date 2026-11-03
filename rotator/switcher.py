@@ -50,6 +50,8 @@ TRUST_TITLE = "Accessing workspace:"
 TRUST_YES_RE = re.compile(r"^(❯\s*)?(\d+\.\s+)?Yes, I trust this folder$")
 TRUST_PATH_MAX_LINES = 4
 KEY_DOWN = "\x1b[B"
+# A session resumed by something else is adopted only while its last status change came this soon after it started.
+ADOPT_FRESH_S = 60.0
 TASKS_STOPPED_HINT = "Background tasks running in the session were stopped at /exit (Exit and stop tasks)."
 RULE_CHARS = frozenset("─━")
 RULE_MIN_LEN = 10
@@ -1208,12 +1210,25 @@ def _adopt(run: _Run, path: str, entry: dict, *, wait_s: float) -> Optional[Swit
         return None
     pid = entry["pid"]
     t = run.timeouts
+    seen_busy = [False]
 
-    def idle() -> bool:
+    def idle() -> Optional[dict]:
         e = _matching_entry(run, path, exclude=frozenset(), dead_is_alive=False)
-        return e is not None and e.get("pid") == pid and e.get("status") == "idle"
+        if e is None or e.get("pid") != pid:
+            return None
+        if e.get("status") == "busy":
+            seen_busy[0] = True
+        return e if e.get("status") == "idle" else None
 
-    if not _wait_until(idle, wait_s, t.poll_s, run.clock, run.sleep):
+    found = _wait_until(idle, wait_s, t.poll_s, run.clock, run.sleep)
+    if found is None or seen_busy[0]:
+        return None
+    started, updated = found.get("startedAt"), found.get("statusUpdatedAt")
+    if (not isinstance(started, (int, float)) or not isinstance(updated, (int, float))
+            or isinstance(started, bool) or isinstance(updated, bool)
+            or (updated - started) / 1000.0 > ADOPT_FRESH_S):
+        # Its status changed well after the start: someone has probably used it already, and an unprompted
+        # continue would answer their turn.
         return None
     ok, env = _guarded(run.procs.read_env, pid)
     env = env if ok and isinstance(env, ProcEnv) else None
@@ -1225,20 +1240,22 @@ def _adopt(run: _Run, path: str, entry: dict, *, wait_s: float) -> Optional[Swit
     logger.info("event=adopted pid=%d new_pid=%d account=%s", run.session.pid, pid, other or run.target.account_id)
     run.new_pid = pid
     run.state = "verified"
-    return _continue_prompt(run, home=home, other_account_id=other)
+    # The session already runs: the relaunch line would start a second process, so no result carries it.
+    run.line = ""
+    return _continue_prompt(run, home=home, other_account_id=other, fail_state="relaunched")
 
 
-def _continue_prompt(run: _Run, *, home: Optional[str] = None,
-                     other_account_id: Optional[str] = None) -> SwitchResult:
+def _continue_prompt(run: _Run, *, home: Optional[str] = None, other_account_id: Optional[str] = None,
+                     fail_state: str = "verified") -> SwitchResult:
     h, t = run.session.terminal_handle, run.timeouts
     v = _screen_verdict(run)
     if v:
-        return _finish(run, "continue_prompt", v, "verified", new_pid=run.new_pid, other_account_id=other_account_id)
+        return _finish(run, "continue_prompt", v, fail_state, new_pid=run.new_pid, other_account_id=other_account_id)
     r = run.driver.send(h, run.prompt, enter=True, interrupt=False)
     rid = r.request_id
 
     def fail(reason: str) -> SwitchResult:
-        return _finish(run, "continue_prompt", reason, "verified", new_pid=run.new_pid, request_id=rid,
+        return _finish(run, "continue_prompt", reason, fail_state, new_pid=run.new_pid, request_id=rid,
                        other_account_id=other_account_id)
 
     if r.delivery == "refused":

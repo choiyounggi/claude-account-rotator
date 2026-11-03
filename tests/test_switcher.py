@@ -2982,6 +2982,52 @@ class TestAdoptForeignResume(unittest.TestCase):
         self.assertEqual(w.run().reason, "launched_elsewhere")
         self.assertIs(w.driver.sent("prompt"), False)
 
+    def _already_running(self, statuses, home=OTHER_HOME, updated_s=0):
+        """statuses[i] is the entry's status from second i of the fake clock on (the last one holds)."""
+        w = World()
+
+        def entry():
+            st = statuses[min(int(w.clock.now), len(statuses) - 1)]
+            return json.dumps({"pid": 5555, "sessionId": SID, "cwd": CWD, "startedAt": 1000, "status": st,
+                               "statusUpdatedAt": 1000 + updated_s * 1000, "procStart": "0"})
+        w.fs.files[home + "/sessions/5555.json"] = entry
+        w.procs.alive[5555] = [True]
+        w.procs.envs[5555] = ProcEnv(config_dir=home, terminal_handle=HANDLE)
+        return w
+
+    def test_already_running_adopted_once_it_goes_idle(self):
+        w = self._already_running(["waiting", "waiting", "idle"])
+        res = w.run()
+        self.assertEqual((res.ok, res.new_pid, res.relaunch_command), (True, 5555, ""))
+
+    def test_a_turn_seen_during_the_wait_blocks_adoption(self):
+        w = self._already_running(["busy", "idle"])
+        res = w.run()
+        self.assertEqual(res.reason, "session_already_running")
+        self.assertIs(w.driver.sent("prompt"), False)
+
+    def test_a_late_status_change_blocks_adoption(self):
+        w = self._already_running(["idle"], updated_s=600)
+        self.assertEqual(w.run().reason, "session_already_running")
+        self.assertIs(w.driver.sent("prompt"), False)
+
+    def test_default_home_is_left_alone(self):
+        home = os.path.expanduser("~/.claude")
+        w = self._already_running(["idle"], home=home)
+        self.assertEqual(w.run().reason, "session_already_running")
+        self.assertIs(w.driver.sent("prompt"), False)
+
+    def test_already_running_in_another_pane_is_left_alone(self):
+        w = self._already_running(["idle"])
+        w.procs.envs[5555] = ProcEnv(config_dir=OTHER_HOME, terminal_handle="term_99999999")
+        self.assertEqual(w.run().reason, "session_already_running")
+
+    def test_failed_adopted_prompt_carries_no_relaunch_line(self):
+        w = self._launched_on_other()
+        w.driver.screens = [EMPTY_SCREEN] + [_screen("❯ typed")] * 20
+        res = w.run()
+        self.assertEqual((res.state, res.reason, res.relaunch_command), ("relaunched", "input_not_empty", ""))
+
     def test_resumed_in_another_pane_is_left_alone(self):
         w = self._launched_on_other()
         w.procs.envs[NEW_PID] = ProcEnv(config_dir=OTHER_HOME, terminal_handle="term_99999999")
