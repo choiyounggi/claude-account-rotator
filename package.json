@@ -1,0 +1,31 @@
+{
+  "name": "claude-account-rotator",
+  "version": "0.1.0",
+  "description": "Switch Orca-hosted Claude Code sessions to another account before they hit the rate limit (macOS).",
+  "license": "MIT",
+  "author": "choiyounggi",
+  "homepage": "https://github.com/choiyounggi/claude-account-rotator#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/choiyounggi/claude-account-rotator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/choiyounggi/claude-account-rotator/issues"
+  },
+  "keywords": ["claude", "claude-code", "orca", "rate-limit", "macos"],
+  "os": ["darwin"],
+  "engines": {
+    "node": ">=16"
+  },
+  "bin": {
+    "rotator": "bin/rotator"
+  },
+  "files": [
+    "bin/rotator",
+    "rotator/*.py",
+    "scripts/postinstall.js"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  }
+}

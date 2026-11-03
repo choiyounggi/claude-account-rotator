@@ -1,4 +1,4 @@
-"""The rotator command line: status, daemon, switch, install, uninstall."""
+"""The rotator command line: status, daemon, switch, install, uninstall, doctor."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import os
+import platform
 import re
 import select
 import shutil
@@ -24,7 +25,7 @@ import unicodedata
 from datetime import datetime, timezone, tzinfo
 from typing import Any, Callable, Dict, List, Optional, Sequence, TextIO, Tuple
 
-from rotator import launchd, refresh
+from rotator import doctor, launchd, refresh
 from rotator.accounts import profile_for_config_dir
 from rotator.config import CONFIG_PATH_DEFAULT, LOG_DIR_DEFAULT, Config, ConfigError, load_config
 from rotator.daemon import (
@@ -33,7 +34,7 @@ from rotator.daemon import (
 )
 from rotator.policy import decide
 from rotator.sessions import session_homes
-from rotator.switcher import build_relaunch_command, result_hint
+from rotator.switcher import ORCA_BINARY_DEFAULT, build_relaunch_command, result_hint
 
 STATUS_SCHEMA = 1
 STATUS_KEYS = ("schema", "generated_at", "daemon", "accounts", "pointer_account_id", "sessions",
@@ -1154,7 +1155,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="rotator",
         description="Switch Orca-hosted Claude Code sessions to another account before they hit the rate limit.")
     p.add_argument("--config", metavar="PATH", default=None, help="config file (default: %s)" % CONFIG_PATH_DEFAULT)
-    sub = p.add_subparsers(dest="command", metavar="{status,daemon,switch,install,uninstall}")
+    sub = p.add_subparsers(dest="command", metavar="{status,daemon,switch,install,uninstall,doctor}")
     st = sub.add_parser("status", help="show accounts, usage and sessions")
     mode = st.add_mutually_exclusive_group()
     mode.add_argument("--watch", action="store_true", help="redraw until q or Ctrl-C")
@@ -1177,6 +1178,7 @@ def build_parser() -> argparse.ArgumentParser:
     sw.add_argument("--dry-run", action="store_true", help="print the decision and relaunch line; send nothing")
     sub.add_parser("install", help="install and start the launchd user agent")
     sub.add_parser("uninstall", help="stop and remove the launchd user agent")
+    sub.add_parser("doctor", help="check that this Mac can run the rotator (macOS, Orca version, accounts)")
     return p
 
 
@@ -1190,6 +1192,24 @@ def _real_stale_check(cfg: Config) -> Callable[[], bool]:
     return lambda: launchd.install_stale(launchd.plist_path_default(), cfg.state_dir, launchd.repo_root())
 
 
+def _real_orca_gate() -> Optional[str]:
+    return doctor.gate(platform.system(), doctor.orca_version())
+
+
+def _doctor(cfg: Config, deps: Deps, out: TextIO, stale: bool) -> int:
+    try:
+        count = len(deps.discover_profiles(cfg.profiles_root))
+    except Exception:
+        count = 0
+    checks = [doctor.check_system(platform.system()), doctor.check_python(sys.version_info[:3]),
+              doctor.check_orca(doctor.orca_version()),
+              doctor.check_orca_cli(ORCA_BINARY_DEFAULT, os.access(ORCA_BINARY_DEFAULT, os.X_OK)),
+              doctor.check_accounts(count, cfg.profiles_root),
+              doctor.check_agent(os.path.isfile(launchd.plist_path_default()), stale)]
+    print("\n".join(doctor.render(checks)), file=out)
+    return doctor.exit_code(checks)
+
+
 def _stale_install(check: Optional[Callable[[], bool]]) -> bool:
     try:
         return check is not None and check() is True
@@ -1201,13 +1221,17 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
          launchctl: Optional[launchd.Runner] = None, uid: Optional[Callable[[], int]] = None,
          stdout: Optional[TextIO] = None, stderr: Optional[TextIO] = None, tz: Optional[tzinfo] = None,
          term_ctl: Optional[Any] = None, read_key: Optional[Callable[[float], Optional[str]]] = None,
-         stdin: Optional[Any] = None, stale_check: Optional[Callable[[], bool]] = None) -> int:
+         stdin: Optional[Any] = None, stale_check: Optional[Callable[[], bool]] = None,
+         orca_gate: Optional[Callable[[], Optional[str]]] = None) -> int:
     """Entry point; returns 0 ok, 1 runtime failure, 2 usage or config error.
 
     ``term_ctl`` / ``read_key`` replace the terminal seams of ``status`` (RealTerm on a TTY). Keys and the
     width probe read ``stdin``, which defaults to sys.stdin only when ``stdout`` is not injected either.
     ``stale_check`` says whether the installed app copy is outdated; it defaults to the real filesystem and git
     check only when ``make_deps`` is not injected either.
+    ``orca_gate`` returns why this Mac cannot run the rotator (not macOS, Orca missing or older than
+    doctor.ORCA_MIN_VERSION) or None; every command but ``doctor`` and ``uninstall`` refuses with exit 2 on a
+    reason. It defaults to the real check only when neither ``make_deps`` nor ``launchctl`` is injected.
     """
     out = stdout or sys.stdout
     inp = stdin if stdin is not None else (sys.stdin if stdout is None else None)
@@ -1227,6 +1251,13 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
     except ConfigError as e:
         print("config error: %s" % e, file=err)
         return 2
+    if orca_gate is None and make_deps is None and launchctl is None:
+        orca_gate = _real_orca_gate
+    if args.command not in ("doctor", "uninstall") and orca_gate is not None:
+        reason = orca_gate()
+        if reason is not None:
+            print("cannot run here: %s (see: rotator doctor)" % reason, file=err)
+            return 2
     if args.command in ("install", "uninstall"):
         run = launchctl or launchd.run_launchctl
         u = (uid or os.getuid)()
@@ -1240,6 +1271,10 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
     if args.command == "daemon" and args.dry_run:
         cfg = dataclasses.replace(cfg, dry_run=True)
     deps = (make_deps or real_deps)(cfg)
+    if args.command == "doctor":
+        if stale_check is None and make_deps is None:
+            stale_check = _real_stale_check(cfg)
+        return _doctor(cfg, deps, out, _stale_install(stale_check))
     if args.command == "daemon":
         return run_daemon(cfg, deps)
     if args.command == "status":

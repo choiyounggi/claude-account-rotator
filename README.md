@@ -61,25 +61,56 @@ Orca's global `selected-host` pointer on a usable account.
 ## Quick start
 
 ```sh
-git clone https://github.com/choiyounggi/claude-account-rotator.git
-cd claude-account-rotator
-bin/rotator status --watch     # dashboard only, changes nothing
-bin/rotator daemon --dry-run   # see what the daemon would do, sends nothing
-bin/rotator install            # run the daemon in the background (automatic switching on)
+npm install -g claude-account-rotator   # checks this Mac first (rotator doctor), then installs `rotator`
+rotator status --watch                  # dashboard only, changes nothing
+rotator daemon --dry-run                # see what the daemon would do, sends nothing
+rotator install                         # run the daemon in the background (automatic switching on)
 ```
+
+Nothing else to set up: the rotator finds the Claude accounts you already added in Orca, and every config key
+has a default. From a checkout, run `bin/rotator` instead of `rotator`
+(`git clone https://github.com/choiyounggi/claude-account-rotator.git`).
 
 ## Requirements
 
 - macOS.
-- Orca with folder-based Claude accounts under `~/Library/Application Support/orca/claude-profiles`.
-- `/usr/bin/python3` 3.9 or newer.
-- Standard library only; nothing to install with pip.
+- Orca **1.4.224 or newer**, the first release that keeps one folder per Claude account under
+  `~/Library/Application Support/orca/claude-profiles` (Orca PR #24434). Older Orca shared one credential set
+  between accounts, which the rotator cannot switch between. Every command except `doctor` and `uninstall`
+  refuses with exit 2 on an older or missing Orca.
+- `/usr/bin/python3` 3.9 or newer (it comes with the Xcode Command Line Tools: `xcode-select --install`).
+- Standard library only; nothing to install with pip. Node is needed only for the npm install.
+
+## Doctor
+
+```sh
+rotator doctor
+```
+
+```
+[ok]   macOS             26.5.1
+[ok]   Python            3.9.6 (/Applications/Xcode.app/Contents/Developer/usr/bin/python3)
+[ok]   Orca              1.4.241 (1.4.224 or newer)
+[ok]   orca CLI          /Applications/Orca.app/Contents/Resources/bin/orca
+[ok]   Claude accounts   6 under /Users/<you>/Library/Application Support/orca/claude-profiles
+[warn] background agent  not installed: run `rotator install` to switch automatically
+```
+
+- `[fail]` means the rotator cannot run here and the exit code is 1: not macOS, Python older than 3.9, Orca
+  missing or older than 1.4.224 (read from `/Applications/Orca.app/Contents/Info.plist`), or the `orca` CLI
+  missing. `[warn]` never fails: fewer than two accounts (switching needs two) or a background agent that is not
+  installed or runs an older copy.
+- The npm `postinstall` step runs `rotator doctor` and fails the install on a `[fail]` line. Before that it fails
+  when the Xcode Command Line Tools are missing, since `/usr/bin/python3` is only an installer stub until then.
+  When the background agent is already installed (an upgrade), it then runs `rotator install` so the agent runs
+  the new version; as root it only prints a reminder. npm shows this output only when the step fails.
 
 ## Install / uninstall
 
 ```sh
-bin/rotator install      # copies the app, writes the launchd user agent and starts it
-bin/rotator uninstall    # stops it and removes the plist and the app copy
+rotator install      # copies the app, writes the launchd user agent and starts it
+rotator uninstall    # stops it and removes the plist and the app copy
+npm uninstall -g claude-account-rotator   # after `rotator uninstall`, for an npm install
 ```
 
 - `install` copies the runnable app — `bin/rotator` and `rotator/*.py`, nothing else (no tests, no `.git`) — into
@@ -92,7 +123,9 @@ bin/rotator uninstall    # stops it and removes the plist and the app copy
   plist and the running agent untouched. `app/VERSION` records the source commit and the copy time.
 - **Re-run `rotator install` after updating the code** (`git pull` or any edit): the agent keeps running the old
   copy until then. `rotator status` shows `설치본이 오래됨 — rotator install 다시 실행` when the installed copy
-  came from a different commit than the checkout you run it from.
+  came from a different commit than the checkout you run it from. An npm install has no `.git`, so `app/VERSION`
+  records `v<package.json version>` instead and the hint compares versions; `npm install -g` of a new version
+  re-runs `rotator install` by itself when the agent is installed.
 - `install` then writes `~/Library/LaunchAgents/io.github.choiyounggi.claude-account-rotator.plist` and runs
   `launchctl bootstrap gui/<uid>` on it. Running it again replaces a loaded agent (`bootout`, then `bootstrap`).
   Right after `bootout` the old instance may still be exiting, and `bootstrap` then fails with
@@ -613,6 +646,10 @@ Numbers must be finite and not `true`/`false`.
     folder line, `Yes, I trust this folder`); the older `Trust this directory?` layout is not answered. Answering
     it also accepts the folder's `.claude/settings.json` permissions that the dialog lists, exactly as the
     session's own account did when the user opened it there.
+27. The Orca minimum (1.4.224) is the first release with folder-based Claude accounts, read from the Orca source
+    history; the rotator itself was measured only on Orca 1.4.241, so 1.4.224 to 1.4.240 pass `doctor` without
+    having been run against. The check reads `/Applications/Orca.app` only, the same place the `orca` CLI is
+    taken from.
 
 ## License
 
