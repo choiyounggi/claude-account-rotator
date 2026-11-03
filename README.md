@@ -65,7 +65,7 @@ bin/rotator uninstall    # stops it and removes the plist and the app copy
   never a pattern), removes the plist, then removes exactly `app/` under the state dir — only if it is a real
   directory there; a symlink or file in its place is reported and left alone.
 - The agent runs `/usr/bin/python3 <state dir>/app/bin/rotator --config <abs path> daemon` from `<state dir>/app`
-  with `RunAtLoad` and `KeepAlive`. Its `ExitTimeOut` is computed from `timeouts` at install time (505 s with the
+  with `RunAtLoad` and `KeepAlive`. Its `ExitTimeOut` is computed from `timeouts` at install time (570 s with the
   defaults: one full switch plus margin), so re-run `rotator install` after changing `timeouts`.
 - Run `rotator uninstall` before running `rotator daemon` in the foreground. Otherwise the second copy finds the
   daemon lock held and exits 1, and with `KeepAlive` launchd restarts the agent copy every 10 s
@@ -388,6 +388,17 @@ Three things used to stop an automatic switch until someone stepped in by hand.
   and keeps the previous file as `<state dir>/backups/claude.json.<account8>.<UTC stamp>` (0600, newest 20
   kept). The log says `event=trust_copied account=<id> path=<cwd>`. Any failure leaves the file as it was and
   the result stays `target_untrusted`. `dry_run` never writes it.
+- **The trust dialog on resume** (`accept_trust_dialog`). Some folders are never stored as trusted: Claude Code
+  does not persist trust for the home folder, so every resume there asks again, and a folder trusted in no
+  account cannot be mirrored. With `accept_trust_dialog` such a session is still switched (the session already
+  runs in that folder, so the user accepted it there), and after the relaunch the rotator watches the screen
+  while the new process has no registry entry yet. Claude Code 2.1.296 opens a dialog titled
+  `Accessing workspace:` with the folder on the next line and the options `No, exit` / `Yes, I trust this
+  folder`, cursor on `No, exit` and no digit shortcut. Only when the folder shown is exactly the session's `cwd`
+  (a wrapped long path is joined) does it press Down, read the screen again, and press Enter once the cursor
+  (`❯`) is on `Yes, I trust this folder`; at most three Down keys. A dialog for any other folder, or any other
+  dialog, gets no key and the switch ends as `trust_dialog` as before. The log says
+  `event=trust_accepted account=<id> path=<cwd>` (no screen text). `dry_run` never answers it.
 
 ## Configuration
 
@@ -421,6 +432,7 @@ starts with the key.
 | `session_token_warmup_request` | `true` | `true` / `false`; `false` keeps the warm-up to Step A (no model request) |
 | `exclusion_ttl_s` | `600` | number >= 0; how long a target refused for `target_untrusted`, `transcript_not_visible` or `target_home_missing` stays excluded for a session (see "Getting past refusals") |
 | `copy_trust` | `true` | `true` / `false`; mirror the session's own folder trust into the target account (see "Getting past refusals") |
+| `accept_trust_dialog` | `true` | `true` / `false`; switch untrusted targets anyway and answer the trust dialog for exactly the session's folder after the relaunch (see "Getting past refusals") |
 | `profiles_root` | `~/Library/Application Support/orca/claude-profiles` | absolute path (`~` expanded) |
 
 Numbers must be finite and not `true`/`false`.
@@ -528,6 +540,10 @@ Numbers must be finite and not `true`/`false`.
     before the rename narrows the window but cannot close it: a Claude Code write that lands between the re-read
     and the rename is lost (the previous file is in `<state dir>/backups/`). Keys are kept as a JSON round trip
     allows (2-space indent, key order kept); number formatting may differ from Claude Code's.
+26. The trust dialog is recognised by its text as rendered by Claude Code 2.1.296 (`Accessing workspace:`, the
+    folder line, `Yes, I trust this folder`); the older `Trust this directory?` layout is not answered. Answering
+    it also accepts the folder's `.claude/settings.json` permissions that the dialog lists, exactly as the
+    session's own account did when the user opened it there.
 
 ## License
 

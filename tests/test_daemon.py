@@ -676,7 +676,7 @@ class TestRunSwitch(RunSwitchBase):
         self.assertEqual(rec["target_account_id"], ACC_B)
         kw = self.env.switch_kwargs[0]
         self.assertEqual(set(kw), {"driver", "procs", "timeouts", "continue_prompt", "profiles_root", "copy_trust",
-                                   "trust_backup_dir"})
+                                   "trust_backup_dir", "accept_trust"})
         self.assertIs(kw["timeouts"], self.cfg.timeouts)
         self.assertEqual(kw["profiles_root"], ROOT)
         self.assertEqual(self.env.driver_calls, [])
@@ -2014,6 +2014,18 @@ class TestTrustCopyWiring(RunSwitchBase):
         self.env.results = [result()]
         self.run_switch()
         self.assertIs(self.env.switch_kwargs[0]["copy_trust"], False)
+        self.assertIs(self.env.switch_kwargs[0]["accept_trust"], False)
+
+    def test_accept_trust_on_by_default(self):
+        self.env.results = [result()]
+        self.run_switch()
+        self.assertIs(self.env.switch_kwargs[0]["accept_trust"], True)
+
+    def test_accept_trust_off_in_config(self):
+        self.cfg = make_cfg(accept_trust_dialog=False)
+        self.env.results = [result()]
+        self.run_switch()
+        self.assertIs(self.env.switch_kwargs[0]["accept_trust"], False)
 
 
 class TestInFlight(DispatchBase):
@@ -2036,7 +2048,7 @@ class TestInFlight(DispatchBase):
     def test_lease_follows_configured_timeouts(self):
         self.make(make_cfg(timeouts=switcher.Timeouts(ready_s=120.0)))
         self.d.tick()
-        self.assertEqual(self.d._inflight[SID1].deadline, 1000.0 + 505.0 + 30.0)
+        self.assertEqual(self.d._inflight[SID1].deadline, 1000.0 + 570.0 + 30.0)
 
     def test_on_attempt_refreshes_deadline(self):
         self.env.results = [result("untouched", "target_untrusted"),
@@ -2053,7 +2065,7 @@ class TestInFlight(DispatchBase):
         self.d = Daemon(self.cfg, self.deps, self.deps.make_logger())
         self.d.tick()
         self.env.run_worker(0)
-        self.assertEqual(seen, [1475.0, 1575.0])
+        self.assertEqual(seen, [1540.0, 1640.0])
 
 
 class TestTouchedNeverRetried(DispatchBase):
@@ -2320,14 +2332,14 @@ class TestRunDaemon(RunDaemonBase):
         self.env.wait_hook = hook
 
     def test_drain_abandons_overrun_worker(self):
-        self._stop_on_first_wait(500.0)
+        self._stop_on_first_wait(565.0)
         self.assertEqual(self.run_d(), 0)
         self.assertEqual(len(self.env.spawned), 1)
         self.assertEqual(self.env.spawned[0].joins, [0.0])
         self.assertEqual(len(self.env.logs("worker_abandoned")), 1)
 
     def test_drain_waits_remaining_lease(self):
-        self._stop_on_first_wait(375.0)
+        self._stop_on_first_wait(440.0)
         self.assertEqual(self.run_d(), 0)
         self.assertEqual(self.env.spawned[0].joins, [100.0])
         self.assertEqual(len(self.env.logs("worker_abandoned")), 1)

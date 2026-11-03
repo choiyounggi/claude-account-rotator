@@ -250,18 +250,19 @@ class TestWaitUntil(unittest.TestCase):
 
 
 class TestSwitchBudget(unittest.TestCase):
-    def test_default_budget_is_445(self):
-        # 380 s before the exit-confirm dialog: + one screen read overrunning the exit wait + one confirm send.
-        self.assertEqual(switch_budget_s(Timeouts()), 445.0)
+    def test_default_budget_is_510(self):
+        # 380 s before the exit-confirm dialog: + one screen read overrunning the exit wait + one confirm send,
+        # and the same again for the ready wait answering the trust dialog.
+        self.assertEqual(switch_budget_s(Timeouts()), 510.0)
 
     def test_budget_tracks_timeouts(self):
         t = Timeouts(idle_s=0, exit_s=0, shell_s=0, ready_s=0, prompt_s=0)
-        self.assertEqual(switch_budget_s(t), 305.0)
+        self.assertEqual(switch_budget_s(t), 370.0)
 
-    def test_budget_covers_exit_confirm_calls(self):
+    def test_budget_covers_exit_confirm_and_trust_calls(self):
         base = 4 * sw.ORCA_CALL_TIMEOUT_S + 3 * sw.ORCA_SEND_TIMEOUT_S + 5.0 + 5 * sw.PS_TIMEOUT_S
         t = Timeouts(idle_s=0, exit_s=0, shell_s=0, ready_s=0, prompt_s=0)
-        self.assertEqual(switch_budget_s(t) - base, sw.ORCA_CALL_TIMEOUT_S + sw.ORCA_SEND_TIMEOUT_S)
+        self.assertEqual(switch_budget_s(t) - base, 2 * (sw.ORCA_CALL_TIMEOUT_S + sw.ORCA_SEND_TIMEOUT_S))
 
 
 # ---------------------------------------------------------------- Task 03
@@ -1022,6 +1023,8 @@ class FakeDriver:
             return "enter"
         if text == "1":
             return "digit"
+        if text == sw.KEY_DOWN:
+            return "down"
         if text == "/exit":
             return "exit"
         if text.startswith("cd "):
@@ -2761,3 +2764,141 @@ class TestSeamFailures(unittest.TestCase):
         for m in messages:
             self.assertNotIn("/Users/user", m)
             self.assertNotIn("embedded", m)
+
+
+# ---------------------------------------------------------------- trust dialog on resume
+
+
+def _trust_dialog(*, on_yes=False, path_lines=(CWD,), above=("● earlier answer",)):
+    lines = tuple(above) + (
+        RULE,
+        " Accessing workspace:",
+        "",
+    ) + tuple(" " + p for p in path_lines) + (
+        "",
+        " Quick safety check: Is this a project you created or one you trust?",
+        "",
+        " Claude Code'll be able to read, edit, and execute files here.",
+        "",
+        " Security guide",
+        "",
+        "   No, exit" if on_yes else " ❯ No, exit",
+        " ❯ Yes, I trust this folder" if on_yes else "   Yes, I trust this folder",
+        "",
+        " Enter to confirm · Esc to cancel",
+    )
+    return ScreenReceipt(ok=True, source="screen", tail=lines)
+
+
+TRUST_ON_NO = _trust_dialog()
+TRUST_ON_YES = _trust_dialog(on_yes=True)
+
+
+class TestTrustDialogState(unittest.TestCase):
+    def test_cursor_position(self):
+        self.assertEqual(sw.trust_dialog_state(TRUST_ON_NO, CWD), "no")
+        self.assertEqual(sw.trust_dialog_state(TRUST_ON_YES, CWD), "yes")
+
+    def test_wrapped_path(self):
+        rec = _trust_dialog(path_lines=("/Users/user/pr", "oj/repo"))
+        self.assertEqual(sw.trust_dialog_state(rec, CWD), "no")
+        self.assertEqual(sw.trust_dialog_state(rec, CWD + "/"), "no")
+
+    def test_other_folder_is_none(self):
+        for path in ("/Users/user/proj", "/Users/user/proj/repo-other", "/Users/user/proj/repo/sub", "/"):
+            with self.subTest(path=path):
+                self.assertIsNone(sw.trust_dialog_state(_trust_dialog(path_lines=(path,)), CWD))
+                self.assertIsNone(sw.trust_dialog_state(_trust_dialog(path_lines=(path,), on_yes=True), CWD))
+
+    def test_quoted_above_input_box_is_none(self):
+        quoted = _screen("❯ ", above=TRUST_ON_YES.tail[1:])
+        self.assertIsNone(sw.trust_dialog_state(quoted, CWD))
+
+    def test_without_cursor_is_none(self):
+        rec = ScreenReceipt(ok=True, source="screen",
+                            tail=tuple(line.replace("❯", " ") for line in TRUST_ON_NO.tail))
+        self.assertIsNone(sw.trust_dialog_state(rec, CWD))
+
+    def test_unreadable_or_other_dialogs_are_none(self):
+        self.assertIsNone(sw.trust_dialog_state(ScreenReceipt(ok=False, tail=TRUST_ON_YES.tail), CWD))
+        self.assertIsNone(sw.trust_dialog_state(
+            ScreenReceipt(ok=True, source="scrollback", tail=TRUST_ON_YES.tail), CWD))
+        self.assertIsNone(sw.trust_dialog_state(ScreenReceipt(ok=True, source="screen", tail=()), CWD))
+        self.assertIsNone(sw.trust_dialog_state(TRUST_SCREEN, CWD))
+        self.assertIsNone(sw.trust_dialog_state(DIALOG_HIGHLIGHTED, CWD))
+        self.assertIsNone(sw.trust_dialog_state(EMPTY_SCREEN, CWD))
+
+
+class TestTrustDialogOnResume(unittest.TestCase):
+    def _world(self, *screens, trusted=False, status_before="none", enters=1):
+        w = World()
+        if not trusted:
+            w.fs.files[TRUST_FILE] = trust()
+
+        def new_reg():
+            if not w.driver.sent("relaunch"):
+                return None
+            if len([c for c in w.driver.sends() if c[2] is None]) < enters:
+                return None if status_before == "none" else reg(NEW_PID, status_before, started_at=2000)
+            return reg(NEW_PID, "busy" if w.driver.sent("prompt") else "idle", started_at=2000)
+
+        w.fs.files[NEW_REG] = new_reg
+        w.driver.screens = [EMPTY_SCREEN] + list(screens)
+        return w
+
+    def test_cursor_moved_to_yes_then_confirmed(self):
+        w = self._world(TRUST_ON_NO, TRUST_ON_YES)
+        self.assertEqual(w.run(accept_trust=True), HAPPY)
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE, sw.KEY_DOWN, None, P])
+        self.assertIn(("send", HANDLE, sw.KEY_DOWN, False, False), w.driver.calls)
+
+    def test_cursor_already_on_yes(self):
+        w = self._world(TRUST_ON_YES)
+        self.assertEqual(w.run(accept_trust=True), HAPPY)
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE, None, P])
+
+    def test_dialog_after_some_polls(self):
+        w = self._world(EMPTY_SCREEN, ScreenReceipt(ok=False), TRUST_ON_YES)
+        self.assertEqual(w.run(accept_trust=True), HAPPY)
+
+    def test_waiting_entry_answered(self):
+        w = self._world(TRUST_ON_YES, status_before="waiting")
+        self.assertEqual(w.run(accept_trust=True), HAPPY)
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE, None, P])
+
+    def test_other_folder_never_answered(self):
+        other = _trust_dialog(path_lines=("/Users/user",), on_yes=True)
+        w = self._world(*([other] * 20))
+        self.assertEqual(w.run(accept_trust=True), result("wait_ready", "trust_dialog", "relaunched"))
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE])
+
+    def test_moves_are_bounded(self):
+        w = self._world(*([TRUST_ON_NO] * 20))
+        self.assertEqual(w.run(accept_trust=True), result("wait_ready", "trust_dialog", "relaunched"))
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE] + [sw.KEY_DOWN] * sw.TRUST_MAX_MOVES)
+
+    def test_off_never_reads_or_answers(self):
+        w = self._world(*([TRUST_ON_YES] * 20), trusted=True)
+        self.assertEqual(w.run(), result("wait_ready", "trust_dialog", "relaunched"))
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE])
+        self.assertEqual(len([c for c in w.driver.calls if c[0] == "read_screen"]), 2)
+
+    def test_untrusted_target_needs_accept(self):
+        assert_untouched(self, self._world(TRUST_ON_YES).run(), "target_untrusted", World())
+        w = self._world(TRUST_ON_YES)
+        self.assertEqual(w.run(accept_trust=True), HAPPY)
+
+    def test_refused_enter_is_retried(self):
+        w = self._world(TRUST_ON_YES, TRUST_ON_YES, enters=2)  # the refused Enter never reached the dialog
+        w.driver.script["enter"] = [SendReceipt("refused", refused_reason="busy")]
+        res = w.run(accept_trust=True)
+        self.assertEqual(res, HAPPY)
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE, None, None, P])
+
+    def test_log_names_folder_not_screen(self):
+        w = self._world(TRUST_ON_YES)
+        with self.assertLogs("rotator.switcher", "DEBUG") as cm:
+            w.run(accept_trust=True)
+        msgs = [r.getMessage() for r in cm.records]
+        self.assertIn("event=trust_accepted account=%s path=%s" % (ACC_NEW, CWD), msgs)
+        self.assertFalse(any("Quick safety" in m or "Accessing" in m for m in msgs))
