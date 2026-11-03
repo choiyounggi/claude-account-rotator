@@ -536,6 +536,30 @@ class TestDecideTargetSelection(unittest.TestCase):
         self.assertEqual(d.utilization, 90.0)
 
 
+class TestDefaultRatio(unittest.TestCase):
+    """The weekly window at the default ratio 6: one weekly point weighs six 5-hour points."""
+
+    def test_weekly_alone_triggers_late(self):
+        self.assertEqual(_decide("idle", _usage(1, 0, 97), _usage(2, 10)).action, "none")
+        d = _decide("idle", _usage(1, 0, 99), _usage(2, 10))
+        self.assertEqual((d.action, d.utilization), ("soft", 94.0))
+        self.assertEqual(_decide("busy", _usage(1, 0, 99.5), _usage(2, 10)).action, "hard")
+
+    def test_stale_lower_bound_uses_the_load(self):
+        own = _usage(1, 10, 99, source="cache", fetched_at=NOW - timedelta(minutes=20),
+                     five_resets_at=NOW + H2, seven_resets_at=NOW + D3)
+        d = _decide("idle", own, _usage(2, 10))
+        self.assertEqual((d.action, d.utilization), ("soft", 94.0))
+
+    def test_pointer_uses_the_load(self):
+        profiles = [_profile(1), _profile(2)]
+        stay = decide_pointer(_profile(1), profiles, _usages(_usage(1, 10, 90), _usage(2, 5)), NOW)
+        self.assertIsNone(stay.target)
+        self.assertIn("load(5h,7d)=40.0%", stay.reason)
+        move = decide_pointer(_profile(1), profiles, _usages(_usage(1, 10, 99), _usage(2, 5)), NOW)
+        self.assertEqual(move.target, _profile(2))
+
+
 class TestDecideHardTier(unittest.TestCase):
     """At or above hard: move to the account with the most room; when every account is at its limit,
     wait on the one that resets first."""

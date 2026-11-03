@@ -28,6 +28,10 @@ Orca's global `selected-host` pointer on a usable account.
     5 minutes sooner than its own (any known time when its own is unknown), and only if its load after the
     lift is below `hard_pct`. It is soft, so a running turn is never interrupted for it. Accounts with stale or
     unavailable usage are not considered.
+  - A session refused by a usage limit marks its account at 100% until the reset, even when the usage API is
+    unreachable (HTTP 429) and the last reading is older and lower. The daemon reads the latest rate-limit entry
+    in the session's transcript that is newer than the process start; earlier entries can belong to another
+    account the session ran on. It logs `event=limit_seen` once per account and reset.
   - The daemon logs each session's decision when it changes (`event=decision`), including why it does not
     switch. Numbers are ignored, and a decision seen within the last 10 minutes is not logged again.
 - **Fable-aware** — Fable sessions are judged by a load that also counts the Fable window. That window is weekly

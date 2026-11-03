@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Sequence, Set, Tuple
@@ -238,6 +239,7 @@ class Deps:
     refresh_token: Callable[..., dict]
     refresh_held: Callable[..., List[str]]
     discover_sessions: Callable[[Sequence[str]], List[Session]]
+    read_limit: Callable[[Session], Optional[Tuple[str, datetime]]]
     switch: Callable[..., SwitchResult]
     make_driver: Callable[[], TerminalDriver]
     procs: ProcessProbe
@@ -639,6 +641,27 @@ DECISION_KEYS_KEPT = 8
 RATE_LIMITED_TOKEN = "http_429"
 
 
+def limit_window(kind: str) -> Optional[str]:
+    """The AccountUsage window a Claude Code rateLimitType refers to, or None for a type with no window."""
+    if kind == "five_hour":
+        return "five_hour"
+    if kind.startswith("seven_day"):
+        return "seven_day"
+    return None
+
+
+def with_limit(u: Optional[AccountUsage], account_id: str, window: str, resets_at: datetime,
+               now: datetime) -> AccountUsage:
+    """u with window at 100% until resets_at, read as fresh now: a session's refusal by the limit is newer and
+    surer than any usage reading."""
+    w = UsageWindow(100.0, resets_at)
+    if u is None or u.source == "unavailable":
+        return AccountUsage(account_id=account_id, source="cache", fetched_at=now,
+                            **{window: w})  # type: ignore[arg-type]
+    return dataclasses.replace(u, source="cache", fetched_at=max(now, u.fetched_at), error=None,
+                               retry_after_s=None, **{window: w})
+
+
 def rate_limited(u: AccountUsage) -> bool:
     """True when the fetch behind u got HTTP 429 (rotator.usage reports error "http_429", or
     "http_429;cache_<reason>" when no cache exists)."""
@@ -987,6 +1010,7 @@ class Daemon:
         self._hold_logged: Dict[str, str] = {}
         # session_id -> {decision key: monotonic time it was last logged}
         self._decision_logged: Dict[str, Dict[Tuple[str, Optional[str], str], float]] = {}
+        self._limit_logged: Dict[str, Tuple[str, str, str]] = {}
         self._would: Dict[str, Tuple[str, str]] = {}
         self._excluded_logged: Dict[str, Tuple[str, str]] = {}
 
@@ -1022,6 +1046,7 @@ class Daemon:
             log.error("event=discover_error what=sessions exc=%s", type(e).__name__)
             self._write_snapshot()
             return
+        usages = self._apply_session_limits(profiles, usages, found, now)
         self._handle_sessions(profiles, usages, found, now)
         live = {s.session_id for s in found}
         for sid in [k for k in self._decision_logged if k not in live]:
@@ -1031,6 +1056,37 @@ class Daemon:
                                     skip=self._switch_accounts(),
                                     warm=self._cfg.session_token_warmup and not self._cfg.dry_run)
         self._write_snapshot()
+
+    def _apply_session_limits(self, profiles: Sequence[Profile], usages: Mapping[str, AccountUsage],
+                              found: Sequence[Session], now: datetime) -> Mapping[str, AccountUsage]:
+        """usages with every account a live session was refused on marked at 100% until the reset."""
+        out = dict(usages)
+        for s in found:
+            own = profile_for_config_dir(profiles, s.config_dir)
+            if own is None:
+                continue
+            try:
+                hit = self._deps.read_limit(s)
+            except Exception as e:
+                self._log.warning("event=limit_read_error pid=%d exc=%s", s.pid, type(e).__name__)
+                continue
+            if hit is None:
+                continue
+            kind, resets_at = hit
+            window = limit_window(kind)
+            if window is None or resets_at <= now:
+                continue
+            cur = out.get(own.account_id)
+            cw = getattr(cur, window) if cur is not None else None
+            if cw is not None and cw.utilization >= 100.0 and cw.resets_at is not None and cw.resets_at >= resets_at:
+                continue
+            out[own.account_id] = with_limit(cur, own.account_id, window, resets_at, now)
+            mark = (own.account_id, window, resets_at.isoformat())
+            if self._limit_logged.get(own.account_id) != mark:
+                self._limit_logged[own.account_id] = mark
+                self._log.warning("event=limit_seen pid=%d account=%s window=%s until=%s", s.pid, own.account_id,
+                                  window, _iso(resets_at))
+        return out
 
     def _refresh_usage(self, profiles: Sequence[Profile], now: datetime) -> None:
         self._usage.refresh(profiles, fetch=self._deps.fetch_usage, monotonic=self._deps.monotonic, now=now,
@@ -1506,6 +1562,10 @@ def _make_logger() -> logging.Logger:
     return setup_logging(LOG_DIR_DEFAULT, sys.stderr.isatty())
 
 
+def _read_limit(s: Session) -> Optional[Tuple[str, datetime]]:
+    return sessions.read_session_limit(s.config_dir, s.cwd, s.session_id, s.started_at)
+
+
 def real_deps(cfg: Config) -> Deps:
     """The only constructor of real seams; building it touches nothing."""
     r = refresh.Refresher(cfg, read_item=accounts.read_keychain_item, item_exists=accounts.keychain_item_exists,
@@ -1517,7 +1577,8 @@ def real_deps(cfg: Config) -> Deps:
                           run_claude=refresh.run_claude_quiet, environ=os.environ.copy)
     return Deps(discover_profiles=accounts.discover_profiles, fetch_usage=usage.fetch_usage,
                 refresh_token=r.refresh, refresh_held=r.held_accounts,
-                discover_sessions=sessions.discover_sessions_with_model, switch=switcher.switch_session,
+                discover_sessions=sessions.discover_sessions_with_model, read_limit=_read_limit,
+                switch=switcher.switch_session,
                 make_driver=switcher.OrcaCliDriver, procs=switcher.OsProcessProbe(),
                 read_pointer=pointer.read_selected_host, write_pointer=pointer.set_selected_host,
                 now=_utc_now, monotonic=time.monotonic, spawn=_spawn, wait_stop=_wait_stop, lock=try_lock,

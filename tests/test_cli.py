@@ -488,7 +488,7 @@ class CliEnv:
         fields = dict(
             discover_profiles=discover_profiles, fetch_usage=fetch_usage,
             refresh_token=_no_refresh, refresh_held=_no_refresh,
-            discover_sessions=discover_sessions, switch=switch, make_driver=_NoDriver,
+            discover_sessions=discover_sessions, read_limit=lambda s: None, switch=switch, make_driver=_NoDriver,
             procs=_NullProbe(), read_pointer=read_pointer, write_pointer=_not_used,
             now=lambda: env.now_v, monotonic=lambda: env.mono_v, spawn=_not_used, wait_stop=wait_stop, lock=lock,
             read_text=read_text, write_text=write_text, list_dir=list_dir, isdir=lambda p: True,
