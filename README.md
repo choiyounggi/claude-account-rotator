@@ -75,7 +75,7 @@ bin/rotator uninstall    # stops it and removes the plist and the app copy
 
 ```sh
 rotator status [--ascii]             # one table
-rotator status --watch [--interval S] [--ascii]
+rotator status --watch [--interval S] [--ascii] [--details]
 rotator status --json
 rotator daemon [--dry-run]           # foreground
 rotator switch --session <pid> --to <account-id> [--soft|--hard] [--dry-run]
@@ -96,12 +96,18 @@ Claude 계정 사용량                                                         
 * = Orca 선택 계정   노랑 ≥85%  빨강 ≥95%
 토큰 만료 계정은 데몬이 자동 갱신해: rotator install (또는 rotator daemon)
 
-┌──────┬────────────────────┬──────┬─────────────────┬──────────────────────────────────┐
-│ PID  │ 계정               │ 상태 │ 모델            │ 최근 전환 결과                   │
-├──────┼────────────────────┼──────┼─────────────────┼──────────────────────────────────┤
-│ 4101 │ alice TEAM 1 Max5x │ busy │ claude-opus-5-5 │ decision soft -> bob TEAM 2 Team │
-│ 4202 │ (관리 밖)          │ idle │ -               │ -                                │
-└──────┴────────────────────┴──────┴─────────────────┴──────────────────────────────────┘
+┌──────┬────────────────────┬──────┬─────────────────┬────────────────────────────────┐
+│ PID  │ 계정               │ 상태 │ 모델            │ 전환                           │
+├──────┼────────────────────┼──────┼─────────────────┼────────────────────────────────┤
+│ 4101 │ alice TEAM 1 Max5x │ busy │ claude-opus-5-5 │ 유휴 시 전환 → bob TEAM 2 Team │
+│ 4303 │ carol TEAM 1       │ idle │ claude-opus-5-5 │ 전환 불가 (작업 폴더 없음)     │
+│ 4202 │ (관리 밖)          │ idle │ -               │ -                              │
+└──────┴────────────────────┴──────┴─────────────────┴────────────────────────────────┘
+
+주의: 확인이 필요한 전환 1건
+  pid 3999 · 11/02 16:36 · 종료 확인 안 됨 (종료 시간 초과)
+
+자세히 (안내, 재실행 명령): rotator status --details
 q 또는 Ctrl-C 종료
 ```
 
@@ -141,10 +147,21 @@ q 또는 Ctrl-C 종료
   column, then 그룹 (accounts sharing a label then show their group and plan after it), then 페이블, then 갱신,
   then the reset times, then cuts an unavailable account's reason down to 4 columns, then narrows 계정; rows are
   never wrapped. `status --watch` measures the terminal on every redraw, so resizing it widens or narrows the
-  table within a second. The sessions table cuts its 최근 전환 결과 text first, then its 계정 cell. Hint lines and
+  table within a second. The sessions table cuts its 전환 text first, then its 계정 cell. Hint lines and
   the footer wrap at spaces instead of being cut. A
-  relaunch command gets a line of its own, printed whole and never wrapped by `status` (the terminal soft-wraps it),
+  relaunch command (shown only with `--details`) gets a line of its own, printed whole and never wrapped by `status` (the terminal soft-wraps it),
   so copying the line gives the exact command.
+- 전환 is one short Korean summary per session, joined with `·`: `멈춤`, `전환 중`, the pending decision
+  (`유휴 시 전환 → <account>` for soft, `즉시 전환 → <account>` for hard, `드라이런: …` under `--dry-run`),
+  `전환 불가 (<reason>)`, `보류 ~HH:MM`, `최근 실패 (<reason>)`, and `검증 <value>` when post-verify is not `ok`;
+  `-` when there is nothing to say. A failed attempt that left the session unchanged (`untouched`) is left out:
+  the daemon simply tries again. Every switcher reason has a Korean text (`작업 폴더 없음`, `종료 시간 초과`, …).
+- `주의` lists, one line each, switches from the last 24 hours that touched a session and did not finish
+  (`pid · local time · what is left (reason)`). A failure is dropped once its session runs again, either live now
+  or as a later record of the same session. A switch with no result reads `전환 중 (입력 금지)` while its worker
+  runs, `전환 중단됨 (창 확인 필요)` once the worker is gone. Hints and relaunch commands are printed only with
+  `--details`; a last line `자세히 (안내, 재실행 명령): rotator status --details` appears whenever they hold
+  something the summary leaves out (an attention item, an orphaned switch, or a failure past `untouched`).
 - Box glyphs and `█▒` are "ambiguous width": terminals set to draw them double width (common in Korean setups)
   would break the borders. On a terminal `status` asks the terminal once (cursor-position report, 0.2 s) and
   measures them accordingly; `--ascii` draws with `+ - |` and `# .` instead and fits any terminal.

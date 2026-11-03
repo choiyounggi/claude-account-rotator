@@ -173,12 +173,13 @@ class Glyphs:
     ge: str
     join: str
     remaining: str
+    arrow: str
 
 
 # The bar pair must share one East Asian width class: █ with ░ (A with N) draws bars of different lengths on
 # terminals that show ambiguous glyphs double width.
-GLYPHS_UNICODE = Glyphs("─", "│", "┌┬┐├┼┤└┴┘", "█", "▒", "…", "≥", "·", "· %s")
-GLYPHS_ASCII = Glyphs("-", "|", "+++++++++", "#", ".", "~", ">=", "/", "/ %s")
+GLYPHS_UNICODE = Glyphs("─", "│", "┌┬┐├┼┤└┴┘", "█", "▒", "…", "≥", "·", "· %s", "→")
+GLYPHS_ASCII = Glyphs("-", "|", "+++++++++", "#", ".", "~", ">=", "/", "/ %s", "->")
 
 _REASONS = {"token_expired": "토큰 만료", "token_missing": "토큰 없음", "request_error": "요청 실패",
             "http_429": "호출 제한", "network": "연결 실패", "timeout": "연결 실패", "bad_json": "응답 이상",
@@ -277,6 +278,20 @@ def _hint(rec: Optional[dict], deps: Deps) -> str:
     return rec.get("hint") or ""
 
 
+def _superseded(rec: dict, records: Any) -> bool:
+    """True when a later record exists for the same session: it ran again after this failure."""
+    sid, t = rec.get("session_id"), _parse_iso(rec.get("updated_at"))
+    if not sid or t is None:
+        return False
+    for other in records:
+        if other is rec or other.get("session_id") != sid:
+            continue
+        u = _parse_iso(other.get("updated_at"))
+        if u is not None and u > t:
+            return True
+    return False
+
+
 def _never_read(account_id: str, now: datetime) -> dict:
     # Another process is fetching an account this one has no reading of yet.
     return {"account_id": account_id, "source": "unavailable", "error": "request_error;cache_missing",
@@ -372,7 +387,7 @@ def build_status(cfg: Config, deps: Deps, now: datetime, usage: Optional[UsageCa
     for ident, rec in records.items():
         if ident in live_idents or not touched(rec):
             continue
-        if rec.get("session_id") in live_session_ids:
+        if rec.get("session_id") in live_session_ids or _superseded(rec, records.values()):
             continue
         res = rec.get("result")
         if isinstance(res, dict) and res.get("ok") is True:
@@ -776,43 +791,85 @@ def _fit_accounts(accounts: List[dict], now: datetime, ctx: _Ctx, width: int, da
             for line in _accounts_table(accounts, now, plain, daemon_running, phases[-1][-1], soft_pct, hard_pct)]
 
 
-def _result_text(r: dict, label_of: Callable[[object], str], tz: tzinfo) -> str:
+_SWITCH_REASONS = {
+    "no_terminal_handle": "터미널 없음", "terminal_handle_invalid": "터미널 핸들 오류", "no_argv": "실행 인자 없음",
+    "relaunch_unbuildable": "재실행 명령 불가", "same_account": "같은 계정", "target_home_missing": "대상 폴더 없음",
+    "cwd_missing": "작업 폴더 없음", "transcript_not_visible": "대화 기록 안 보임", "target_untrusted": "폴더 미신뢰",
+    "pid_not_alive": "프로세스 종료됨", "pane_binding_unverified": "창 연결 미확인", "pane_not_claude": "창에 Claude 없음",
+    "registry_mismatch": "세션 정보 불일치", "dialog_open": "대화상자 열림", "not_idle": "작업 중",
+    "send_refused": "입력 거부", "interrupt_timeout": "중단 시간 초과", "screen_unreadable": "화면 읽기 실패",
+    "trust_dialog": "신뢰 확인창", "input_not_empty": "입력창에 글자 있음", "exit_timeout": "종료 시간 초과",
+    "session_already_running": "이미 실행 중", "ready_timeout": "재시작 시간 초과",
+    "launched_elsewhere": "다른 계정으로 실행됨", "account_unverified": "계정 미확인", "wrong_account": "잘못된 계정",
+    "prompt_blocked_permission": "권한 확인창", "prompt_unconfirmed": "이어가기 미확인",
+}
+_SWITCH_STATES = {
+    "interrupted": "작업만 중단됨", "exit_pending": "종료 확인 안 됨", "exited": "종료 후 재실행 미확인",
+    "relaunched": "재실행 후 미확인", "verified": "이어가기 미확인", "untouched": "변경 없음", "continued": "완료",
+}
+_ACTIONS = {"soft": "유휴 시 전환", "hard": "즉시 전환"}
+
+
+def _reason_ko(reason: object) -> str:
+    return _SWITCH_REASONS.get(reason, _clean(reason)) if isinstance(reason, str) else "-"
+
+
+def _switch_left(rec: dict) -> str:
+    """What a record's switch left behind, in a few Korean words."""
+    if rec.get("record_state") == "in_progress":
+        return "전환 중단됨 (창 확인 필요)" if rec.get("hint") == ORPHANED_HINT else "전환 중 (입력 금지)"
+    lr = rec.get("last_result")
+    if not isinstance(lr, dict):
+        return "결과 없음"
+    return "%s (%s)" % (_SWITCH_STATES.get(lr.get("state"), _clean(lr.get("state")) or "-"), _reason_ko(lr.get("reason")))
+
+
+def _needs_details(rec: dict) -> bool:
+    """True when ``--details`` holds advice for this session that the summary does not give."""
+    if rec.get("record_state") == "in_progress" and rec.get("hint") == ORPHANED_HINT:
+        return True
+    lr = rec.get("last_result")
+    return isinstance(lr, dict) and lr.get("ok") is not True and lr.get("state") != "untouched"
+
+
+def _result_text(r: dict, label_of: Callable[[object], str], tz: tzinfo, g: Glyphs = GLYPHS_UNICODE) -> str:
+    """One short Korean summary; a failure that left the session unchanged is left out (the daemon retries)."""
     parts = []
-    dec = r.get("decision")
-    if isinstance(dec, dict) and dec:
-        target = dec.get("target_account_id")
-        parts.append("decision %s%s" % (dec.get("action"), " -> " + label_of(target) if target else ""))
-    ws = r.get("would_switch")
-    if isinstance(ws, dict) and ws:
-        parts.append("would %s -> %s" % (ws.get("action"), label_of(ws.get("target_account_id"))))
-    if r.get("in_flight"):
-        parts.append("in flight (pid %s)" % r.get("in_flight_pid"))
     if r.get("stuck"):
-        parts.append("STUCK")
+        parts.append("멈춤")
+    if r.get("record_state") == "in_progress" and r.get("hint") == ORPHANED_HINT:
+        parts.append("전환 중단됨 (창 확인 필요)")
+    elif r.get("in_flight") or r.get("record_state") == "in_progress":
+        parts.append("전환 중")
+    dec = r.get("decision")
+    if isinstance(dec, dict) and dec.get("action") in _ACTIONS and not parts:
+        parts.append("%s %s %s" % (_ACTIONS[dec["action"]], g.arrow, label_of(dec.get("target_account_id"))))
+    ws = r.get("would_switch")
+    if isinstance(ws, dict) and ws.get("action") in _ACTIONS:
+        parts.append("드라이런: %s %s %s" % (_ACTIONS[ws["action"]], g.arrow, label_of(ws.get("target_account_id"))))
     if r.get("unswitchable"):
-        parts.append("unswitchable (%s)" % r["unswitchable"])
+        parts.append("전환 불가 (%s)" % _reason_ko(r["unswitchable"]))
     if r.get("hard_hold_until"):
-        parts.append("hard hold until %s" % _local(r["hard_hold_until"], "%H:%M", tz))
-    if r.get("record_state") == "in_progress":
-        parts.append("switch in progress")
+        parts.append("보류 ~%s" % _local(r["hard_hold_until"], "%H:%M", tz))
     lr = r.get("last_result")
-    if isinstance(lr, dict):
-        parts.append("last %s/%s/%s" % (lr.get("step"), lr.get("reason"), lr.get("state")))
-    if r.get("post_verify"):
-        parts.append("verify %s" % r["post_verify"])
-    return _clean(", ".join(parts)) or "-"
+    if (isinstance(lr, dict) and lr.get("ok") is not True and lr.get("state") != "untouched"
+            and not r.get("unswitchable")):
+        parts.append("최근 실패 (%s)" % _reason_ko(lr.get("reason")))
+    if r.get("post_verify") not in (None, "ok"):
+        parts.append("검증 %s" % _clean(r["post_verify"]))
+    return _clean((" %s " % g.join).join(parts)) or "-"
 
 
 def _sessions_table(d: dict, labels_at: Callable[[int], Callable[[object], str]], tz: tzinfo, ctx: _Ctx,
                     width: int) -> List[str]:
-    """Fits ``width`` by cutting the 최근 전환 결과 text down to 4 columns, then the 계정 cell down to 4; when
+    """Fits ``width`` by cutting the 전환 text down to 4 columns, then the 계정 cell down to 4; when
     even that does not fit, the lines are cut with the 계정 cells as at the start."""
 
     def entries(label_of: Callable[[object], str]) -> List[Tuple[dict, str, str]]:
         out = []
         for r in d.get("sessions") or []:
             if isinstance(r, dict):
-                out.append((r, label_of(r.get("account_id")), _result_text(r, label_of, tz)))
+                out.append((r, label_of(r.get("account_id")), _result_text(r, label_of, tz, ctx.g)))
         for u in d.get("unmanaged_sessions") or []:
             if isinstance(u, dict):
                 out.append((u, "(관리 밖)", "-"))
@@ -822,7 +879,7 @@ def _sessions_table(d: dict, labels_at: Callable[[int], Callable[[object], str]]
         rows = [[str(r.get("pid")), lab, _clean(r.get("status")) or "-",
                  _clean(r.get("model")) or "-", res if cap is None else clip(res, cap, ctx.amb, ctx.g.ell)]
                 for r, lab, res in rows_in]
-        return _table(["PID", "계정", "상태", "모델", "최근 전환 결과"], ["right", "left", "left", "left", "left"],
+        return _table(["PID", "계정", "상태", "모델", "전환"], ["right", "left", "left", "left", "left"],
                       rows, ctx)
 
     rows = entries(labels_at(_SESSION_LABEL_CAP))
@@ -887,9 +944,10 @@ def _detail_lines(pid: object, hint: object, last_result: object) -> List[Tuple[
 
 def render(doc: Optional[dict], now: datetime, tz: tzinfo, width: int, *, color: bool = False,
            soft_pct: float = 85.0, hard_pct: float = 95.0, ambiguous_wide: bool = False,
-           ascii: bool = False, stale_install: bool = False) -> List[str]:
+           ascii: bool = False, stale_install: bool = False, details: bool = False) -> List[str]:
     """Pure table view of a status document; no line is wider than ``width`` terminal columns, except a
-    relaunch command, which is printed whole on its own line."""
+    relaunch command, which is printed whole on its own line. Hints and relaunch commands only with
+    ``details``; otherwise each failed switch is one summary line."""
     w = max(1, width)
     ctx = _Ctx(GLYPHS_ASCII if ascii else GLYPHS_UNICODE, ambiguous_wide, color)
     amb, g = ctx.amb, ctx.g
@@ -927,17 +985,21 @@ def render(doc: Optional[dict], now: datetime, tz: tzinfo, width: int, *, color:
     sessions = _sessions_table(d, labels_at, tz, dataclasses.replace(ctx, color=False), w)
     if sessions:
         lines += [""] + sessions
-        for r in d.get("sessions") or []:
-            if isinstance(r, dict):
-                free += _detail_lines(r.get("pid"), r.get("hint"), r.get("last_result"))
+        if details:
+            for r in d.get("sessions") or []:
+                if isinstance(r, dict):
+                    free += _detail_lines(r.get("pid"), r.get("hint"), r.get("last_result"))
     attention = [x for x in d.get("attention") or [] if isinstance(x, dict)]
     if attention:
-        free += [("", True), ("주의 (최근 24시간 실패한 전환)", True)]
+        free += [("", True), ("주의: 확인이 필요한 전환 %d건" % len(attention), True)]
         for item in attention:
-            lr = item.get("last_result")
-            free.append(("  pid %s %s %s" % (item.get("pid"), item.get("record_state"),
-                                             lr.get("state", "-") if isinstance(lr, dict) else "-"), True))
-            free += _detail_lines(item.get("pid"), item.get("hint"), lr)
+            when = _local(item.get("updated_at"), "%m/%d %H:%M", tz)
+            free.append(("  pid %s %s %s %s %s" % (item.get("pid"), g.join, when, g.join, _switch_left(item)), True))
+            if details:
+                free += _detail_lines(item.get("pid"), item.get("hint"), item.get("last_result"))
+    hidden = attention or any(isinstance(r, dict) and _needs_details(r) for r in d.get("sessions") or [])
+    if hidden and not details:
+        free += [("", True), ("자세히 (안내, 재실행 명령): rotator status --details", True)]
     for line, wrap in free:
         lines += _wrap(_printable(line), w, amb, g.ell) if wrap else [_printable(line)]
     return lines
@@ -1099,6 +1161,8 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--json", action="store_true", help="print the status document as JSON")
     st.add_argument("--interval", type=float, default=WATCH_INTERVAL_S, metavar="S",
                     help="seconds between --watch redraws (default 1)")
+    st.add_argument("--details", action="store_true",
+                    help="also print each switch's hint and relaunch command")
     st.add_argument("--ascii", action="store_true",
                     help="draw with ASCII only (for terminals that show box glyphs double width)")
     dm = sub.add_parser("daemon", help="run the rotator in the foreground")
@@ -1200,7 +1264,7 @@ def _status(args: argparse.Namespace, cfg: Config, deps: Deps, out: TextIO, err:
         term = term_ctl if term_ctl is not None else (RealTerm(out, inp) if _isatty(out) else None)
         opts: Dict[str, Any] = {"color": _isatty(out) and not os.environ.get("NO_COLOR"),  # no-color.org
                                 "soft_pct": cfg.soft_pct, "hard_pct": cfg.hard_pct, "ascii": args.ascii,
-                                "stale_install": _stale_install(stale_check)}
+                                "details": args.details, "stale_install": _stale_install(stale_check)}
         if not args.watch:
             opts["ambiguous_wide"] = _probe(term, args.ascii)
             now = deps.now()
