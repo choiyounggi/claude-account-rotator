@@ -390,14 +390,17 @@ Three things used to stop an automatic switch until someone stepped in by hand.
   the result stays `target_untrusted`. `dry_run` never writes it.
 - **The trust dialog on resume** (`accept_trust_dialog`). Some folders are never stored as trusted: Claude Code
   does not persist trust for the home folder, so every resume there asks again, and a folder trusted in no
-  account cannot be mirrored. With `accept_trust_dialog` such a session is still switched (the session already
-  runs in that folder, so the user accepted it there), and after the relaunch the rotator watches the screen
-  while the new process has no registry entry yet. Claude Code 2.1.296 opens a dialog titled
+  account cannot be mirrored. With `accept_trust_dialog`, when neither the target nor the session's own account
+  stores trust for the folder (or a parent), the session is still switched (it already runs in that folder, so
+  the user accepted it there); a folder the session's own account does trust is left to `copy_trust`, and a
+  failed mirror still refuses with `target_untrusted`. After the relaunch the rotator watches the screen while
+  the new process has no registry entry yet. Claude Code 2.1.296 opens a dialog titled
   `Accessing workspace:` with the folder on the next line and the options `No, exit` / `Yes, I trust this
   folder`, cursor on `No, exit` and no digit shortcut. Only when the folder shown is exactly the session's `cwd`
-  (a wrapped long path is joined) does it press Down, read the screen again, and press Enter once the cursor
-  (`❯`) is on `Yes, I trust this folder`; at most three Down keys. A dialog for any other folder, or any other
-  dialog, gets no key and the switch ends as `trust_dialog` as before. The log says
+  (a wrapped long path is joined) does it press Down once (a second press could wrap back to `No, exit`), then
+  press Enter only when a later read shows the cursor (`❯`) on `Yes, I trust this folder`. A dialog for any other
+  folder, any other dialog, or a cursor that never reaches `Yes` gets no further key, and the switch ends as
+  `trust_dialog` as before (with no fallback to another target, since the old session has already exited). The log says
   `event=trust_accepted account=<id> path=<cwd>` (no screen text). `dry_run` never answers it.
 
 ## Configuration

@@ -2861,10 +2861,15 @@ class TestTrustDialogOnResume(unittest.TestCase):
         w = self._world(EMPTY_SCREEN, ScreenReceipt(ok=False), TRUST_ON_YES)
         self.assertEqual(w.run(accept_trust=True), HAPPY)
 
-    def test_waiting_entry_answered(self):
-        w = self._world(TRUST_ON_YES, status_before="waiting")
+    def test_waiting_entry_stays_a_dialog_stop(self):
+        w = self._world(TRUST_ON_YES, TRUST_ON_YES, status_before="waiting")
+        self.assertEqual(w.run(accept_trust=True), result("wait_ready", "trust_dialog", "relaunched", new_pid=NEW_PID))
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE])
+
+    def test_lagging_render_gets_no_second_down(self):
+        w = self._world(TRUST_ON_NO, TRUST_ON_NO, TRUST_ON_NO, TRUST_ON_YES)
         self.assertEqual(w.run(accept_trust=True), HAPPY)
-        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE, None, P])
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE, sw.KEY_DOWN, None, P])
 
     def test_other_folder_never_answered(self):
         other = _trust_dialog(path_lines=("/Users/user",), on_yes=True)
@@ -2872,10 +2877,10 @@ class TestTrustDialogOnResume(unittest.TestCase):
         self.assertEqual(w.run(accept_trust=True), result("wait_ready", "trust_dialog", "relaunched"))
         self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE])
 
-    def test_moves_are_bounded(self):
+    def test_one_down_only(self):
         w = self._world(*([TRUST_ON_NO] * 20))
         self.assertEqual(w.run(accept_trust=True), result("wait_ready", "trust_dialog", "relaunched"))
-        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE] + [sw.KEY_DOWN] * sw.TRUST_MAX_MOVES)
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE, sw.KEY_DOWN])
 
     def test_off_never_reads_or_answers(self):
         w = self._world(*([TRUST_ON_YES] * 20), trusted=True)
@@ -2886,6 +2891,19 @@ class TestTrustDialogOnResume(unittest.TestCase):
     def test_untrusted_target_needs_accept(self):
         assert_untouched(self, self._world(TRUST_ON_YES).run(), "target_untrusted", World())
         w = self._world(TRUST_ON_YES)
+        self.assertEqual(w.run(accept_trust=True), HAPPY)
+
+    def test_source_trust_left_to_copy_trust(self):
+        # The session's own account trusts the folder: mirroring is the fix, and a failed mirror still refuses
+        # so the daemon tries the next target.
+        w = self._world(TRUST_ON_YES)
+        w.fs.files[SOURCE_TRUST] = trust(CWD)
+        assert_untouched(self, w.run(accept_trust=True), "target_untrusted", World())
+        w = self._world(TRUST_ON_YES)
+        w.fs.files[SOURCE_TRUST] = trust("/Users/user")
+        assert_untouched(self, w.run(accept_trust=True), "target_untrusted", World())
+        w = self._world(TRUST_ON_YES)
+        w.fs.files[SOURCE_TRUST] = json.dumps({"projects": {CWD: {"hasTrustDialogAccepted": False}}})
         self.assertEqual(w.run(accept_trust=True), HAPPY)
 
     def test_refused_enter_is_retried(self):

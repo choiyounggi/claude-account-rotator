@@ -49,7 +49,6 @@ EXIT_CONFIRM_OPTION_RE = re.compile(r"^(❯\s*)?1\.\s+Exit and stop tasks$")
 TRUST_TITLE = "Accessing workspace:"
 TRUST_YES_RE = re.compile(r"^(❯\s*)?(\d+\.\s+)?Yes, I trust this folder$")
 TRUST_PATH_MAX_LINES = 4
-TRUST_MAX_MOVES = 3
 KEY_DOWN = "\x1b[B"
 TASKS_STOPPED_HINT = "Background tasks running in the session were stopped at /exit (Exit and stop tasks)."
 RULE_CHARS = frozenset("─━")
@@ -749,6 +748,10 @@ def _target_trusted(run: _Run) -> bool:
     return _trusts(run.read_text, os.path.join(run.target.home, ".claude.json"), run.session.cwd)
 
 
+def _source_trusted(run: _Run) -> bool:
+    return _trusts(run.read_text, os.path.join(run.session.config_dir, ".claude.json"), run.session.cwd)
+
+
 def _trusts(read_text: ReadText, config_path: str, cwd: str) -> bool:
     cfg = _read_registry(read_text, config_path)
     projects = cfg.get("projects") if cfg else None
@@ -868,7 +871,7 @@ def _copy_trust(run: _Run) -> bool:
     s = run.session
     if not run.copy_trust or run.trust_backup_dir is None:
         return False
-    if not _trusts(run.read_text, os.path.join(s.config_dir, ".claude.json"), s.cwd):
+    if not _source_trusted(run):
         return False
     ok, wrote = _guarded(run.trust_mirror, os.path.join(run.target.home, ".claude.json"), s.cwd,
                          run.trust_backup_dir, run.target.account_id)
@@ -904,7 +907,7 @@ def _preflight(run: _Run) -> Optional[SwitchResult]:
     if not run.glob_paths(os.path.join(glob.escape(target.home), "projects", "*",
                                        glob.escape(s.session_id) + ".jsonl")):
         return fail("transcript_not_visible")
-    if not _target_trusted(run) and not _copy_trust(run) and not run.accept_trust:
+    if not _target_trusted(run) and not _copy_trust(run) and not (run.accept_trust and not _source_trusted(run)):
         return fail("target_untrusted")
     ok, alive = _guarded(run.procs.is_alive, s.pid)
     if not ok or not alive:
@@ -1115,24 +1118,22 @@ def _relaunch_onward(run: _Run) -> SwitchResult:
 
     target_glob = os.path.join(glob.escape(run.target.home), "sessions", "*.json")
     seen: List[int] = []
-    trust = {"moves": 0, "answered": False}
+    trust = {"moved": False, "answered": False}
 
-    def answer_trust() -> bool:
-        """True while the trust dialog for the session's folder is being answered (one key per poll)."""
-        if not run.accept_trust or trust["answered"] or trust["moves"] >= TRUST_MAX_MOVES:
-            return False
+    def answer_trust() -> None:
+        """Answer the trust dialog for the session's folder, one key per poll."""
+        if not run.accept_trust or trust["answered"]:
+            return
         state = trust_dialog_state(run.driver.read_screen(h), run.session.cwd)
-        if state is None:
-            return False
-        if state == "no":
-            # Re-read before Enter: the next poll confirms the cursor landed on "Yes".
-            trust["moves"] += 1
+        if state == "no" and not trust["moved"]:
+            # One Down only: from "No, exit" it can reach nothing but "Yes", and a second press could wrap
+            # back. Enter waits for a later read that shows the cursor on "Yes".
+            trust["moved"] = True
             run.driver.send(h, KEY_DOWN, enter=False, interrupt=False)
-            return True
-        if run.driver.send(h, None, enter=True, interrupt=False).delivery != "refused":
-            trust["answered"] = True
-            logger.info("event=trust_accepted account=%s path=%s", run.target.account_id, run.session.cwd)
-        return True
+        elif state == "yes":
+            if run.driver.send(h, None, enter=True, interrupt=False).delivery != "refused":
+                trust["answered"] = True
+                logger.info("event=trust_accepted account=%s path=%s", run.target.account_id, run.session.cwd)
 
     def probe() -> Optional[Tuple[str, int]]:
         found = [(p, e) for p in run.glob_paths(target_glob)
@@ -1146,8 +1147,6 @@ def _relaunch_onward(run: _Run) -> SwitchResult:
         if e.get("status") == "idle":
             return ("ready", e["pid"])
         if e.get("status") in ("waiting", "shell"):
-            if e.get("status") == "waiting" and answer_trust():
-                return None
             return ("dialog", e["pid"])
         return None
 
@@ -1241,7 +1240,8 @@ def switch_session(session: Session, target: Profile, mode: str, *, driver: Term
     unverifiable process), so the run ends fail-closed with the state of the step where it happened.
     With ``copy_trust`` and a ``trust_backup_dir``, a target that does not trust the session's folder gets the
     trust the session's own account already has for it (``trust_mirror``, default ``mirror_trust``).
-    With ``accept_trust`` an untrusted target is still switched, and the trust dialog Claude Code opens for
+    With ``accept_trust`` a target is still switched when neither it nor the session's own account stores
+    trust for the folder (Claude Code never stores it for the home folder), and the trust dialog Claude Code opens for
     exactly the session's folder after the relaunch is answered "Yes, I trust this folder".
     """
     if mode not in MODES:
