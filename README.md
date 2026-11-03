@@ -31,9 +31,11 @@ Orca's global `selected-host` pointer on a usable account.
   - Sometimes something else resumes the session first, such as Orca respawning the pane or the user, either
     before the rotator types its relaunch line or instead of it. The rotator then sends that process the continue
     prompt (`event=adopted`) if it runs in the same pane, on another managed account or the target, is idle,
-    and its environment shows that account's folder. The prompt goes through the same screen checks, so it stops
-    if text is already in the input box. A resume on the account being left, on the default `~/.claude`, or in
-    another pane is left alone.
+    and its environment shows that account's folder. It must also look unused: no `busy` status while the rotator
+    waits, and a last status change within 60 s of its start. The prompt goes through the same screen checks, so
+    it stops if text is already in the input box, and no result of an adopted session carries a relaunch line
+    (running it would start a second process). A resume on the account being left, on the default `~/.claude`,
+    or in another pane is left alone.
   - A session refused by a usage limit marks its account at 100% until the reset, even when the usage API is
     unreachable (HTTP 429) and the last reading is older and lower.
     - The daemon reads the latest rate-limit entry in the session's transcript that is newer than the process
