@@ -465,6 +465,12 @@ Numbers must be finite and not `true`/`false`.
   (`rotator.daemon` never calls a terminal driver method itself).
 - A session whose switch touched the pane (any result state other than `untouched`) is never switched again
   until it reappears as a new process (`daemon.touched`, checked by the tick and again inside `run_switch`).
+  One exception (`daemon.interrupt_only`): a hard switch whose result is `interrupted` and that stopped before
+  typing anything (the interrupt step's `interrupt_timeout`/`dialog_open`, or a check before `/exit` such as
+  `input_not_empty` or `not_idle`). Only its Ctrl-C reached the session, so the session is switched again
+  later, but only in soft mode and only while it is idle. Its records carry `soft_only: true`, so that process
+  never gets a second Ctrl-C from the rotator. A failed retry that was asked for as hard still sets
+  `hard_hold_until`, and `rotator switch --hard` on such a session runs soft and says so.
 - A switch whose outcome is unknown (an intent record left by a crash, SIGKILL or OOM) is never re-sent and is
   shown as "outcome unknown": the intent record is written before every `switch_session` call.
 - One switch at a time per session and per pane, across the daemon and the CLI (`flock` on
@@ -496,8 +502,9 @@ Numbers must be finite and not `true`/`false`.
    the respawned shell.
 4. There is an unavoidable window between reading the screen and sending `/exit` or the continue prompt; a
    keystroke typed by the user in that window is mixed with the rotator's input.
-5. Hard mode may restore the cancelled prompt into the input box after Ctrl-C, which ends the attempt as
-   `interrupted` (touched), so that process is never retried.
+5. Hard mode may restore the cancelled prompt into the input box after Ctrl-C, which ends the attempt at the
+   exit step as `interrupted` / `input_not_empty`. The process is retried in soft mode, which in turn waits
+   until the input box is empty, so the session stays put until the user clears or sends that text.
 6. Workspace trust inherited from a parent directory is not verified; sessions in a subdirectory may fail closed
    as `target_untrusted`, and the rotator then excludes that target for the session for `exclusion_ttl_s` and
    tries the next one.

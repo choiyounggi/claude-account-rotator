@@ -3494,13 +3494,27 @@ class TestSwitchCommand(MainBase):
         self.assertEqual(self.switches(), [])
 
     def test_refused_touched(self):
-        rec = stored_record(101, res=result("interrupted", "interrupt_timeout"), touched=True,
-                            hint=STATE_HINTS["interrupted"])
+        rec = stored_record(101, res=result("exit_pending", "exit_timeout", step="wait_exit"), touched=True,
+                            hint=STATE_HINTS["exit_pending"])
         self.env.files[record_path(self.state_dir, SID1, 101)] = json.dumps(rec)
         self.assertEqual(self.sw(), 1)
         self.assertIn("never switched again", self.err.getvalue())
-        self.assertIn("state: interrupted", self.err.getvalue())
+        self.assertIn("state: exit_pending", self.err.getvalue())
         self.assertEqual(self.switches(), [])
+
+    def test_hard_after_a_ctrl_c_runs_soft_and_says_so(self):
+        rec = stored_record(101, res=result("interrupted", "interrupt_timeout", step="interrupt"), touched=True)
+        self.env.files[record_path(self.state_dir, SID1, 101)] = json.dumps(rec)
+        self.env.results = [result("continued", None, ok=True, step="continue_prompt", new_pid=303)]
+        self.assertEqual(self.sw("--hard"), 0)
+        self.assertEqual([c[3] for c in self.switches()], ["soft"])
+        self.assertIn("ran as soft", self.out.getvalue())
+
+    def test_plain_hard_has_no_soft_note(self):
+        self.env.results = [result("continued", None, ok=True, step="continue_prompt", new_pid=303)]
+        self.sw("--hard")
+        self.assertEqual([c[3] for c in self.switches()], ["hard"])
+        self.assertNotIn("ran as soft", self.out.getvalue())
 
     def test_intent_failed(self):
         self.env.fail_write = {os.sep + "sessions" + os.sep}
