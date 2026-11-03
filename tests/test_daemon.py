@@ -2230,6 +2230,31 @@ class TestTouchedNeverRetried(DispatchBase):
         self.assertEqual(self.switches(), [])
 
 
+class TestDecisionLog(DispatchBase):
+    def decisions(self):
+        return self.env.logs("decision")
+
+    def test_logged_once_per_change_ignoring_numbers(self):
+        self.env.pcts = {ACC_A: 40.0, ACC_B: 20.0, ACC_C: 50.0}
+        self.d.tick()
+        self.assertEqual(len(self.decisions()), 1)
+        self.assertIn("action=none", self.decisions()[0])
+        self.env.pcts[ACC_A] = 41.0
+        self.tick_after(40)
+        self.assertEqual(len(self.decisions()), 1)
+        self.env.pcts[ACC_A] = 97.0
+        self.tick_after(40)
+        self.assertEqual(len(self.decisions()), 2)
+        self.assertIn("action=hard target=%s" % ACC_B, self.decisions()[1])
+
+    def test_no_target_reason_is_logged(self):
+        self.env.pcts = {ACC_A: 97.0, ACC_B: 99.0, ACC_C: 98.0}
+        self.d.tick()
+        self.assertEqual(len(self.decisions()), 1)
+        self.assertIn("no target", self.decisions()[0])
+        self.assertEqual(self.spawns(), [])
+
+
 class TestRetryAfterInterrupt(DispatchBase):
     def first_attempt_interrupted(self):
         self.env.results = [result("interrupted", "interrupt_timeout", step="interrupt"),

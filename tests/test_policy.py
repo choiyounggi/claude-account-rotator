@@ -510,23 +510,91 @@ class TestDecideTargetSelection(unittest.TestCase):
         self.assertEqual(d.target.account_id, _pid(3))
 
     def test_above_headroom_line_rejected(self):
-        d = _decide("busy", _usage(1, 96), _usage(3, 75.001))
+        d = _decide("idle", _usage(1, 90), _usage(3, 75.001))
         self.assertEqual(d.action, "none")
         self.assertIsNone(d.target)
         self.assertIn("no target: best candidate %s at 75.001%% > headroom line 75.0%%" % _pid(3), d.reason)
 
     def test_headroom_line_follows_config(self):
-        d = _decide("busy", _usage(1, 96), _usage(3, 75.0), config=PolicyConfig(target_headroom_pct=20))
+        d = _decide("idle", _usage(1, 90), _usage(3, 75.0), config=PolicyConfig(target_headroom_pct=20))
         self.assertEqual(d.action, "none")
         self.assertIn("headroom line 65.0%", d.reason)
 
     def test_all_hot(self):
-        d = _decide("busy", _usage(1, 97), _usage(2, 80), _usage(3, 90))
+        d = _decide("idle", _usage(1, 90), _usage(2, 80), _usage(3, 88))
         self.assertEqual(d.action, "none")
         self.assertIsNone(d.target)
         self.assertIn("no target", d.reason)
         self.assertIn("%s at 80.0%%" % _pid(2), d.reason)
-        self.assertEqual(d.utilization, 97.0)
+        self.assertEqual(d.utilization, 90.0)
+
+
+class TestDecideHardTier(unittest.TestCase):
+    """At or above hard: move to the account with the most room; when every account is at its limit,
+    wait on the one that resets first."""
+
+    def test_most_room_without_headroom_line(self):
+        d = _decide("busy", _usage(1, 97), _usage(2, 80), _usage(3, 90))
+        self.assertEqual((d.action, d.target), ("hard", _profile(2)))
+
+    def test_weekly_counts_toward_room(self):
+        d = _decide("idle", _usage(1, 100), _usage(2, 3, 93), _usage(3, 81, 62))
+        self.assertEqual(d.target, _profile(3))
+
+    def test_any_room_beats_a_limit(self):
+        d = _decide("idle", _usage(1, 100), _usage(2, 3, 93), _usage(3, 100))
+        self.assertEqual((d.action, d.target), ("hard", _profile(2)))
+
+    def test_never_moves_to_more_used_account(self):
+        d = _decide("busy", _usage(1, 96), _usage(2, 96.5), _usage(3, 99))
+        self.assertEqual(d.action, "none")
+        self.assertIn("healthiest", d.reason)
+
+    def test_all_limited_waits_on_soonest_reset(self):
+        d = _decide("idle", _usage(1, 100, five_resets_at=NOW + H2),
+                    _usage(2, 100, five_resets_at=NOW + timedelta(minutes=20)),
+                    _usage(3, 50, 100, seven_resets_at=NOW + timedelta(minutes=10)))
+        self.assertEqual((d.action, d.target), ("hard", _profile(3)))
+        self.assertIn("all accounts at the limit", d.reason)
+
+    def test_all_limited_stays_when_own_resets_first(self):
+        d = _decide("idle", _usage(1, 100, five_resets_at=NOW + timedelta(minutes=9)),
+                    _usage(2, 100, five_resets_at=NOW + timedelta(minutes=9)),
+                    _usage(3, 50, 100, seven_resets_at=NOW + D3))
+        self.assertEqual(d.action, "none")
+        self.assertIn("no account resets 300s sooner", d.reason)
+
+    def test_reset_wait_needs_the_margin(self):
+        own = _usage(1, 100, five_resets_at=NOW + timedelta(minutes=30))
+        d = _decide("idle", own, _usage(2, 100, five_resets_at=NOW + timedelta(minutes=25, seconds=1)))
+        self.assertEqual(d.action, "none")
+        d = _decide("idle", own, _usage(2, 100, five_resets_at=NOW + timedelta(minutes=25)))
+        self.assertEqual(d.target, _profile(2))
+
+    def test_limit_lifts_when_every_limited_window_resets(self):
+        d = _decide("idle", _usage(1, 100, five_resets_at=NOW + H2),
+                    _usage(2, 100, 100, five_resets_at=NOW + timedelta(minutes=10), seven_resets_at=NOW + D3))
+        self.assertEqual(d.action, "none")
+
+    def test_unknown_reset_is_not_a_wait_target(self):
+        d = _decide("idle", _usage(1, 100, five_resets_at=NOW + H2), _usage(2, 100))
+        self.assertEqual(d.action, "none")
+        self.assertIn("no account resets sooner", d.reason)
+
+    def test_own_reset_unknown_still_waits_on_a_known_one(self):
+        d = _decide("idle", _usage(1, 100), _usage(2, 100, five_resets_at=NOW + timedelta(minutes=10)))
+        self.assertEqual(d.target, _profile(2))
+
+    def test_stale_candidate_is_skipped(self):
+        old = NOW - timedelta(hours=1)
+        d = _decide("idle", _usage(1, 100, five_resets_at=NOW + H2),
+                    _usage(2, 100, five_resets_at=NOW + timedelta(minutes=10), fetched_at=old))
+        self.assertEqual(d.action, "none")
+
+    def test_below_limit_own_never_waits(self):
+        d = _decide("idle", _usage(1, 99, five_resets_at=NOW + H2),
+                    _usage(2, 100, five_resets_at=NOW + timedelta(minutes=1)))
+        self.assertEqual(d.action, "none")
 
     def test_equal_utilization_not_a_target(self):
         d = _decide("idle", _usage(1, 85), _usage(2, 85), config=PolicyConfig(target_headroom_pct=0))

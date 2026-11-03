@@ -9,6 +9,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -982,6 +983,7 @@ class Daemon:
         self._pointer: Tuple[Optional[str], Optional[str]] = (None, None)
         self._orphans_logged: Set[Identity] = set()
         self._hold_logged: Dict[str, str] = {}
+        self._decision_logged: Dict[str, Tuple[str, Optional[str], str]] = {}
         self._would: Dict[str, Tuple[str, str]] = {}
         self._excluded_logged: Dict[str, Tuple[str, str]] = {}
 
@@ -1153,6 +1155,7 @@ class Daemon:
         row["decision"] = {"action": d.action,
                            "target_account_id": d.target.account_id if d.target is not None else None,
                            "reason": reason}
+        self._log_decision(s, row["decision"])
         if d.action == "none" or d.target is None:
             self._would.pop(s.session_id, None)
             return row
@@ -1178,6 +1181,16 @@ class Daemon:
         if self._dispatch_locked(s, own, d.action, d.target, profiles, usages, pc, ls, mono):
             row.update(in_flight=True, in_flight_pid=s.pid)
         return row
+
+    def _log_decision(self, s: Session, decision: Mapping[str, Any]) -> None:
+        """Log a session's decision when it changes, ignoring numbers so moving percentages do not repeat it:
+        a session that is never switched leaves the reason in the log."""
+        key = (decision["action"], decision["target_account_id"], re.sub(r"\d+(\.\d+)?", "#", decision["reason"]))
+        if self._decision_logged.get(s.session_id) == key:
+            return
+        self._decision_logged[s.session_id] = key
+        self._log.info("event=decision pid=%d action=%s target=%s reason=%r", s.pid, decision["action"],
+                       decision["target_account_id"], decision["reason"])
 
     def _held_filter(self, candidates: Sequence[Profile], target_id: str,
                      keep_id: Optional[str]) -> Optional[Tuple[str, List[str], List[Profile]]]:

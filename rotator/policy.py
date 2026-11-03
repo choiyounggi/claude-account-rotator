@@ -129,6 +129,52 @@ def _usable(usage: Optional[AccountUsage], now: datetime, config: PolicyConfig, 
     return u, ""
 
 
+LIMIT_PCT = 100.0
+# Waiting out a limit moves only to an account that resets this much sooner: a relaunch costs more than a few
+# minutes saved.
+RESET_WAIT_MARGIN = timedelta(minutes=5)
+
+
+def _limit_lifts_at(usage: AccountUsage, now: datetime, fable: bool) -> Tuple[bool, Optional[datetime]]:
+    """(at the limit, when every window at the limit has reset). The time is None when no window is at the
+    limit or one of them has no reset time."""
+    windows = [usage.five_hour, usage.seven_day] + ([usage.fable] if fable else [])
+    limited = [w for w in windows if w is not None and w.utilization >= LIMIT_PCT
+               and not (w.resets_at is not None and w.resets_at <= now)]
+    if not limited:
+        return False, None
+    if any(w.resets_at is None for w in limited):
+        return True, None
+    return True, max(w.resets_at for w in limited if w.resets_at is not None)
+
+
+def _soonest_reset(exclude_account_id: str, own_usage: Optional[AccountUsage], profiles: Sequence[Profile],
+                   usages: Mapping[str, AccountUsage], now: datetime, config: PolicyConfig, *,
+                   fable: bool) -> Tuple[Optional[Profile], str]:
+    """When every account is at its limit: the account whose limit lifts first, if that is at least
+    RESET_WAIT_MARGIN sooner than the current account's. Returns (target, reason fragment)."""
+    own_at = _limit_lifts_at(own_usage, now, fable)[1] if own_usage is not None else None
+    best: Optional[Tuple[datetime, str, Profile]] = None
+    for p in profiles:
+        if p.account_id == exclude_account_id:
+            continue
+        u = usages.get(p.account_id)
+        cu, _ = _usable(u, now, config, require_fresh=True, fable=fable)
+        if cu is None or u is None:
+            continue
+        limited, at = _limit_lifts_at(u, now, fable)
+        if not limited or at is None:
+            continue
+        if best is None or (at, p.account_id) < (best[0], best[1]):
+            best = (at, p.account_id, p)
+    if best is None:
+        return None, "no account resets sooner"
+    if own_at is not None and best[0] > own_at - RESET_WAIT_MARGIN:
+        return None, "current account resets at %s, no account resets %ds sooner (best %s at %s)" % (
+            own_at.isoformat(), int(RESET_WAIT_MARGIN.total_seconds()), best[1], best[0].isoformat())
+    return best[2], "all accounts at the limit; %s resets first at %s" % (best[1], best[0].isoformat())
+
+
 def _select_target(exclude_account_id: str, subject: str, own_u: float, line: Optional[float],
                    profiles: Sequence[Profile], usages: Mapping[str, AccountUsage], now: datetime,
                    config: PolicyConfig, *, fable: bool = False) -> Tuple[Optional[Profile], Optional[float], str]:
@@ -201,9 +247,15 @@ def decide(session: Session, profiles: Sequence[Profile], usages: Mapping[str, A
             int((now - last_switch_at).total_seconds()), int(config.cooldown.total_seconds())), u)
     if tier == "soft" and session.status == "busy":
         return Decision("none", None, head + "; session busy, waiting for idle", u)
-    target, tu, fragment = _select_target(own.account_id, "current account", u,
-                                          config.soft_pct - config.target_headroom_pct,
+    # The hard tier is about to stop: any account with more room is better, so it has no headroom line.
+    line = config.soft_pct - config.target_headroom_pct if tier == "soft" else None
+    target, tu, fragment = _select_target(own.account_id, "current account", u, line,
                                           profiles, usages, now, config, fable=fable)
+    if target is None and tier == "hard" and u >= LIMIT_PCT:
+        wait, why = _soonest_reset(own.account_id, own_usage, profiles, usages, now, config, fable=fable)
+        if wait is not None:
+            return Decision("hard", wait, head + "; session %s; %s" % (session.status, why), u)
+        fragment += "; " + why
     if target is None:
         return Decision("none", None, head + "; session %s; " % session.status + fragment, u)
     return Decision(tier, target, head + "; session %s; target %s at %s" % (
