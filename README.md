@@ -661,6 +661,26 @@ Numbers must be finite and not `true`/`false`.
     having been run against. The check reads `/Applications/Orca.app` only, the same place the `orca` CLI is
     taken from.
 
+## Development and release
+
+```sh
+/usr/bin/python3 -m unittest discover -s tests -t .   # the rotator's tests (system Python, as installed)
+node --test scripts/release.check.mjs                   # the release script's tests
+```
+
+Releases are automatic. On every push to main, CI (`.github/workflows/ci.yml`) runs both test suites on macOS
+and then:
+
+1. Picks the version from the Conventional Commits since the last `v*` tag: `feat!:` or `BREAKING CHANGE:` →
+   major, `feat:` → minor, anything else → patch. Only `docs:`, `chore:`, `ci:`, `test:`, `style:` and Git
+   merge commits release nothing.
+2. Bumps `package.json`, commits, tags `vX.Y.Z` and creates the GitHub release.
+3. Publishes to npm with trusted publishing (GitHub Actions OIDC, no token). npm's package settings must trust
+   this repository's `ci.yml`:
+   `npm trust github claude-account-rotator --file ci.yml --repo choiyounggi/claude-account-rotator --allow-publish`.
+4. If a step fails, re-run the job: it skips the tag, release or npm version that already exists and runs only
+   what is missing.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
