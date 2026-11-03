@@ -248,7 +248,7 @@ class TestDecideUsability(unittest.TestCase):
         self.assertEqual(d.action, "soft")
         self.assertEqual(d.target.account_id, _pid(2))
         self.assertEqual(d.utilization, 85.0)
-        self.assertIn("max(5h,7d)=85.0% >= soft 85.0%", d.reason)
+        self.assertIn("load(5h,7d)=85.0% >= soft 85.0%", d.reason)
 
     def test_own_missing_usage(self):
         d = _decide("idle", _usage(2, 40))
@@ -375,7 +375,7 @@ class TestDecideCandidateFreshness(unittest.TestCase):
         self.assertEqual(d.action, "none")
         self.assertIsNone(d.target)
         # rejected candidates are listed sorted by account id, whatever the profile order
-        self.assertEqual(d.reason, "max(5h,7d)=96.0%% >= hard 95.0%%; session busy; no target: no fresh candidate "
+        self.assertEqual(d.reason, "load(5h,7d)=96.0%% >= hard 95.0%%; session busy; no target: no fresh candidate "
                                    "data (%s: usage unavailable (network;cache_missing); "
                                    "%s: usage stale: age 1200s > max 900s)" % (_pid(2), _pid(3)))
 
@@ -391,7 +391,7 @@ class TestDecideThresholds(unittest.TestCase):
         d = _decide("idle", _usage(1, 84.999), _usage(2, 40))
         self.assertEqual(d.action, "none")
         self.assertIsNone(d.target)
-        self.assertEqual(d.reason, "max(5h,7d)=84.999% below soft 85.0%")
+        self.assertEqual(d.reason, "load(5h,7d)=84.999% below soft 85.0%")
         self.assertEqual(d.utilization, 84.999)
 
     def test_exactly_hard(self):
@@ -404,7 +404,7 @@ class TestDecideThresholds(unittest.TestCase):
         d = _decide("idle", _usage(1, 94.999), _usage(2, 40))
         self.assertEqual(d.action, "soft")
         self.assertEqual(d.target.account_id, _pid(2))
-        self.assertIn("max(5h,7d)=94.999% >= soft 85.0%", d.reason)
+        self.assertIn("load(5h,7d)=94.999% >= soft 85.0%", d.reason)
 
     def test_display_never_contradicts(self):
         d = _decide("idle", _usage(1, 84.9996), _usage(2, 40))
@@ -468,14 +468,14 @@ class TestDecideTiers(unittest.TestCase):
         d = _decide("busy", _usage(1, 86), _usage(2, 40))
         self.assertEqual(d.action, "none")
         self.assertIsNone(d.target)
-        self.assertEqual(d.reason, "max(5h,7d)=86.0% >= soft 85.0%; session busy, waiting for idle")
+        self.assertEqual(d.reason, "load(5h,7d)=86.0% >= soft 85.0%; session busy, waiting for idle")
         self.assertEqual(d.utilization, 86.0)
 
     def test_idle_soft_switches_exact_reason(self):
         d = _decide("idle", _usage(1, 86), _usage(2, 40))
         self.assertEqual(d.action, "soft")
         self.assertEqual(d.target, _profile(2))
-        self.assertEqual(d.reason, "max(5h,7d)=86.0% >= soft 85.0%; session idle; "
+        self.assertEqual(d.reason, "load(5h,7d)=86.0% >= soft 85.0%; session idle; "
                                    "target 00000000-0000-4000-8000-000000000002 at 40.0%")
         self.assertEqual(d.utilization, 86.0)
 
@@ -650,14 +650,14 @@ class TestDecideHardTier(unittest.TestCase):
         d = _decide("idle", _usage(1, 86), _usage(2, 90), _usage(3, 95))
         self.assertEqual(d.action, "none")
         self.assertIsNone(d.target)
-        self.assertEqual(d.reason, "max(5h,7d)=86.0%% >= soft 85.0%%; session idle; no target: current account is "
+        self.assertEqual(d.reason, "load(5h,7d)=86.0%% >= soft 85.0%%; session idle; no target: current account is "
                                    "the healthiest (86.0%% <= best candidate %s at 90.0%%)" % _pid(2))
 
     def test_single_profile(self):
         d = _decide("busy", _usage(1, 96), profiles=[_profile(1)])
         self.assertEqual(d.action, "none")
         self.assertIsNone(d.target)
-        self.assertEqual(d.reason, "max(5h,7d)=96.0% >= hard 95.0%; session busy; no target: no other account")
+        self.assertEqual(d.reason, "load(5h,7d)=96.0% >= hard 95.0%; session busy; no target: no other account")
 
 
 class TestDecideCooldown(unittest.TestCase):
@@ -668,7 +668,7 @@ class TestDecideCooldown(unittest.TestCase):
         d = self._hot(NOW - timedelta(minutes=2))
         self.assertEqual(d.action, "none")
         self.assertIsNone(d.target)
-        self.assertEqual(d.reason, "max(5h,7d)=96.0% >= hard 95.0%; cooldown: last switch 120s ago < 300s")
+        self.assertEqual(d.reason, "load(5h,7d)=96.0% >= hard 95.0%; cooldown: last switch 120s ago < 300s")
         self.assertEqual(d.utilization, 96.0)
 
     def test_exactly_cooldown_acts(self):
@@ -776,7 +776,7 @@ class TestDecidePointer(unittest.TestCase):
     def test_hot_pointer_repoints_to_healthiest(self):
         d = _pointer(_usage(1, 90), _usage(2, 30), _usage(3, 50))
         self.assertEqual(d.target, _profile(2))
-        self.assertEqual(d.reason, "pointer account %s max(5h,7d)=90.0%% >= soft 85.0%%; "
+        self.assertEqual(d.reason, "pointer account %s load(5h,7d)=90.0%% >= soft 85.0%%; "
                                    "repoint to 00000000-0000-4000-8000-000000000002 at 30.0%%" % _pid(1))
 
     def test_lowest_utilization_beats_lower_account_id(self):
@@ -798,12 +798,12 @@ class TestDecidePointer(unittest.TestCase):
     def test_exactly_soft_repoints(self):
         d = _pointer(_usage(1, 85.0), _usage(2, 30), profiles=[_profile(1), _profile(2)])
         self.assertEqual(d.target.account_id, _pid(2))
-        self.assertIn("max(5h,7d)=85.0% >= soft 85.0%", d.reason)
+        self.assertIn("load(5h,7d)=85.0% >= soft 85.0%", d.reason)
 
     def test_just_below_soft_keeps(self):
         d = _pointer(_usage(1, 84.999), _usage(2, 30), profiles=[_profile(1), _profile(2)])
         self.assertIsNone(d.target)
-        self.assertEqual(d.reason, "pointer account %s max(5h,7d)=84.999%% below soft 85.0%%" % _pid(1))
+        self.assertEqual(d.reason, "pointer account %s load(5h,7d)=84.999%% below soft 85.0%%" % _pid(1))
 
     def test_healthy_pointer_keeps(self):
         d = _pointer(_usage(1, 50), _usage(2, 30), _usage(3, 10))
@@ -822,7 +822,7 @@ class TestDecidePointer(unittest.TestCase):
     def test_pointer_healthiest(self):
         d = _pointer(_usage(1, 90), _usage(2, 95), _usage(3, 95))
         self.assertIsNone(d.target)
-        self.assertEqual(d.reason, "pointer account %s max(5h,7d)=90.0%% >= soft 85.0%%; no target: pointer account "
+        self.assertEqual(d.reason, "pointer account %s load(5h,7d)=90.0%% >= soft 85.0%%; no target: pointer account "
                                    "is the healthiest (90.0%% <= best candidate %s at 95.0%%)" % (_pid(1), _pid(2)))
         self.assertNotIn("current account", d.reason)
 
@@ -894,7 +894,7 @@ class TestDecidePointer(unittest.TestCase):
     def test_single_profile(self):
         d = _pointer(_usage(1, 90), profiles=[_profile(1)])
         self.assertIsNone(d.target)
-        self.assertEqual(d.reason, "pointer account %s max(5h,7d)=90.0%% >= soft 85.0%%; "
+        self.assertEqual(d.reason, "pointer account %s load(5h,7d)=90.0%% >= soft 85.0%%; "
                                    "no target: no other account" % _pid(1))
 
     def test_naive_now_rejected(self):
@@ -941,37 +941,37 @@ class TestFableTrigger(unittest.TestCase):
         self.assertEqual(d.action, "soft")
         self.assertEqual(d.target.account_id, _pid(2))
         self.assertEqual(d.utilization, 85.0)
-        self.assertTrue(d.reason.startswith("max(5h,7d,fable)=85.0% >= soft 85.0%"), d.reason)
+        self.assertTrue(d.reason.startswith("load(5h,7d,fable)=85.0% >= soft 85.0%"), d.reason)
 
     def test_below_soft_boundary(self):
         d = _decide("idle", _fusage(1, 10.0, 20.0, 84.9), self.cand(), session=_fsession("idle"))
         self.assertEqual(d.action, "none")
-        self.assertEqual(d.reason, "max(5h,7d,fable)=84.9% below soft 85.0%")
+        self.assertEqual(d.reason, "load(5h,7d,fable)=84.9% below soft 85.0%")
 
     def test_hard_on_fable(self):
         d = _decide("busy", _fusage(1, 10.0, 20.0, 95.0), self.cand(), session=_fsession("busy"))
         self.assertEqual(d.action, "hard")
         self.assertEqual(d.target.account_id, _pid(2))
-        self.assertTrue(d.reason.startswith("max(5h,7d,fable)=95.0% >= hard 95.0%"), d.reason)
+        self.assertTrue(d.reason.startswith("load(5h,7d,fable)=95.0% >= hard 95.0%"), d.reason)
 
     def test_busy_soft_waits(self):
         d = _decide("busy", _fusage(1, 10.0, 20.0, 94.9), self.cand(), session=_fsession("busy"))
         self.assertEqual(d.action, "none")
-        self.assertEqual(d.reason, "max(5h,7d,fable)=94.9% >= soft 85.0%; session busy, waiting for idle")
+        self.assertEqual(d.reason, "load(5h,7d,fable)=94.9% >= soft 85.0%; session busy, waiting for idle")
 
     def test_reset_fable_counts_zero(self):
         own = _fusage(1, 10.0, 20.0, 99.0, fable_resets_at=NOW - timedelta(minutes=1))
         d = _decide("idle", own, self.cand(), session=_fsession("idle"), config=RAW)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.utilization, 20.0)
-        self.assertTrue(d.reason.startswith("max(5h,7d,fable)=20.0%"), d.reason)
+        self.assertTrue(d.reason.startswith("load(5h,7d,fable)=20.0%"), d.reason)
 
     def test_non_fable_unchanged(self):
         own = _fusage(1, 10.0, 20.0, 85.0)
         opus = _decide("idle", own, self.cand(), session=_fsession("idle", model="claude-opus-5-5"), config=RAW)
         plain = _decide("idle", own, self.cand(), config=RAW)
         self.assertEqual(opus, plain)
-        self.assertEqual(plain.reason, "max(5h,7d)=20.0% below soft 85.0%")
+        self.assertEqual(plain.reason, "load(5h,7d)=20.0% below soft 85.0%")
 
     def test_non_fable_ignores_fable_fields_entirely(self):
         scenarios = [("idle", _usage(1, 86), _usage(2, 40)), ("busy", _usage(1, 96), _usage(2, 40)),
@@ -986,7 +986,7 @@ class TestFableTrigger(unittest.TestCase):
     def test_own_fable_unknown_label(self):
         d = _decide("idle", _fusage(1, 90.0, 10.0, None), self.cand(), session=_fsession("idle"))
         self.assertEqual(d.action, "soft")
-        self.assertTrue(d.reason.startswith("max(5h,7d; fable unknown)=90.0% >= soft 85.0%"), d.reason)
+        self.assertTrue(d.reason.startswith("load(5h,7d; fable unknown)=90.0% >= soft 85.0%"), d.reason)
 
     def test_stale_own_fable_without_reset_not_lower_bound(self):
         stale = dict(fetched_at=NOW - H2, five_resets_at=NOW + H2, seven_resets_at=NOW + D3)
@@ -1062,7 +1062,7 @@ class TestFablePointerUnchanged(unittest.TestCase):
         with_fable = _pointer(_fusage(1, 20.0, 20.0, 99.0), _fusage(2, 10.0, 10.0, 10.0), pointer=_profile(1))
         without = _pointer(_fusage(1, 20.0, 20.0, None), _fusage(2, 10.0, 10.0, None), pointer=_profile(1))
         self.assertEqual(with_fable, without)
-        self.assertIn("max(5h,7d)=20.0% below soft 85.0%", with_fable.reason)
+        self.assertIn("load(5h,7d)=20.0% below soft 85.0%", with_fable.reason)
 
 
 if __name__ == "__main__":

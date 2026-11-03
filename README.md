@@ -14,7 +14,8 @@ Orca's global `selected-host` pointer on a usable account.
 - **Automatic per-session rotation** — soft switch when idle, hard switch near the limit, then the session
   continues on the new account with `--resume`.
   - Every account is scored by its load: how close it is to being blocked, in percent of a 5-hour window.
-    The load is `max(5h, 100 - weekly_to_5h_ratio × (100 - 7d))`, plus the raw Fable window for Fable sessions.
+    The load is `max(5h, 100 - weekly_to_5h_ratio × (100 - 7d))`, plus the raw Fable window for Fable sessions
+    (see Fable-aware). Decision reasons print it as `load(5h,7d)=…`.
     The weekly window is scaled because its remaining room lasts longer. With the measured ratio 6, an account at
     3% / 93% (7 weekly points ≈ 42 points of a 5-hour window) has more room than one at 81% / 62%.
     `weekly_to_5h_ratio: 1` restores the plain `max(5h, 7d)`.
@@ -29,7 +30,9 @@ Orca's global `selected-host` pointer on a usable account.
     unavailable usage are not considered.
   - The daemon logs each session's decision when it changes (`event=decision`), including why it does not
     switch. Numbers are ignored, and a decision seen within the last 10 minutes is not logged again.
-- **Fable-aware** — Fable sessions are judged by the highest of the 5-hour, weekly and Fable windows.
+- **Fable-aware** — Fable sessions are judged by a load that also counts the Fable window. That window is weekly
+  too, but it is counted raw, unscaled: its ratio to the 5-hour window has not been measured, and counting it raw
+  can only switch earlier, never later.
 - **Idle-account token refresh** — the daemon refreshes OAuth tokens of accounts with no live session, the same
   way Claude Code does, and writes them back to the same Keychain item.
 - **Shared, rate-limit friendly polling** — one usage request per account per interval across all rotator
@@ -156,7 +159,8 @@ q 또는 Ctrl-C 종료
   With the daemon off and at least one `갱신 필요` row, a footer says `토큰 만료 계정은 데몬이 자동 갱신해: rotator
   install (또는 rotator daemon)`; only the daemon refreshes tokens.
 - Colours (only when stdout is a terminal and `NO_COLOR` is unset or empty): yellow at `soft_pct`, red at
-  `hard_pct`, cache rows dimmed. Without colour the layout is the same.
+  `hard_pct` on each raw window value (the policy acts on the scaled load, so a yellow weekly cell does not
+  mean a switch is near), cache rows dimmed. Without colour the layout is the same.
 - Every line is measured in terminal columns (Hangul counts 2). Columns are as wide as their widest cell, so on
   a wide enough terminal nothing is cut. When the table does not fit, the label, the 갱신 text and the
   unavailable reason are cut step by step down to 18, 20 and 24 columns; then it drops the bars, then the 플랜

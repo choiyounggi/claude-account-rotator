@@ -131,7 +131,7 @@ def _usable(usage: Optional[AccountUsage], now: datetime, config: PolicyConfig, 
     future. With require_fresh=False such a reading still counts as a lower bound, but only
     when every present window has a reset time: usage only accumulates until resets_at, while
     a window without one may have reset since the fetch and over-state the reading.
-    fable=True scores max(5h,7d,fable) and, with require_fresh, refuses a reading whose fable
+    fable=True adds the fable window to the load and, with require_fresh, refuses a reading whose fable
     window is unknown.
     """
     if usage is None:
@@ -264,11 +264,11 @@ def decide(session: Session, profiles: Sequence[Profile], usages: Mapping[str, A
     own_usage = usages.get(own.account_id)
     u, cause = _usable(own_usage, now, config, require_fresh=False, fable=fable)
     if not fable:
-        label = "max(5h,7d)"
+        label = "load(5h,7d)"
     elif own_usage is not None and own_usage.fable is not None:
-        label = "max(5h,7d,fable)"
+        label = "load(5h,7d,fable)"
     else:
-        label = "max(5h,7d; fable unknown)"
+        label = "load(5h,7d; fable unknown)"
     # "shell" is Claude Code idle at its prompt with background shells running; switch it like idle.
     if session.status not in ("idle", "busy", "shell"):
         return Decision("none", None,
@@ -326,9 +326,9 @@ def decide_pointer(pointer_profile: Optional[Profile], profiles: Sequence[Profil
     if u is None:
         return PointerDecision(None, "pointer account %s: %s" % (pid, cause))
     if u < config.soft_pct:
-        return PointerDecision(None, "pointer account %s max(5h,7d)=%s below soft %s" % (
+        return PointerDecision(None, "pointer account %s load(5h,7d)=%s below soft %s" % (
             pid, _pct(u), _pct(config.soft_pct)))
-    head = "pointer account %s max(5h,7d)=%s >= soft %s" % (pid, _pct(u), _pct(config.soft_pct))
+    head = "pointer account %s load(5h,7d)=%s >= soft %s" % (pid, _pct(u), _pct(config.soft_pct))
     target, tu, fragment = _select_target(pid, "pointer account", u, None, profiles, usages, now, config)
     if target is None:
         return PointerDecision(None, head + "; " + fragment)

@@ -1797,7 +1797,7 @@ class TestSnapshot(TickBase):
         self.d.tick()
         row = self.snap()["sessions"][0]
         self.assertEqual(row["decision"]["action"], "none")
-        self.assertTrue(row["decision"]["reason"].startswith("max(5h,7d,fable)=90.0% >= soft 85.0%"),
+        self.assertTrue(row["decision"]["reason"].startswith("load(5h,7d,fable)=90.0% >= soft 85.0%"),
                         row["decision"]["reason"])
         self.assertEqual([c for c in self.env.calls if c[0] == "switch"], [])
 

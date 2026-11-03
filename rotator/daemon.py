@@ -1190,15 +1190,15 @@ class Daemon:
 
     def _log_decision(self, s: Session, decision: Mapping[str, Any]) -> None:
         """Log a session's decision when it changes, so a session that is never switched leaves the reason in
-        the log. Numbers are ignored (moving percentages), and a decision logged within DECISION_RELOG_S is not
+        the log. Numbers are ignored (moving percentages), and a decision seen within DECISION_RELOG_S is not
         logged again (a session flipping between idle and busy alternates two reasons every turn)."""
         key = (decision["action"], decision["target_account_id"], re.sub(r"\d+(\.\d+)?", "#", decision["reason"]))
         seen = self._decision_logged.setdefault(s.session_id, {})
         mono = self._deps.monotonic()
         last = seen.get(key)
+        seen[key] = mono
         if last is not None and mono - last < DECISION_RELOG_S:
             return
-        seen[key] = mono
         if len(seen) > DECISION_KEYS_KEPT:
             del seen[min(seen, key=lambda k: seen[k])]
         self._log.info("event=decision pid=%d action=%s target=%s reason=%r", s.pid, decision["action"],
