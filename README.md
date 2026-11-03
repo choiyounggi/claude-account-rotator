@@ -61,11 +61,15 @@ Orca's global `selected-host` pointer on a usable account.
 ## Quick start
 
 ```sh
-npm install -g claude-account-rotator   # checks this Mac first (rotator doctor), then installs `rotator`
+npm install -g claude-account-rotator   # installs the `rotator` command
+rotator doctor                          # checks this Mac: macOS, Python, Orca version, accounts
 rotator status --watch                  # dashboard only, changes nothing
 rotator daemon --dry-run                # see what the daemon would do, sends nothing
 rotator install                         # run the daemon in the background (automatic switching on)
 ```
+
+To update: `npm install -g claude-account-rotator@latest`, then `rotator install` so the background agent runs
+the new version.
 
 Nothing else to set up: the rotator finds the Claude accounts you already added in Orca, and every config key
 has a default. From a checkout, run `bin/rotator` instead of `rotator`
@@ -100,10 +104,14 @@ rotator doctor
   missing or older than 1.4.224 (read from `/Applications/Orca.app/Contents/Info.plist`), or the `orca` CLI
   missing. `[warn]` never fails: fewer than two accounts (switching needs two) or a background agent that is not
   installed or runs an older copy.
-- The npm `postinstall` step runs `rotator doctor` and fails the install on a `[fail]` line. Before that it fails
-  when the Xcode Command Line Tools are missing, since `/usr/bin/python3` is only an installer stub until then.
-  When the background agent is already installed (an upgrade), it then runs `rotator install` so the agent runs
-  the new version; as root it only prints a reminder. npm shows this output only when the step fails.
+- The npm `postinstall` step, when npm runs it, does the same: it fails the install when the Xcode Command Line
+  Tools are missing (`/usr/bin/python3` is only an installer stub until then) or on a `[fail]` line, and when the
+  background agent is already installed (an upgrade) it runs `rotator install` so the agent runs the new version;
+  as root it only prints a reminder. npm shows this output only when the step fails. npm 12 blocks dependency
+  lifecycle scripts by default (npm 11 ran it and warned), so do not count on it: run `rotator doctor` after
+  installing and `rotator install` after updating, or install with
+  `npm install -g --allow-scripts=claude-account-rotator claude-account-rotator`. The Orca check does not
+  depend on it: every command checks again when it starts.
 
 ## Install / uninstall
 
@@ -124,8 +132,7 @@ npm uninstall -g claude-account-rotator   # after `rotator uninstall`, for an np
 - **Re-run `rotator install` after updating the code** (`git pull` or any edit): the agent keeps running the old
   copy until then. `rotator status` shows `설치본이 오래됨 — rotator install 다시 실행` when the installed copy
   came from a different commit than the checkout you run it from. An npm install has no `.git`, so `app/VERSION`
-  records `v<package.json version>` instead and the hint compares versions; `npm install -g` of a new version
-  re-runs `rotator install` by itself when the agent is installed.
+  records `v<package.json version>` instead and the hint compares versions.
 - `install` then writes `~/Library/LaunchAgents/io.github.choiyounggi.claude-account-rotator.plist` and runs
   `launchctl bootstrap gui/<uid>` on it. Running it again replaces a loaded agent (`bootout`, then `bootstrap`).
   Right after `bootout` the old instance may still be exiting, and `bootstrap` then fails with
