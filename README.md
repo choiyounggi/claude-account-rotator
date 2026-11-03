@@ -13,6 +13,14 @@ Orca's global `selected-host` pointer on a usable account.
   with the terminal.
 - **Automatic per-session rotation** — soft switch when idle, hard switch near the limit, then the session
   continues on the new account with `--resume`.
+  - Soft tier (`soft_pct` to `hard_pct`): only to an account at or below `soft_pct - target_headroom_pct`.
+  - Hard tier (`hard_pct` and up): to the account with the most room (lowest of max(5h, 7d)) that is below the
+    session's own account, with no headroom line.
+  - When the session's account and every other account are at 100%, the session moves to the account whose
+    limit lifts first, and waits there. This happens only if that account lifts at least 5 minutes sooner
+    than its own; otherwise it stays.
+  - The daemon logs each session's decision whenever it changes (`event=decision`), including why it does not
+    switch.
 - **Fable-aware** — Fable sessions are judged by the highest of the 5-hour, weekly and Fable windows.
 - **Idle-account token refresh** — the daemon refreshes OAuth tokens of accounts with no live session, the same
   way Claude Code does, and writes them back to the same Keychain item.
@@ -430,7 +438,7 @@ starts with the key.
 |-----|---------|------------|
 | `soft_pct` | `85` | number 0-100, <= `hard_pct` |
 | `hard_pct` | `95` | number 0-100, >= `soft_pct` |
-| `target_headroom_pct` | `10` | number 0-100, <= `soft_pct`; a target must be at or below `soft_pct - target_headroom_pct` |
+| `target_headroom_pct` | `10` | number 0-100, <= `soft_pct`; a soft-tier target must be at or below `soft_pct - target_headroom_pct` (the hard tier has no line) |
 | `stale_max_age_s` | `900` | number >= 0; older usage is not trusted for a target |
 | `cooldown_s` | `300` | number >= 0; minimum time between switches of one session, and the hard-mode hold after an aborted hard switch |
 | `clock_skew_tolerance_s` | `300` | number >= 0 |
