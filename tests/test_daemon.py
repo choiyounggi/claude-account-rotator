@@ -733,6 +733,14 @@ class TestRunSwitch(RunSwitchBase):
         self.assertEqual(len(self.env.logs("post_verify")), 1)
         self.assertEqual(self.env.logs("relaunch_pending"), [])
 
+    def test_adopted_session_is_verified_on_its_own_account(self):
+        res = dataclasses.replace(result("continued", None, ok=True, step="continue_prompt", new_pid=303),
+                                  other_account_id=ACC_C)
+        self.env.results = [res]
+        self.env.probe.envs[303] = ProcEnv(config_dir=prof(ACC_C).home)
+        self.run_switch()
+        self.assertEqual(self.stored()["post_verify"], "ok")
+
     def test_intent_precedes_every_switch(self):
         self.env.results = [result()]
         self.run_switch()

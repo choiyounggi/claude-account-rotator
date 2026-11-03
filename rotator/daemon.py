@@ -590,7 +590,12 @@ def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cf
         except Exception as e:
             logger.error("event=record_write_failed pid=%d exc=%s", pid, type(e).__name__)
         if res.new_pid is not None:
-            pv = post_verify(res.new_pid, last_target, deps.procs)
+            landed = last_target
+            if res.other_account_id not in (None, "default"):
+                # An adopted session runs on the account something else resumed it on.
+                landed = dataclasses.replace(last_target, account_id=res.other_account_id,
+                                             home=os.path.join(cfg.profiles_root, res.other_account_id, "home"))
+            pv = post_verify(res.new_pid, landed, deps.procs)
             if pv == "ok":
                 logger.info("event=post_verify pid=%d new_pid=%d outcome=ok", pid, res.new_pid)
             else:
