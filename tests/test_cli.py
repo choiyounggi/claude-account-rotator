@@ -1406,8 +1406,8 @@ class TestBuildStatus(StatusBase):
     def test_attention(self):
         cmd = "cd /x && claude --resume y"
         hour_ago = (T0 - timedelta(hours=1)).isoformat()
-        self.put_record(stored_record(777, res=result("exited", "exit_timeout", cmd=cmd), touched=True,
-                                      updated_at=hour_ago))
+        self.put_record(stored_record(777, sid="77777777-7777-4777-8777-777777777777",
+                                      res=result("exited", "exit_timeout", cmd=cmd), touched=True, updated_at=hour_ago))
         self.put_record(stored_record(778, res=result("exited", "exit_timeout", cmd=cmd), touched=True,
                                       updated_at=(T0 - timedelta(hours=25)).isoformat()))
         self.put_record(stored_record(779, res=result("continued", None, ok=True), touched=True))
@@ -1431,6 +1431,21 @@ class TestBuildStatus(StatusBase):
         att = {a["pid"] for a in self.doc()["attention"]}
         self.assertNotIn(791, att)
         self.assertIn(792, att)
+
+    def test_attention_hides_failures_superseded_by_a_later_record(self):
+        cmd = "cd /x && claude --resume y"
+        two_h, one_h = (T0 - timedelta(hours=2)).isoformat(), (T0 - timedelta(hours=1)).isoformat()
+        sid_later, sid_alone = "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"
+        self.put_record(stored_record(794, sid=sid_later, res=result("exited", "exit_timeout", cmd=cmd),
+                                      touched=True, updated_at=two_h))
+        self.put_record(stored_record(795, sid=sid_later, res=result("continued", None, ok=True), touched=True,
+                                      updated_at=one_h))  # the session ran again after the failure
+        self.put_record(stored_record(796, sid=sid_alone, res=result("exited", "exit_timeout", cmd=cmd),
+                                      touched=True, updated_at=one_h))
+        self.put_record(stored_record(797, sid=sid_alone, res=result("continued", None, ok=True), touched=True,
+                                      updated_at=two_h))  # earlier than the failure: no proof
+        self.env.sessions = []
+        self.assertEqual([a["pid"] for a in self.doc()["attention"]], [796])
 
     def test_attention_kept_when_no_session_runs(self):
         hour_ago = (T0 - timedelta(hours=1)).isoformat()
@@ -1772,7 +1787,7 @@ class TestRender(unittest.TestCase):
     def test_header_and_legend(self):
         lines = self.lines()
         self.assertEqual(cells(tables(lines)[0][1]), ["", "계정", "플랜", "5시간", "주간", "페이블", "세션", "갱신"])
-        self.assertEqual(cells(tables(lines)[1][1]), ["PID", "계정", "상태", "모델", "최근 전환 결과"])
+        self.assertEqual(cells(tables(lines)[1][1]), ["PID", "계정", "상태", "모델", "전환"])
         self.assertIn("* = Orca 선택 계정   노랑 ≥85%  빨강 ≥95%", lines)
         self.assertIn("* = Orca 선택 계정   노랑 ≥70%  빨강 ≥90.5%", self.lines(soft_pct=70.0, hard_pct=90.5))
 
@@ -1859,20 +1874,51 @@ class TestRender(unittest.TestCase):
         self.assertEqual(self.row(self.lines(doc), "bob")[5], "-")
 
     def test_blocks_and_relaunch(self):
-        lines = self.lines()
+        lines = self.lines(details=True)
         self.assertEqual(self.session_row(lines, 101),
-                         ["101", "alice", "idle", "-", "decision hard -> bob, last wait_exit/exit_timeout/exited"])
+                         ["101", "alice", "idle", "-", "즉시 전환 → bob · 최근 실패 (종료 시간 초과)"])
         self.assertEqual(self.session_row(lines, 555), ["555", "(관리 밖)", "busy", "-", "-"])
         self.assertEqual(lines[lines.index("  pid 101 재실행:") + 1], "cd /x && claude --resume y")
-        self.assertIn("주의 (최근 24시간 실패한 전환)", lines)
-        self.assertIn("  pid 777 final exited", lines)
+        self.assertIn("주의: 확인이 필요한 전환 1건", lines)
+        self.assertTrue(any(l.startswith("  pid 777 · ") and l.endswith(" · 종료 후 재실행 미확인 (종료 시간 초과)")
+                            for l in lines), lines)
         self.assertIn("  pid 777 힌트: look", lines)
         self.assertEqual(lines[lines.index("  pid 777 재실행:") + 1], "cd /y && claude")
         self.assertTrue(any(l.startswith("  pid 101 힌트: Claude Code exited") for l in lines))
 
+    def test_compact_by_default(self):
+        lines = self.lines()
+        self.assertFalse(any("힌트:" in l or "재실행:" in l for l in lines))
+        self.assertFalse(RELAUNCH_LINES & set(lines))
+        self.assertIn("주의: 확인이 필요한 전환 1건 — 재실행 명령: rotator status --details", lines)
+        self.assertEqual(len([l for l in lines if l.startswith("  pid ")]), 1)
+
+    def test_result_text_summaries(self):
+        tz, lab = TZ9, (lambda aid: "bob")
+        cases = [({}, "-"),
+                 ({"decision": {"action": "none"}}, "-"),
+                 ({"last_result": {"ok": False, "state": "untouched", "reason": "screen_unreadable"}}, "-"),
+                 ({"last_result": {"ok": True, "state": "continued"}}, "-"),
+                 ({"last_result": {"ok": False, "state": "exit_pending", "reason": "exit_timeout"}},
+                  "최근 실패 (종료 시간 초과)"),
+                 ({"last_result": {"ok": False, "state": "relaunched", "reason": "new_reason"}}, "최근 실패 (new_reason)"),
+                 ({"unswitchable": "cwd_missing", "last_result": {"ok": False, "state": "untouched",
+                                                                  "reason": "cwd_missing"}}, "전환 불가 (작업 폴더 없음)"),
+                 ({"in_flight": True, "decision": {"action": "soft", "target_account_id": "b"}}, "전환 중"),
+                 ({"post_verify": "ok"}, "-"),
+                 ({"post_verify": "mismatch"}, "검증 mismatch")]
+        for r, want in cases:
+            with self.subTest(r=r):
+                self.assertEqual(cli._result_text(r, lab, tz), want)
+        self.assertEqual(cli._result_text({"decision": {"action": "hard", "target_account_id": "b"}}, lab, tz,
+                                          cli.GLYPHS_ASCII), "즉시 전환 -> bob")
+
+    def test_every_switch_reason_has_korean_text(self):
+        self.assertEqual(set(cli._SWITCH_REASONS), set(switcher.REASONS))
+
     def test_long_detail_lines_wrap_not_cut(self):
         hint = STATE_HINTS["exited"]
-        lines = self.lines(width=60)
+        lines = self.lines(width=60, details=True)
         start = next(i for i, l in enumerate(lines) if l.startswith("  pid 101 힌트: "))
         block = [lines[start]] + list(itertools.takewhile(lambda l: l.startswith("      "), lines[start + 1:]))
         self.assertGreater(len(block), 1)
@@ -1889,7 +1935,7 @@ class TestRender(unittest.TestCase):
         doc["sessions"][0]["last_result"]["relaunch_command"] = cmd
         for width in (120, 60, 20, 1):
             with self.subTest(width=width):
-                lines = self.lines(doc, width=width)
+                lines = self.lines(doc, width=width, details=True)
                 self.assertGreater(cli.display_width(cmd), width)
                 self.assertEqual(lines.count(cmd), 1)  # whole, not wrapped, indented or cut
                 self.assertFalse(any(l.startswith("      ") and l.strip() in cmd for l in lines), lines)
@@ -1902,7 +1948,7 @@ class TestRender(unittest.TestCase):
         doc["sessions"], doc["unmanaged_sessions"], doc["attention"] = [], [], []
         lines = self.lines(doc)
         self.assertEqual(len(tables(lines)), 1)
-        self.assertNotIn("주의 (최근 24시간 실패한 전환)", lines)
+        self.assertFalse(any(l.startswith("주의") for l in lines))
 
     def test_session_flags(self):
         doc = render_doc()
@@ -1910,9 +1956,7 @@ class TestRender(unittest.TestCase):
                                   hard_hold_until="2026-10-28T12:05:00+00:00", record_state="in_progress",
                                   would_switch={"action": "soft", "target_account_id": ACC_C}, post_verify="ok")
         res = self.session_row(self.lines(doc, width=1000), 101)[4]
-        for part in ("in flight (pid 101)", "STUCK", "unswitchable (no_argv)", "hard hold until 21:05",
-                     "switch in progress", "would soft -> 00000000", "verify ok", "decision hard -> bob"):
-            self.assertIn(part, res)
+        self.assertEqual(res, "멈춤 · 전환 중 · 드라이런: 유휴 시 전환 → 00000000 · 전환 불가 (실행 인자 없음) · 보류 ~21:05")
 
     def test_model_parts(self):
         doc = render_doc()
@@ -1927,7 +1971,7 @@ class TestRender(unittest.TestCase):
     def test_width_boundary(self):
         for width in (60, 20, 1, 0, -5):
             with self.subTest(width=width):
-                lines = self.lines(dashboard_doc(), width=width)
+                lines = self.lines(dashboard_doc(), width=width, details=True)
                 self.assertTrue(lines)
                 for l in lines:
                     if l not in RELAUNCH_LINES:
@@ -1949,7 +1993,7 @@ class TestRender(unittest.TestCase):
         self.assertEqual(doc, before)
 
     def test_ascii_mode(self):
-        lines = self.lines(dashboard_doc(), ascii=True)
+        lines = self.lines(dashboard_doc(), ascii=True, details=True)
         for l in lines:
             self.assertTrue(all(ch.isascii() or "가" <= ch <= "힣" for ch in l), l)
         row = next(cells(l, ascii=True) for l in account_rows(lines, ascii=True) if cells(l, ascii=True)[1] == "alice")
@@ -2169,8 +2213,8 @@ class TestPlan(unittest.TestCase):
         lines = render(doc, T0, TZ9, 200)
         body = [cells(l) for l in tables(lines)[1][3:-1]]
         self.assertEqual([(r[0], r[1], r[4]) for r in body],
-                         [("100", "user Max5x", "decision soft -> user Team"),
-                          ("101", "user Team", "decision soft -> user Max5x")])
+                         [("100", "user Max5x", "유휴 시 전환 → user Team"),
+                          ("101", "user Team", "유휴 시 전환 → user Max5x")])
 
     def test_suffix_survives_label_cut(self):
         long = "a-very-long-account-name-indeed"
@@ -2301,7 +2345,7 @@ class TestGroup(unittest.TestCase):
         lines = render(doc, T0, TZ9, 200)
         rows = [cells(l) for l in tables(lines)[1][3:-1]]
         self.assertEqual(rows[0][1], "user TEAM 1 Max5x")
-        self.assertIn("-> user TEAM 1 Max5x", rows[1][4])
+        self.assertIn("→ user TEAM 1 Max5x", rows[1][4])
         rows = [cells(l) for l in tables(render(doc, T0, TZ9, 45))[1][3:-1]]
         self.assertTrue(all(cli.display_width(r[1]) <= 45 for r in rows))
 
