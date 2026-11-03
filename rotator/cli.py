@@ -814,12 +814,32 @@ def _reason_ko(reason: object) -> str:
     return _SWITCH_REASONS.get(reason, _clean(reason)) if isinstance(reason, str) else "-"
 
 
+def _switch_left(rec: dict) -> str:
+    """What a record's switch left behind, in a few Korean words."""
+    if rec.get("record_state") == "in_progress":
+        return "전환 중단됨 (창 확인 필요)" if rec.get("hint") == ORPHANED_HINT else "전환 중 (입력 금지)"
+    lr = rec.get("last_result")
+    if not isinstance(lr, dict):
+        return "결과 없음"
+    return "%s (%s)" % (_SWITCH_STATES.get(lr.get("state"), _clean(lr.get("state")) or "-"), _reason_ko(lr.get("reason")))
+
+
+def _needs_details(rec: dict) -> bool:
+    """True when ``--details`` holds advice for this session that the summary does not give."""
+    if rec.get("record_state") == "in_progress" and rec.get("hint") == ORPHANED_HINT:
+        return True
+    lr = rec.get("last_result")
+    return isinstance(lr, dict) and lr.get("ok") is not True and lr.get("state") != "untouched"
+
+
 def _result_text(r: dict, label_of: Callable[[object], str], tz: tzinfo, g: Glyphs = GLYPHS_UNICODE) -> str:
     """One short Korean summary; a failure that left the session unchanged is left out (the daemon retries)."""
     parts = []
     if r.get("stuck"):
         parts.append("멈춤")
-    if r.get("in_flight") or r.get("record_state") == "in_progress":
+    if r.get("record_state") == "in_progress" and r.get("hint") == ORPHANED_HINT:
+        parts.append("전환 중단됨 (창 확인 필요)")
+    elif r.get("in_flight") or r.get("record_state") == "in_progress":
         parts.append("전환 중")
     dec = r.get("decision")
     if isinstance(dec, dict) and dec.get("action") in _ACTIONS and not parts:
@@ -971,17 +991,15 @@ def render(doc: Optional[dict], now: datetime, tz: tzinfo, width: int, *, color:
                     free += _detail_lines(r.get("pid"), r.get("hint"), r.get("last_result"))
     attention = [x for x in d.get("attention") or [] if isinstance(x, dict)]
     if attention:
-        more = "" if details else " — 재실행 명령: rotator status --details"
-        free += [("", True), ("주의: 확인이 필요한 전환 %d건%s" % (len(attention), more), True)]
+        free += [("", True), ("주의: 확인이 필요한 전환 %d건" % len(attention), True)]
         for item in attention:
-            lr = item.get("last_result")
-            lr = lr if isinstance(lr, dict) else {}
             when = _local(item.get("updated_at"), "%m/%d %H:%M", tz)
-            free.append(("  pid %s %s %s %s %s (%s)" % (item.get("pid"), g.join, when, g.join,
-                                                     _SWITCH_STATES.get(lr.get("state"), _clean(lr.get("state")) or "-"),
-                                                     _reason_ko(lr.get("reason"))), True))
+            free.append(("  pid %s %s %s %s %s" % (item.get("pid"), g.join, when, g.join, _switch_left(item)), True))
             if details:
-                free += _detail_lines(item.get("pid"), item.get("hint"), lr)
+                free += _detail_lines(item.get("pid"), item.get("hint"), item.get("last_result"))
+    hidden = attention or any(isinstance(r, dict) and _needs_details(r) for r in d.get("sessions") or [])
+    if hidden and not details:
+        free += [("", True), ("자세히 (안내, 재실행 명령): rotator status --details", True)]
     for line, wrap in free:
         lines += _wrap(_printable(line), w, amb, g.ell) if wrap else [_printable(line)]
     return lines

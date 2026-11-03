@@ -1890,8 +1890,40 @@ class TestRender(unittest.TestCase):
         lines = self.lines()
         self.assertFalse(any("힌트:" in l or "재실행:" in l for l in lines))
         self.assertFalse(RELAUNCH_LINES & set(lines))
-        self.assertIn("주의: 확인이 필요한 전환 1건 — 재실행 명령: rotator status --details", lines)
+        self.assertIn("주의: 확인이 필요한 전환 1건", lines)
         self.assertEqual(len([l for l in lines if l.startswith("  pid ")]), 1)
+        self.assertEqual(lines[-1], "자세히 (안내, 재실행 명령): rotator status --details")
+        self.assertNotIn("자세히 (안내, 재실행 명령): rotator status --details", self.lines(details=True))
+
+    def test_details_pointer_only_when_something_is_hidden(self):
+        doc = render_doc()
+        doc["attention"] = []
+        doc["sessions"][0]["last_result"] = {"ok": False, "state": "untouched", "reason": "screen_unreadable"}
+        self.assertFalse(any("--details" in l for l in self.lines(doc)))
+        doc["sessions"][0]["last_result"] = {"ok": False, "state": "relaunched", "reason": "prompt_unconfirmed"}
+        self.assertIn("자세히 (안내, 재실행 명령): rotator status --details", self.lines(doc))
+        doc["sessions"][0].update(last_result=None, record_state="in_progress", hint=ORPHANED_HINT)
+        lines = self.lines(doc)
+        self.assertIn("전환 중단됨 (창 확인 필요)", self.session_row(lines, 101)[4])
+        self.assertIn("자세히 (안내, 재실행 명령): rotator status --details", lines)
+        doc["sessions"][0]["hint"] = IN_PROGRESS_HINT
+        lines = self.lines(doc)
+        self.assertTrue(self.session_row(lines, 101)[4].startswith("전환 중"))
+        self.assertFalse(any("--details" in l for l in lines))
+
+    def test_attention_without_result(self):
+        doc = render_doc()
+        base = dict(doc["attention"][0], last_result=None, record_state="in_progress")
+        doc["attention"] = [dict(base, pid=20, hint=ORPHANED_HINT), dict(base, pid=21, hint=IN_PROGRESS_HINT),
+                            dict(base, pid=22, record_state="final", hint="")]
+        lines = self.lines(doc)
+        self.assertTrue(any(l.startswith("  pid 20 · ") and l.endswith("전환 중단됨 (창 확인 필요)") for l in lines), lines)
+        self.assertTrue(any(l.startswith("  pid 21 · ") and l.endswith("전환 중 (입력 금지)") for l in lines), lines)
+        self.assertTrue(any(l.startswith("  pid 22 · ") and l.endswith("결과 없음") for l in lines), lines)
+
+    def test_ascii_compact(self):
+        for l in self.lines(dashboard_doc(), ascii=True):
+            self.assertTrue(all(ch.isascii() or "가" <= ch <= "힣" for ch in l), l)
 
     def test_result_text_summaries(self):
         tz, lab = TZ9, (lambda aid: "bob")
