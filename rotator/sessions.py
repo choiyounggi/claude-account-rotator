@@ -398,11 +398,16 @@ def read_session_limit(config_dir: str, cwd: str, session_id: str, since: Option
     refused by a usage limit at or after since (this process's start); None otherwise.
 
     The usage API can be unreachable for a long time, while the transcript records the refusal the moment it
-    happens. Entries before since may come from another account (the transcript follows a resumed session).
+    happens. Entries before since may come from another account (the transcript follows a resumed session), so
+    an unknown since reads nothing. A real assistant reply after the refusal means the limit no longer applies.
     Never logs and never returns transcript text."""
+    if since is None:
+        return None
     try:
         for raw in _tail_lines(config_dir, cwd, session_id, tail_bytes, chunk_bytes):
             if b'"rate_limit_info"' not in raw:
+                if isinstance(_line_model(raw), str):
+                    return None
                 continue
             try:
                 obj = json.loads(raw.decode("utf-8"))
@@ -416,7 +421,7 @@ def read_session_limit(config_dir: str, cwd: str, session_id: str, since: Option
                 at = datetime.fromisoformat(ts.replace("Z", "+00:00")) if isinstance(ts, str) else None
             except ValueError:
                 at = None
-            if at is None or at.utcoffset() is None or (since is not None and at < since):
+            if at is None or at.utcoffset() is None or at < since:
                 return None
             kind, reset = info.get("rateLimitType"), info.get("resetsAt")
             if info.get("status") != "rejected" or not isinstance(kind, str):

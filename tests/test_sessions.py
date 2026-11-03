@@ -888,7 +888,7 @@ def limit_line(ts, kind="five_hour", reset=1793682600, status="rejected"):
     info = {"status": status, "resetsAt": reset, "rateLimitType": kind, "overageStatus": "rejected"}
     return json.dumps({"type": "assistant", "timestamp": ts, "isApiErrorMessage": True,
                        "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "SECRET-PROMPT-TEXT"}]},
-                       "error": {"rate_limit_info": info}})
+                       "apiErrorParams": {"rate_limit_info": info}})
 
 
 class ReadSessionLimitTest(unittest.TestCase):
@@ -907,9 +907,15 @@ class ReadSessionLimitTest(unittest.TestCase):
         self.assertEqual(self.limit(), ("five_hour", datetime(2026, 11, 3, 5, 10, tzinfo=timezone.utc)))
 
     def test_refusal_before_start_is_another_process(self):
-        self.write([limit_line("2026-11-03T03:59:59Z"), a_line("claude-opus-5-5")])
+        self.write([limit_line("2026-11-03T03:59:59Z")])
         self.assertIsNone(self.limit())
-        self.assertIsNotNone(self.limit(since=None))
+        self.assertIsNone(self.limit(since=None))
+
+    def test_reply_after_the_refusal_clears_it(self):
+        self.write([limit_line("2026-11-03T04:20:00Z"), u_line(), a_line("claude-opus-5-5")])
+        self.assertIsNone(self.limit())
+        self.write([limit_line("2026-11-03T04:20:00Z"), u_line(), a_line("<synthetic>")])
+        self.assertIsNotNone(self.limit())
 
     def test_latest_entry_wins(self):
         self.write([limit_line("2026-11-03T04:10:00Z", kind="seven_day", reset=1793900000),

@@ -643,23 +643,23 @@ RATE_LIMITED_TOKEN = "http_429"
 
 def limit_window(kind: str) -> Optional[str]:
     """The AccountUsage window a Claude Code rateLimitType refers to, or None for a type with no window."""
-    if kind == "five_hour":
-        return "five_hour"
-    if kind.startswith("seven_day"):
-        return "seven_day"
+    if kind in ("five_hour", "seven_day"):
+        return kind
+    # A model-scoped weekly cap (seven_day_sonnet, seven_day_opus) blocks only that model, not the account.
+    if "fable" in kind:
+        return "fable"
     return None
 
 
 def with_limit(u: Optional[AccountUsage], account_id: str, window: str, resets_at: datetime,
                now: datetime) -> AccountUsage:
-    """u with window at 100% until resets_at, read as fresh now: a session's refusal by the limit is newer and
-    surer than any usage reading."""
+    """u with window at 100% until resets_at: a session's refusal by the limit is surer than any usage reading.
+    The other windows keep their own fetched_at, so an old reading of them still counts as old."""
     w = UsageWindow(100.0, resets_at)
     if u is None or u.source == "unavailable":
         return AccountUsage(account_id=account_id, source="cache", fetched_at=now,
                             **{window: w})  # type: ignore[arg-type]
-    return dataclasses.replace(u, source="cache", fetched_at=max(now, u.fetched_at), error=None,
-                               retry_after_s=None, **{window: w})
+    return dataclasses.replace(u, source="cache", error=None, retry_after_s=None, **{window: w})
 
 
 def rate_limited(u: AccountUsage) -> bool:
@@ -1010,7 +1010,10 @@ class Daemon:
         self._hold_logged: Dict[str, str] = {}
         # session_id -> {decision key: monotonic time it was last logged}
         self._decision_logged: Dict[str, Dict[Tuple[str, Optional[str], str], float]] = {}
-        self._limit_logged: Dict[str, Tuple[str, str, str]] = {}
+        # (account_id, window) -> (resets_at, when it was recorded)
+        self._limits: Dict[Tuple[str, str], Tuple[datetime, datetime]] = {}
+        # (account_id, window) -> resets_at of a limit a later live reading showed lifted; not recorded again
+        self._limits_lifted: Dict[Tuple[str, str], datetime] = {}
         self._would: Dict[str, Tuple[str, str]] = {}
         self._excluded_logged: Dict[str, Tuple[str, str]] = {}
 
@@ -1038,7 +1041,7 @@ class Daemon:
             self._write_snapshot()
             return
         self._refresh_usage(profiles, now)
-        usages = self._usage.usages()
+        usages = self._overlay_limits(self._usage.usages(), now)
         self._pointer_step(profiles, usages, now)
         try:
             found = deps.discover_sessions(session_homes(profiles))
@@ -1046,7 +1049,8 @@ class Daemon:
             log.error("event=discover_error what=sessions exc=%s", type(e).__name__)
             self._write_snapshot()
             return
-        usages = self._apply_session_limits(profiles, usages, found, now)
+        self._record_session_limits(profiles, found, now)
+        usages = self._overlay_limits(usages, now)
         self._handle_sessions(profiles, usages, found, now)
         live = {s.session_id for s in found}
         for sid in [k for k in self._decision_logged if k not in live]:
@@ -1057,10 +1061,9 @@ class Daemon:
                                     warm=self._cfg.session_token_warmup and not self._cfg.dry_run)
         self._write_snapshot()
 
-    def _apply_session_limits(self, profiles: Sequence[Profile], usages: Mapping[str, AccountUsage],
-                              found: Sequence[Session], now: datetime) -> Mapping[str, AccountUsage]:
-        """usages with every account a live session was refused on marked at 100% until the reset."""
-        out = dict(usages)
+    def _record_session_limits(self, profiles: Sequence[Profile], found: Sequence[Session], now: datetime) -> None:
+        """Remember every account a live session was refused on, until the reset: once that session moves away
+        its new process no longer shows the refusal, while the usage API may still be unreachable."""
         for s in found:
             own = profile_for_config_dir(profiles, s.config_dir)
             if own is None:
@@ -1076,16 +1079,37 @@ class Daemon:
             window = limit_window(kind)
             if window is None or resets_at <= now:
                 continue
-            cur = out.get(own.account_id)
+            key = (own.account_id, window)
+            prev = self._limits.get(key)
+            if (prev is not None and prev[0] >= resets_at) or self._limits_lifted.get(key) == resets_at:
+                continue
+            self._limits[key] = (resets_at, now)
+            self._log.warning("event=limit_seen pid=%d account=%s window=%s until=%s", s.pid, own.account_id,
+                              window, _iso(resets_at))
+
+    def _overlay_limits(self, usages: Mapping[str, AccountUsage], now: datetime) -> Mapping[str, AccountUsage]:
+        """usages with every remembered limit at 100% until its reset. A limit is forgotten at its reset, or when
+        a live reading taken after it was recorded shows the window below 100% (the limit lifted early)."""
+        out = dict(usages)
+        for key in [k for k, t in self._limits_lifted.items() if t <= now]:
+            del self._limits_lifted[key]
+        for key in list(self._limits):
+            aid, window = key
+            resets_at, recorded_at = self._limits[key]
+            cur = out.get(aid)
             cw = getattr(cur, window) if cur is not None else None
+            if resets_at <= now:
+                del self._limits[key]
+                continue
+            if (cur is not None and cur.source == "live" and cur.fetched_at > recorded_at and cw is not None
+                    and cw.utilization < 100.0):
+                del self._limits[key]
+                self._limits_lifted[key] = resets_at
+                self._log.info("event=limit_lifted account=%s window=%s", aid, window)
+                continue
             if cw is not None and cw.utilization >= 100.0 and cw.resets_at is not None and cw.resets_at >= resets_at:
                 continue
-            out[own.account_id] = with_limit(cur, own.account_id, window, resets_at, now)
-            mark = (own.account_id, window, resets_at.isoformat())
-            if self._limit_logged.get(own.account_id) != mark:
-                self._limit_logged[own.account_id] = mark
-                self._log.warning("event=limit_seen pid=%d account=%s window=%s until=%s", s.pid, own.account_id,
-                                  window, _iso(resets_at))
+            out[aid] = with_limit(cur, aid, window, resets_at, now)
         return out
 
     def _refresh_usage(self, profiles: Sequence[Profile], now: datetime) -> None:

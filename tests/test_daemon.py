@@ -2249,7 +2249,7 @@ class TestSessionLimits(DispatchBase):
     def test_refused_account_is_not_a_target(self):
         self.env.pcts = {ACC_A: 97.0, ACC_B: 20.0, ACC_C: 50.0}
         self.env.sessions = [sess(101, ACC_A), sess(102, ACC_B, sid=SID2, handle="term_00000002")]
-        self.env.limits[102] = ("seven_day_opus", T0 + timedelta(days=2))
+        self.env.limits[102] = ("seven_day", T0 + timedelta(days=2))
         self.d.tick()
         self.assertEqual(self.row(101)["decision"]["target_account_id"], ACC_C)
 
@@ -2268,11 +2268,46 @@ class TestSessionLimits(DispatchBase):
         self.assertIsNotNone(self.row(101)["decision"])
 
     def test_logged_once(self):
-        self.env.pcts = {ACC_A: 84.0, ACC_B: 99.0, ACC_C: 99.5}
+        self.env.pcts = {}
+        self.env.usages = {a: dataclasses.replace(live(a, p), fetched_at=T0 - timedelta(hours=1))
+                           for a, p in ((ACC_A, 84.0), (ACC_B, 99.0), (ACC_C, 99.5))}
         self.env.limits[101] = ("five_hour", T0 + timedelta(hours=3))
         for _ in range(5):
             self.tick_after(10)
         self.assertEqual(len(self.env.logs("limit_seen")), 1)
+
+    def test_remembered_after_the_session_moves(self):
+        self.env.pcts = {}
+        self.env.usages = {a: dataclasses.replace(live(a, p), fetched_at=T0 - timedelta(hours=1))
+                           for a, p in ((ACC_A, 84.0), (ACC_B, 20.0), (ACC_C, 50.0))}
+        self.env.limits[101] = ("five_hour", T0 + timedelta(hours=3))
+        self.d.tick()
+        del self.env.limits[101]
+        self.env.sessions = [sess(101, ACC_A), sess(102, ACC_C, sid=SID2, handle="term_00000002")]
+        self.env.usages[ACC_C] = live(ACC_C, 97.0, now=T0 + timedelta(seconds=400))
+        self.env.usages[ACC_B] = live(ACC_B, 99.0, now=T0 + timedelta(seconds=400))
+        # A fresh Claude Code cache reading of A that predates the refusal's effect: 84%, a valid target alone.
+        self.env.usages[ACC_A] = dataclasses.replace(live(ACC_A, 84.0, now=T0 + timedelta(seconds=400)),
+                                                     source="cache")
+        self.tick_after(400)
+        self.assertEqual(self.row(102)["decision"]["action"], "none")
+
+    def test_forgotten_at_reset(self):
+        self.env.limits[101] = ("five_hour", T0 + timedelta(minutes=5))
+        self.d.tick()
+        self.assertIn((ACC_A, "five_hour"), self.d._limits)
+        del self.env.limits[101]
+        self.tick_after(301)
+        self.assertEqual(self.d._limits, {})
+
+    def test_live_reading_after_the_refusal_lifts_it_once(self):
+        self.env.pcts = {ACC_A: 84.0, ACC_B: 99.0, ACC_C: 99.5}
+        self.env.limits[101] = ("five_hour", T0 + timedelta(hours=3))
+        for _ in range(10):
+            self.tick_after(10)
+        self.assertEqual(len(self.env.logs("limit_seen")), 1)
+        self.assertEqual(len(self.env.logs("limit_lifted")), 1)
+        self.assertEqual(self.d._limits, {})
 
 
 class TestWithLimit(unittest.TestCase):
@@ -2290,7 +2325,9 @@ class TestWithLimit(unittest.TestCase):
 
     def test_limit_window_mapping(self):
         self.assertEqual(daemon.limit_window("five_hour"), "five_hour")
-        self.assertEqual(daemon.limit_window("seven_day_sonnet"), "seven_day")
+        self.assertEqual(daemon.limit_window("seven_day"), "seven_day")
+        self.assertIsNone(daemon.limit_window("seven_day_sonnet"))
+        self.assertEqual(daemon.limit_window("seven_day_fable"), "fable")
         self.assertIsNone(daemon.limit_window("overage"))
 
 
