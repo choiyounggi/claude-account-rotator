@@ -2138,7 +2138,7 @@ class TestInFlight(DispatchBase):
     def test_lease_follows_configured_timeouts(self):
         self.make(make_cfg(timeouts=switcher.Timeouts(ready_s=120.0)))
         self.d.tick()
-        self.assertEqual(self.d._inflight[SID1].deadline, 1000.0 + 570.0 + 30.0)
+        self.assertEqual(self.d._inflight[SID1].deadline, 1000.0 + 615.0 + 30.0)
 
     def test_on_attempt_refreshes_deadline(self):
         self.env.results = [result("untouched", "target_untrusted"),
@@ -2155,7 +2155,7 @@ class TestInFlight(DispatchBase):
         self.d = Daemon(self.cfg, self.deps, self.deps.make_logger())
         self.d.tick()
         self.env.run_worker(0)
-        self.assertEqual(seen, [1540.0, 1640.0])
+        self.assertEqual(seen, [1585.0, 1685.0])
 
 
 class TestTouchedNeverRetried(DispatchBase):
@@ -2633,14 +2633,14 @@ class TestRunDaemon(RunDaemonBase):
         self.env.wait_hook = hook
 
     def test_drain_abandons_overrun_worker(self):
-        self._stop_on_first_wait(565.0)
+        self._stop_on_first_wait(610.0)
         self.assertEqual(self.run_d(), 0)
         self.assertEqual(len(self.env.spawned), 1)
         self.assertEqual(self.env.spawned[0].joins, [0.0])
         self.assertEqual(len(self.env.logs("worker_abandoned")), 1)
 
     def test_drain_waits_remaining_lease(self):
-        self._stop_on_first_wait(440.0)
+        self._stop_on_first_wait(485.0)
         self.assertEqual(self.run_d(), 0)
         self.assertEqual(self.env.spawned[0].joins, [100.0])
         self.assertEqual(len(self.env.logs("worker_abandoned")), 1)

@@ -250,19 +250,20 @@ class TestWaitUntil(unittest.TestCase):
 
 
 class TestSwitchBudget(unittest.TestCase):
-    def test_default_budget_is_510(self):
-        # 380 s before the exit-confirm dialog: + one screen read overrunning the exit wait + one confirm send,
-        # and the same again for the ready wait answering the trust dialog.
-        self.assertEqual(switch_budget_s(Timeouts()), 510.0)
+    def test_default_budget_is_555(self):
+        # Two exit windows (each may overrun by one screen read) and one confirm send; one screen read and one
+        # trust-dialog key for the ready wait.
+        self.assertEqual(switch_budget_s(Timeouts()), 555.0)
 
     def test_budget_tracks_timeouts(self):
         t = Timeouts(idle_s=0, exit_s=0, shell_s=0, ready_s=0, prompt_s=0)
-        self.assertEqual(switch_budget_s(t), 370.0)
+        self.assertEqual(switch_budget_s(t), 385.0)
 
     def test_budget_covers_exit_confirm_and_trust_calls(self):
         base = 4 * sw.ORCA_CALL_TIMEOUT_S + 3 * sw.ORCA_SEND_TIMEOUT_S + 5.0 + 5 * sw.PS_TIMEOUT_S
         t = Timeouts(idle_s=0, exit_s=0, shell_s=0, ready_s=0, prompt_s=0)
-        self.assertEqual(switch_budget_s(t) - base, 2 * (sw.ORCA_CALL_TIMEOUT_S + sw.ORCA_SEND_TIMEOUT_S))
+        # Two exit windows each overrun by one read; one exit-confirm and one trust-dialog key.
+        self.assertEqual(switch_budget_s(t) - base, 3 * sw.ORCA_CALL_TIMEOUT_S + 2 * sw.ORCA_SEND_TIMEOUT_S)
 
 
 # ---------------------------------------------------------------- Task 03
@@ -1586,14 +1587,15 @@ class TestWaitExit(unittest.TestCase):
         w.procs.alive[OLD_PID] = [True]
         res = w.run("soft", timeouts=dataclasses.replace(FAST, exit_s=0))
         self.assertEqual(res, result("wait_exit", "exit_timeout", "exit_pending"))
-        self.assertEqual(w.procs.calls.count(("is_alive", OLD_PID)), 3)
+        self.assertEqual(w.procs.calls.count(("is_alive", OLD_PID)), 4)
 
     def test_five_by_one_probe_counts(self):
         w = World()
         w.procs.alive[OLD_PID] = [True]
         res = w.run("soft", timeouts=dataclasses.replace(FAST, exit_s=5, poll_s=1))
         self.assertEqual(res, result("wait_exit", "exit_timeout", "exit_pending"))
-        self.assertEqual(w.procs.calls.count(("is_alive", OLD_PID)), 7)
+        # Two windows of five one-second polls (plus their first probes) and the final check.
+        self.assertEqual(w.procs.calls.count(("is_alive", OLD_PID)), 12)
 
     def test_is_alive_raising_counts_as_alive(self):
         w = World()
@@ -1946,6 +1948,25 @@ class TestExitConfirm(unittest.TestCase):
         res = w.run("soft")
         self.assertEqual(res, dataclasses.replace(HAPPY, tasks_stopped=True))
         self.assertEqual(len([c for c in w.driver.sends() if c[2] is None]), 1)
+
+    def test_dialog_after_the_first_window_is_still_answered(self):
+        # Claude Code may need longer than exit_s to stop background agents before it opens the dialog.
+        # exit_s=2 with 1 s polls reads the screen twice per window: the dialog is the second window's second read.
+        w = self._world(*([EMPTY_SCREEN] * 3 + [DIALOG_HIGHLIGHTED]))
+        with self.assertLogs("rotator.switcher", "INFO") as cm:
+            res = w.run("soft", timeouts=dataclasses.replace(FAST, exit_s=2, poll_s=1))
+        self.assertEqual(res, dataclasses.replace(HAPPY, tasks_stopped=True))
+        self.assertTrue(any("event=exit_wait_extended" in m for m in cm.output))
+        self.assertEqual(len([c for c in w.driver.sends() if c[2] is None]), 1)
+
+    def test_no_second_window_after_an_answered_dialog(self):
+        w = self._world(DIALOG_HIGHLIGHTED)
+        w.procs.alive[OLD_PID] = [True]
+        with self.assertLogs("rotator.switcher", "INFO") as cm:
+            res = w.run("soft", timeouts=dataclasses.replace(FAST, exit_s=2, poll_s=1))
+        self.assertEqual(res, dataclasses.replace(result("wait_exit", "exit_timeout", "exit_pending"),
+                                                  tasks_stopped=True))
+        self.assertFalse(any("event=exit_wait_extended" in m for m in cm.output))
 
     def test_look_alike_never_confirms(self):
         w = self._world(*([LOOK_ALIKE] * 7))

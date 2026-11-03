@@ -219,9 +219,9 @@ def _wait_until(probe: Callable[[], Any], budget_s: float, poll_s: float,
 
 def switch_budget_s(timeouts: Timeouts) -> float:
     """Upper bound in seconds for one ``switch_session`` run with these timeouts."""
-    # The exit wait may overrun by one screen read and send one exit-confirm key; the ready wait by one
-    # screen read and one trust-dialog key.
-    return float(6 * ORCA_CALL_TIMEOUT_S + 5 * ORCA_SEND_TIMEOUT_S + timeouts.idle_s + timeouts.exit_s
+    # The exit wait has two windows, each of which may overrun by one screen read, and sends one exit-confirm
+    # key; the ready wait may overrun by one screen read and send one trust-dialog key.
+    return float(7 * ORCA_CALL_TIMEOUT_S + 5 * ORCA_SEND_TIMEOUT_S + timeouts.idle_s + 2 * timeouts.exit_s
                  + timeouts.shell_s + 5.0 + timeouts.ready_s + timeouts.prompt_s + 5 * PS_TIMEOUT_S)
 
 
@@ -1022,6 +1022,11 @@ def _wait_exit(run: _Run) -> Optional[SwitchResult]:
         return False
 
     dead = _wait_until(exited_or_confirm, t.exit_s, t.poll_s, run.clock, run.sleep)
+    if not dead and not confirm_sent[0]:
+        # Claude Code stops the session's background agents before it opens the exit-confirm dialog, which can
+        # take longer than exit_s; without a second window that dialog is left unanswered.
+        logger.info("event=exit_wait_extended pid=%d", run.session.pid)
+        dead = _wait_until(exited_or_confirm, t.exit_s, t.poll_s, run.clock, run.sleep)
     w = run.driver.wait_for(h, "exit", int(t.shell_s * 1000))
     logger.debug("switch exit settle satisfied=%s", w.satisfied)
     if not dead and not gone():
