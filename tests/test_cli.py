@@ -1112,6 +1112,40 @@ class TestStaleInstall(unittest.TestCase):
             f.write("gitdir: /elsewhere\n")
         self.assertEqual(launchd.source_commit(self.source, lambda argv, timeout: (0, "0123abc\n", "")), "0123abc")
 
+    def test_release_version_matches_only_itself(self):
+        self.version("v0.1.0\n2026-11-02T03:04:05Z\n")
+        self.assertIs(self.stale("v0.1.0"), False)
+        self.assertIs(self.stale("v0.2.0"), True)
+        self.assertIs(self.stale("abc1234"), True)  # switched from an npm install to a checkout
+        self.version("v0.1.1\n")
+        self.assertIs(self.stale("v0.1.10"), True)  # never a prefix match
+        self.version("abc1234\n")
+        self.assertIs(self.stale("v0.1.0"), True)
+
+    def test_source_commit_falls_back_to_package_version(self):
+        def no_git(argv, timeout):
+            raise AssertionError("git must not run without .git")
+        pkg = os.path.join(self.source, "package.json")
+        self.assertIsNone(launchd.source_commit(self.source, no_git))  # neither .git nor package.json
+        for text, want in (('{"version": "0.1.0"}', "v0.1.0"), ('{"version": "0.2.0-rc.1"}', "v0.2.0-rc.1"),
+                           ('{"version": "0.1"}', None),
+                           ('{"version": 1}', None), ("[]", None), ("{", None)):
+            with open(pkg, "w", encoding="utf-8") as f:
+                f.write(text)
+            self.assertEqual(launchd.source_commit(self.source, no_git), want, text)
+        with open(pkg, "w", encoding="utf-8") as f:
+            f.write('{"version": "0.1.0"}')
+        os.makedirs(os.path.join(self.source, ".git"))
+        self.assertEqual(launchd.source_commit(self.source, lambda argv, timeout: (0, "abc1234\n", "")), "abc1234")
+
+    def test_installed_release_version(self):
+        self.version("v0.1.0\n2026-11-02T03:04:05Z\n")
+        self.assertEqual(launchd.installed_commit(self.state), "v0.1.0")
+        self.version("v0.2.0-rc.1\n")
+        self.assertEqual(launchd.installed_commit(self.state), "v0.2.0-rc.1")
+        self.version("0.1.0\n")
+        self.assertIsNone(launchd.installed_commit(self.state))
+
     def test_render_line(self):
         doc = {"daemon": {"running": False}, "accounts": [
             {"account_id": "acc-1", "label": "a", "source": "live", "five_hour": None, "seven_day": None}]}
@@ -3403,8 +3437,187 @@ class TestBinEntrypoint(unittest.TestCase):
         p = subprocess.run([sys.executable, path, "--help"], cwd="/", capture_output=True, text=True, timeout=30,
                            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
         self.assertEqual(p.returncode, 0, p.stderr)
-        for name in ("status", "daemon", "switch", "install", "uninstall"):
+        for name in ("status", "daemon", "switch", "install", "uninstall", "doctor"):
             self.assertIn(name, p.stdout)
+
+
+class TestPackage(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(REPO, "package.json"), encoding="utf-8") as f:
+            self.pkg = json.load(f)
+
+    def test_ships_the_app_and_runs_doctor(self):
+        self.assertRegex(self.pkg["version"], r"^\d+\.\d+\.\d+$")  # launchd.release_version reads it
+        self.assertEqual(self.pkg["bin"], {"rotator": "bin/rotator"})
+        self.assertEqual(self.pkg["os"], ["darwin"])
+        self.assertEqual(set(self.pkg["files"]), {"bin/rotator", "rotator/*.py", "scripts/postinstall.js"})
+        self.assertEqual(self.pkg["scripts"], {"postinstall": "node scripts/postinstall.js"})
+        for rel in ("bin/rotator", "scripts/postinstall.js"):
+            self.assertTrue(os.path.isfile(os.path.join(REPO, rel)), rel)
+
+    def test_postinstall_names_the_agent_plist(self):
+        with open(os.path.join(REPO, "scripts", "postinstall.js"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("'%s.plist'" % LABEL, text)
+        self.assertIn("[ROTATOR, 'doctor']", text)
+
+
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
+class TestPostinstall(unittest.TestCase):
+    """Runs scripts/postinstall.js with a stub bin/rotator that records its arguments, under a scratch HOME."""
+
+    def setUp(self):
+        self.dir = scratch("postinstall-" + self._testMethodName)
+        os.makedirs(os.path.join(self.dir, "pkg", "scripts"))
+        os.makedirs(os.path.join(self.dir, "pkg", "bin"))
+        shutil.copyfile(os.path.join(REPO, "scripts", "postinstall.js"),
+                        os.path.join(self.dir, "pkg", "scripts", "postinstall.js"))
+        self.calls = os.path.join(self.dir, "calls.txt")
+        with open(os.path.join(self.dir, "pkg", "bin", "rotator"), "w", encoding="utf-8") as f:
+            f.write("import os, sys\n"
+                    "open(os.environ['STUB_CALLS'], 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                    "sys.exit(int(os.environ.get('STUB_RC_' + sys.argv[1].upper(), '0')))\n")
+        self.home = os.path.join(self.dir, "home")
+        os.makedirs(os.path.join(self.home, "Library", "LaunchAgents"))
+
+    def run_script(self, global_install=True, plist=False, doctor_rc=0, install_rc=0):
+        if plist:
+            with open(os.path.join(self.home, "Library", "LaunchAgents", LABEL + ".plist"), "w") as f:
+                f.write("<plist/>\n")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("npm_config_")}
+        env.update(HOME=self.home, STUB_CALLS=self.calls, STUB_RC_DOCTOR=str(doctor_rc),
+                   STUB_RC_INSTALL=str(install_rc))
+        if global_install:
+            env["npm_config_global"] = "true"
+        p = subprocess.run(["node", os.path.join(self.dir, "pkg", "scripts", "postinstall.js")], env=env,
+                           capture_output=True, text=True, timeout=60)
+        try:
+            with open(self.calls, encoding="utf-8") as f:
+                calls = f.read().split()
+        except FileNotFoundError:
+            calls = []
+        return p, calls
+
+    def test_fresh_install_runs_doctor_only(self):
+        p, calls = self.run_script()
+        self.assertEqual((p.returncode, calls), (0, ["doctor"]), p.stderr)
+        self.assertIn("rotator install", p.stdout)
+
+    def test_failed_doctor_fails_the_install(self):
+        p, calls = self.run_script(plist=True, doctor_rc=1)
+        self.assertEqual((p.returncode, calls), (1, ["doctor"]))
+        self.assertIn("cannot run the rotator", p.stderr)
+
+    def test_global_upgrade_refreshes_the_agent(self):
+        p, calls = self.run_script(plist=True)
+        self.assertEqual((p.returncode, calls), (0, ["doctor", "install"]), p.stderr)
+
+    def test_local_install_leaves_the_agent_alone(self):
+        p, calls = self.run_script(global_install=False, plist=True)
+        self.assertEqual((p.returncode, calls), (0, ["doctor"]), p.stderr)
+
+    def test_failed_refresh_does_not_fail_the_install(self):
+        p, calls = self.run_script(plist=True, install_rc=1)
+        self.assertEqual((p.returncode, calls), (0, ["doctor", "install"]))
+        self.assertIn("run `rotator install`", p.stderr)
+
+
+class TestOrcaGate(MainBase):
+    def gated(self, *argv, reason="Orca: 1.4.200 is too old"):
+        self.out, self.err = io.StringIO(), io.StringIO()
+        calls = []
+        rc = main(["--config", self.cfg_path] + list(argv), make_deps=self.make_deps, launchctl=FakeRunner(),
+                  uid=lambda: 501, stdout=self.out, stderr=self.err, tz=timezone.utc,
+                  orca_gate=lambda: calls.append(1) or reason)
+        return rc, calls
+
+    def test_refuses_every_command_that_uses_orca(self):
+        for argv in (["status", "--json"], ["daemon", "--dry-run"], ["switch", "--session", "1", "--to", ACC_B],
+                     ["install"]):
+            rc, calls = self.gated(*argv)
+            self.assertEqual(rc, 2, argv)
+            self.assertEqual(calls, [1])
+            self.assertEqual(self.err.getvalue(),
+                             "cannot run here: Orca: 1.4.200 is too old (see: rotator doctor)\n")
+            self.assertEqual(self.cfg_seen, [], argv)  # refused before any deps were built
+
+    def test_doctor_and_uninstall_are_never_gated(self):
+        with mock.patch("rotator.launchd.uninstall", lambda **kw: (0, "uninstall ok")):
+            rc, calls = self.gated("uninstall")
+        self.assertEqual((rc, calls), (0, []))
+        with mock.patch("rotator.cli.doctor.orca_version", return_value="1.4.241"):
+            rc, calls = self.gated("doctor")
+        self.assertEqual(calls, [])
+        self.assertIn("Orca", self.out.getvalue())
+
+    def test_no_reason_runs(self):
+        rc, calls = self.gated("status", "--json", reason=None)
+        self.assertEqual((rc, calls), (0, [1]))
+
+    def test_real_gate_only_without_injected_seams(self):
+        with mock.patch("rotator.cli._real_orca_gate", side_effect=AssertionError("real gate")):
+            self.assertEqual(self.main("status", "--json"), 0)
+        with mock.patch("rotator.cli._real_orca_gate", return_value="macOS: Linux") as real, \
+                mock.patch("rotator.cli.real_deps", side_effect=AssertionError("deps built")):
+            err = io.StringIO()
+            rc = main(["--config", self.cfg_path, "status", "--json"], stdout=io.StringIO(), stderr=err)
+        self.assertEqual(rc, 2)
+        real.assert_called_once_with()
+        self.assertIn("macOS: Linux", err.getvalue())
+
+    def test_real_gate_reads_system_and_orca(self):
+        with mock.patch("rotator.cli.platform.system", return_value="Darwin"), \
+                mock.patch("rotator.cli.doctor.orca_version", return_value="1.4.223"):
+            self.assertIn("too old", cli._real_orca_gate())
+        with mock.patch("rotator.cli.platform.system", return_value="Darwin"), \
+                mock.patch("rotator.cli.doctor.orca_version", return_value="1.4.224"):
+            self.assertIsNone(cli._real_orca_gate())
+
+
+class TestDoctorCommand(MainBase):
+    def doctor(self, version="1.4.241", system="Darwin", cli_ok=True, stale=False):
+        self.out, self.err = io.StringIO(), io.StringIO()
+        with mock.patch("rotator.cli.doctor.orca_version", return_value=version), \
+                mock.patch("rotator.cli.platform.system", return_value=system), \
+                mock.patch("rotator.cli.os.access", return_value=cli_ok):
+            return main(["--config", self.cfg_path, "doctor"], make_deps=self.make_deps, launchctl=FakeRunner(),
+                        uid=lambda: 501, stdout=self.out, stderr=self.err, stale_check=lambda: stale)
+
+    def line(self, name):
+        return next(x for x in self.out.getvalue().splitlines() if (" %s " % name) in x)
+
+    def test_all_good(self):
+        self.write_cfg({"profiles_root": ROOT})
+        self.assertEqual(self.doctor(), 0)
+        self.assertTrue(self.line("Orca").startswith("[ok]"))
+        self.assertTrue(self.line("Claude accounts").startswith("[ok]"))
+        self.assertIn("%d under %s" % (len(self.env.profiles), ROOT), self.line("Claude accounts"))
+        self.assertEqual(self.err.getvalue(), "")
+
+    def test_old_orca_fails(self):
+        self.assertEqual(self.doctor(version="1.4.223"), 1)
+        self.assertTrue(self.line("Orca").startswith("[fail]"))
+
+    def test_missing_cli_or_other_os_fails(self):
+        self.assertEqual(self.doctor(cli_ok=False), 1)
+        self.assertTrue(self.line("orca CLI").startswith("[fail]"))
+        self.assertEqual(self.doctor(system="Linux"), 1)
+        self.assertTrue(self.line("macOS").startswith("[fail]"))
+
+    def test_bad_config_is_a_fail_line(self):
+        self.write_cfg({"no_such_key": 1})
+        self.assertEqual(self.doctor(), 1)
+        self.assertTrue(self.line("config").startswith("[fail]"))
+        self.assertIn("no_such_key", self.line("config"))
+        self.assertTrue(self.line("Orca").startswith("[ok]"))  # the other checks still ran
+        self.assertEqual(self.err.getvalue(), "")
+        self.assertEqual(self.main("status", "--json"), 2)  # every other command still refuses it
+        self.assertIn("config error", self.err.getvalue())
+
+    def test_warnings_do_not_fail(self):
+        self.env.profiles = []
+        self.assertEqual(self.doctor(stale=True), 0)
+        self.assertTrue(self.line("Claude accounts").startswith("[warn]"))
 
 
 # --- Task 14 ---------------------------------------------------------------------------------------------

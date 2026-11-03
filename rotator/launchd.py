@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import math
 import os
 import plistlib
@@ -35,6 +36,9 @@ UNKNOWN_COMMIT = "unknown"
 # launchd-spawned processes are denied these TCC-protected folders even when the user's terminal is not.
 PROTECTED_DIRS = ("Desktop", "Documents", "Downloads")
 _COMMIT_RE = re.compile(r"[0-9a-f]{4,40}")
+# An npm install has no .git; its package.json version stands in for the commit, as "v<version>".
+_RELEASE_RE = re.compile(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?")
+PACKAGE_JSON = "package.json"
 
 Runner = Callable[[List[str], float], Tuple[int, str, str]]
 CopyFile = Callable[[str, str], object]
@@ -101,11 +105,23 @@ def run_git(argv: List[str], timeout_s: float) -> Tuple[int, str, str]:
     return (p.returncode, p.stdout, p.stderr)
 
 
+def release_version(root: str) -> Optional[str]:
+    """``"v<version>"`` from ``root/package.json``; None when it is absent, unreadable or not x.y.z."""
+    try:
+        with open(os.path.join(root, PACKAGE_JSON), encoding="utf-8") as f:
+            v = json.load(f).get("version")
+    except (OSError, ValueError, AttributeError):
+        return None
+    tag = "v%s" % v if isinstance(v, str) else ""
+    return tag if _RELEASE_RE.fullmatch(tag) else None
+
+
 def source_commit(root: str, runner: Runner = run_git) -> Optional[str]:
-    """Short HEAD commit of the checkout at ``root``; None when it is not a checkout or git fails."""
+    """Short HEAD commit of the checkout at ``root``, or its release version when it is not a checkout (an npm
+    install); None when neither is known or git fails."""
     # Without its own .git, git would walk up and report whatever repository contains root.
     if not os.path.lexists(os.path.join(root, ".git")):
-        return None
+        return release_version(root)
     try:
         rc, out, _ = runner(["git", "-C", root, "rev-parse", "--short", "HEAD"], GIT_TIMEOUT_S)
     except Exception:
@@ -121,14 +137,15 @@ def installed_commit(state_dir: str) -> Optional[str]:
             first = f.readline().strip()
     except (OSError, ValueError):
         return None
-    return first if _COMMIT_RE.fullmatch(first) else None
+    return first if _COMMIT_RE.fullmatch(first) or _RELEASE_RE.fullmatch(first) else None
 
 
 def install_stale(plist_path: str, state_dir: str, source_root: str,
                   commit_of: Callable[[str], Optional[str]] = source_commit) -> bool:
     """True only when the agent is installed and its app copy came from a different commit than source_root.
 
-    Either commit unknown means not stale; short hashes of different lengths match on their common prefix."""
+    Either commit unknown means not stale; short hashes of different lengths match on their common prefix, and
+    a release version ("v1.2.3", an npm install) matches only itself."""
     try:
         if not os.path.isfile(plist_path):
             return False
@@ -138,6 +155,8 @@ def install_stale(plist_path: str, state_dir: str, source_root: str,
         return False
     if installed is None or current is None:
         return False
+    if not (_COMMIT_RE.fullmatch(installed) and _COMMIT_RE.fullmatch(current)):
+        return installed != current
     return not (installed.startswith(current) or current.startswith(installed))
 
 
