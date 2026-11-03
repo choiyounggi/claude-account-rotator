@@ -152,6 +152,7 @@ class FakeEnv:
         self.sessions: List[Session] = []
         self.usages: Dict[str, AccountUsage] = {}
         self.pcts: Dict[str, float] = {}  # account -> utilization, served as a live usage fetched "now"
+        self.limits: Dict[int, object] = {}  # pid -> (rateLimitType, resets_at) read from its transcript
         self.fetch_raises: Set[str] = set()
         self.profiles_raise = False
         self.sessions_raise = False
@@ -297,6 +298,12 @@ class FakeEnv:
             return dict(table.get(p.account_id, {"state": "not_needed", "reason": "fresh", "at": None,
                                                  "last_refreshed_at": None}))
 
+        def read_limit(s):
+            hit = env.limits.get(s.pid)
+            if isinstance(hit, Exception):
+                raise hit
+            return hit
+
         def refresh_held(*, due_only=False):
             env.refresh_calls.append(("refresh_held", due_only))
             if env.held_raises:
@@ -305,7 +312,7 @@ class FakeEnv:
 
         fields = dict(
             discover_profiles=discover_profiles, fetch_usage=fetch_usage, refresh_token=refresh_token,
-            refresh_held=refresh_held, discover_sessions=discover_sessions,
+            refresh_held=refresh_held, discover_sessions=discover_sessions, read_limit=read_limit,
             switch=switch, make_driver=lambda: FakeDriver(env), procs=env.probe, read_pointer=read_pointer,
             write_pointer=write_pointer, now=lambda: env.now_v, monotonic=lambda: env.mono_v, spawn=spawn,
             wait_stop=wait_stop, lock=lock, read_text=read_text, write_text=write_text, list_dir=list_dir,
@@ -435,7 +442,7 @@ class TestDeps(unittest.TestCase):
         fields = dataclasses.fields(Deps)
         with self.assertRaises(TypeError):
             Deps(**{f.name: None for f in fields[:-1]})
-        self.assertEqual(len(fields), 22)
+        self.assertEqual(len(fields), 23)
         for f in fields:
             self.assertIs(f.default, dataclasses.MISSING, f.name)
             self.assertIs(f.default_factory, dataclasses.MISSING, f.name)
@@ -1797,7 +1804,7 @@ class TestSnapshot(TickBase):
         self.d.tick()
         row = self.snap()["sessions"][0]
         self.assertEqual(row["decision"]["action"], "none")
-        self.assertTrue(row["decision"]["reason"].startswith("max(5h,7d,fable)=90.0% >= soft 85.0%"),
+        self.assertTrue(row["decision"]["reason"].startswith("load(5h,7d,fable)=90.0% >= soft 85.0%"),
                         row["decision"]["reason"])
         self.assertEqual([c for c in self.env.calls if c[0] == "switch"], [])
 
@@ -2228,6 +2235,162 @@ class TestTouchedNeverRetried(DispatchBase):
         self.assertEqual(self.stored()["worker_error"], "OSError")
         self.assertEqual(self.d._touched_at[SID1], T0)
         self.assertEqual(self.switches(), [])
+
+
+class TestSessionLimits(DispatchBase):
+    def test_refusal_overrides_a_reading_below_soft(self):
+        self.env.pcts = {ACC_A: 84.0, ACC_B: 20.0, ACC_C: 50.0}
+        self.env.limits[101] = ("five_hour", T0 + timedelta(hours=3))
+        self.d.tick()
+        d = self.row(101)["decision"]
+        self.assertEqual((d["action"], d["target_account_id"]), ("hard", ACC_B))
+        self.assertEqual(len(self.env.logs("limit_seen")), 1)
+
+    def test_refused_account_is_not_a_target(self):
+        self.env.pcts = {ACC_A: 97.0, ACC_B: 20.0, ACC_C: 50.0}
+        self.env.sessions = [sess(101, ACC_A), sess(102, ACC_B, sid=SID2, handle="term_00000002")]
+        self.env.limits[102] = ("seven_day", T0 + timedelta(days=2))
+        self.d.tick()
+        self.assertEqual(self.row(101)["decision"]["target_account_id"], ACC_C)
+
+    def test_past_reset_and_unknown_type_ignored(self):
+        self.env.pcts = {ACC_A: 40.0, ACC_B: 20.0, ACC_C: 50.0}
+        for hit in (("five_hour", T0 - timedelta(seconds=1)), ("opus_burst", T0 + timedelta(hours=1))):
+            self.env.limits[101] = hit
+            self.tick_after(40)
+            self.assertEqual(self.row(101)["decision"]["action"], "none")
+        self.assertEqual(self.env.logs("limit_seen"), [])
+
+    def test_reader_error_contained(self):
+        self.env.limits[101] = OSError("boom")
+        self.d.tick()
+        self.assertEqual(len(self.env.logs("limit_read_error")), 1)
+        self.assertIsNotNone(self.row(101)["decision"])
+
+    def test_logged_once(self):
+        self.env.pcts = {}
+        self.env.usages = {a: dataclasses.replace(live(a, p), fetched_at=T0 - timedelta(hours=1))
+                           for a, p in ((ACC_A, 84.0), (ACC_B, 99.0), (ACC_C, 99.5))}
+        self.env.limits[101] = ("five_hour", T0 + timedelta(hours=3))
+        for _ in range(5):
+            self.tick_after(10)
+        self.assertEqual(len(self.env.logs("limit_seen")), 1)
+
+    def test_remembered_after_the_session_moves(self):
+        self.env.pcts = {}
+        self.env.usages = {a: dataclasses.replace(live(a, p), fetched_at=T0 - timedelta(hours=1))
+                           for a, p in ((ACC_A, 84.0), (ACC_B, 20.0), (ACC_C, 50.0))}
+        self.env.limits[101] = ("five_hour", T0 + timedelta(hours=3))
+        self.d.tick()
+        del self.env.limits[101]
+        self.env.sessions = [sess(101, ACC_A), sess(102, ACC_C, sid=SID2, handle="term_00000002")]
+        self.env.usages[ACC_C] = live(ACC_C, 97.0, now=T0 + timedelta(seconds=400))
+        self.env.usages[ACC_B] = live(ACC_B, 99.0, now=T0 + timedelta(seconds=400))
+        # A fresh Claude Code cache reading of A that predates the refusal's effect: 84%, a valid target alone.
+        self.env.usages[ACC_A] = dataclasses.replace(live(ACC_A, 84.0, now=T0 + timedelta(seconds=400)),
+                                                     source="cache")
+        self.tick_after(400)
+        self.assertEqual(self.row(102)["decision"]["action"], "none")
+
+    def test_forgotten_at_reset(self):
+        self.env.limits[101] = ("five_hour", T0 + timedelta(minutes=5))
+        self.d.tick()
+        self.assertIn((ACC_A, "five_hour"), self.d._limits)
+        del self.env.limits[101]
+        self.tick_after(301)
+        self.assertEqual(self.d._limits, {})
+
+    def test_live_reading_after_the_refusal_lifts_it_once(self):
+        self.env.pcts = {ACC_A: 84.0, ACC_B: 99.0, ACC_C: 99.5}
+        self.env.limits[101] = ("five_hour", T0 + timedelta(hours=3))
+        for _ in range(10):
+            self.tick_after(10)
+        self.assertEqual(len(self.env.logs("limit_seen")), 1)
+        self.assertEqual(len(self.env.logs("limit_lifted")), 1)
+        self.assertEqual(self.d._limits, {})
+
+
+class TestWithLimit(unittest.TestCase):
+    def test_unavailable_reading_becomes_a_fresh_limit(self):
+        u = AccountUsage(account_id=ACC_A, source="unavailable", fetched_at=T0 - timedelta(hours=1),
+                         error="http_429;cache_missing")
+        out = daemon.with_limit(u, ACC_A, "five_hour", T0 + timedelta(hours=1), T0)
+        self.assertEqual((out.source, out.fetched_at, out.five_hour.utilization), ("cache", T0, 100.0))
+        self.assertIsNone(out.seven_day)
+
+    def test_other_window_kept(self):
+        u = dataclasses.replace(live(ACC_A, 30.0), seven_day=UsageWindow(62.0, T0 + timedelta(days=2)))
+        out = daemon.with_limit(u, ACC_A, "five_hour", T0 + timedelta(hours=1), T0)
+        self.assertEqual((out.five_hour.utilization, out.seven_day.utilization), (100.0, 62.0))
+
+    def test_limit_window_mapping(self):
+        self.assertEqual(daemon.limit_window("five_hour"), "five_hour")
+        self.assertEqual(daemon.limit_window("seven_day"), "seven_day")
+        self.assertIsNone(daemon.limit_window("seven_day_sonnet"))
+        self.assertEqual(daemon.limit_window("seven_day_fable"), "fable")
+        self.assertIsNone(daemon.limit_window("overage"))
+
+
+class TestResetWaitDispatch(DispatchBase):
+    def test_all_limited_dispatches_soft_to_soonest_reset(self):
+        self.env.pcts = {}
+        for aid, mins in ((ACC_A, 120), (ACC_B, 10), (ACC_C, 60)):
+            self.env.usages[aid] = dataclasses.replace(
+                live(aid, 100.0), five_hour=UsageWindow(100.0, T0 + timedelta(minutes=mins)))
+        self.d.tick()
+        self.assertEqual(self.row(101)["decision"]["action"], "soft")
+        self.assertEqual(self.row(101)["decision"]["target_account_id"], ACC_B)
+        self.env.run_worker(0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_B, "soft")])
+
+
+class TestDecisionLog(DispatchBase):
+    def decisions(self):
+        return self.env.logs("decision")
+
+    def test_logged_once_per_change_ignoring_numbers(self):
+        self.env.pcts = {ACC_A: 40.0, ACC_B: 20.0, ACC_C: 50.0}
+        self.d.tick()
+        self.assertEqual(len(self.decisions()), 1)
+        self.assertIn("action=none", self.decisions()[0])
+        self.env.pcts[ACC_A] = 41.0
+        self.tick_after(40)
+        self.assertEqual(len(self.decisions()), 1)
+        self.env.pcts[ACC_A] = 97.0
+        self.tick_after(40)
+        self.assertEqual(len(self.decisions()), 2)
+        self.assertIn("action=hard target=%s" % ACC_B, self.decisions()[1])
+
+    def test_idle_busy_flip_is_not_relogged(self):
+        self.env.pcts = {ACC_A: 90.0, ACC_B: 80.0, ACC_C: 88.0}
+        for status in ("idle", "busy", "idle", "busy", "idle"):
+            self.env.sessions = [sess(101, ACC_A, status=status)]
+            self.tick_after(10)
+        self.assertEqual(len(self.decisions()), 2)
+        self.env.advance(600)
+        self.env.sessions = [sess(101, ACC_A, status="busy")]
+        self.d.tick()
+        self.assertEqual(len(self.decisions()), 3)
+
+    def test_steady_decision_logged_once(self):
+        self.env.pcts = {ACC_A: 40.0, ACC_B: 20.0, ACC_C: 50.0}
+        for _ in range(130):
+            self.tick_after(10)
+        self.assertEqual(len(self.decisions()), 1)
+
+    def test_gone_session_is_forgotten(self):
+        self.d.tick()
+        self.assertIn(SID1, self.d._decision_logged)
+        self.env.sessions = []
+        self.tick_after(10)
+        self.assertNotIn(SID1, self.d._decision_logged)
+
+    def test_no_target_reason_is_logged(self):
+        self.env.pcts = {ACC_A: 97.0, ACC_B: 99.0, ACC_C: 98.0}
+        self.d.tick()
+        self.assertEqual(len(self.decisions()), 1)
+        self.assertIn("no target", self.decisions()[0])
+        self.assertEqual(self.spawns(), [])
 
 
 class TestRetryAfterInterrupt(DispatchBase):

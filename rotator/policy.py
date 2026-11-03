@@ -1,16 +1,21 @@
 """Pure account-switching policy: no I/O, no clock reads; now is always a parameter."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import FrozenSet, Mapping, Optional, Sequence, Tuple
 
 from rotator.accounts import profile_for_config_dir
-from rotator.models import AccountUsage, Profile, Session, is_fable_model
+from rotator.models import AccountUsage, Profile, Session, UsageWindow, is_fable_model
 
 ACTIONS: FrozenSet[str] = frozenset({"none", "soft", "hard"})
 
 _PCT_FIELDS = ("soft_pct", "hard_pct", "target_headroom_pct")
+# Measured on Max 5x accounts: one percent of the weekly window used about this many percent of a 5-hour window.
+WEEKLY_TO_5H_RATIO_DEFAULT = 6.0
+WEEKLY_TO_5H_RATIO_MAX = 50.0
+LIMIT_PCT = 100.0
 _DURATION_FIELDS = ("stale_max_age", "cooldown", "clock_skew_tolerance")
 
 
@@ -24,6 +29,8 @@ class PolicyConfig:
     stale_max_age: timedelta = timedelta(minutes=15)
     cooldown: timedelta = timedelta(minutes=5)
     clock_skew_tolerance: timedelta = timedelta(minutes=5)
+    # How many percent of a 5-hour window one percent of the weekly window holds; 1.0 scores max(5h, 7d).
+    weekly_to_5h_ratio: float = WEEKLY_TO_5H_RATIO_DEFAULT
 
     def __post_init__(self) -> None:
         for name in _PCT_FIELDS:
@@ -42,6 +49,10 @@ class PolicyConfig:
             v = getattr(self, name)
             if not isinstance(v, timedelta) or v < timedelta(0):
                 raise ValueError("PolicyConfig.%s must be a non-negative timedelta" % name)
+        r = self.weekly_to_5h_ratio
+        if isinstance(r, bool) or not isinstance(r, (int, float)) or not (1 <= r <= WEEKLY_TO_5H_RATIO_MAX):
+            raise ValueError("PolicyConfig requires 1 <= weekly_to_5h_ratio <= %s" % WEEKLY_TO_5H_RATIO_MAX)
+        object.__setattr__(self, "weekly_to_5h_ratio", float(r))
 
 
 DEFAULT_CONFIG: PolicyConfig = PolicyConfig()
@@ -89,6 +100,29 @@ def _require_aware(value: datetime, name: str) -> None:
         raise ValueError("%s must be timezone-aware" % name)
 
 
+def _window_u(w: Optional[UsageWindow], now: datetime) -> Optional[float]:
+    if w is None:
+        return None
+    return 0.0 if w.resets_at is not None and w.resets_at <= now else w.utilization
+
+
+def load(usage: AccountUsage, now: datetime, ratio: float, *, fable: bool = False,
+         skip_limited: bool = False) -> Optional[float]:
+    """How close the account is to being blocked, in percent of a 5-hour window: max(5h, 100 - ratio * (100 -
+    7d)), plus the raw fable window for a fable session. The weekly window is scaled because its remaining room
+    lasts ratio times longer than the same remaining room in the 5-hour window. A window at the limit still
+    scores 100. skip_limited leaves out windows at the limit (the load once they reset). None when no window
+    counts."""
+    parts = []
+    u5, u7 = _window_u(usage.five_hour, now), _window_u(usage.seven_day, now)
+    uf = _window_u(usage.fable, now) if fable else None
+    for u, weekly in ((u5, False), (u7, True), (uf, False)):
+        if u is None or (skip_limited and u >= LIMIT_PCT):
+            continue
+        parts.append(max(0.0, 100.0 - ratio * (100.0 - u)) if weekly else u)
+    return max(parts) if parts else None
+
+
 def _usable(usage: Optional[AccountUsage], now: datetime, config: PolicyConfig, *,
             require_fresh: bool, fable: bool = False) -> Tuple[Optional[float], str]:
     """(utilization, "") when usable, else (None, cause).
@@ -97,12 +131,12 @@ def _usable(usage: Optional[AccountUsage], now: datetime, config: PolicyConfig, 
     future. With require_fresh=False such a reading still counts as a lower bound, but only
     when every present window has a reset time: usage only accumulates until resets_at, while
     a window without one may have reset since the fetch and over-state the reading.
-    fable=True scores max(5h,7d,fable) and, with require_fresh, refuses a reading whose fable
+    fable=True adds the fable window to the load and, with require_fresh, refuses a reading whose fable
     window is unknown.
     """
     if usage is None:
         return None, "no usage data"
-    u = usage.max_utilization_fable(now) if fable else usage.max_utilization(now)
+    u = load(usage, now, config.weekly_to_5h_ratio, fable=fable)
     if usage.source == "unavailable" or u is None:
         if usage.error:
             return None, "usage unavailable (%s)" % usage.error
@@ -127,6 +161,56 @@ def _usable(usage: Optional[AccountUsage], now: datetime, config: PolicyConfig, 
     if any(w.resets_at is None for w in windows):
         return None, stale_cause + "; a window has no reset time, not a lower bound"
     return u, ""
+
+
+# Waiting out a limit moves only to an account that resets this much sooner: a relaunch costs more than a few
+# minutes saved.
+RESET_WAIT_MARGIN = timedelta(minutes=5)
+
+
+def _limit_lifts_at(usage: AccountUsage, now: datetime, fable: bool) -> Tuple[bool, Optional[datetime]]:
+    """(at the limit, when every window at the limit has reset). The time is None when no window is at the
+    limit or one of them has no reset time."""
+    windows = [usage.five_hour, usage.seven_day] + ([usage.fable] if fable else [])
+    limited = [w for w in windows if w is not None and w.utilization >= LIMIT_PCT
+               and not (w.resets_at is not None and w.resets_at <= now)]
+    if not limited:
+        return False, None
+    if any(w.resets_at is None for w in limited):
+        return True, None
+    return True, max(w.resets_at for w in limited if w.resets_at is not None)
+
+
+def _soonest_reset(exclude_account_id: str, own_usage: Optional[AccountUsage], profiles: Sequence[Profile],
+                   usages: Mapping[str, AccountUsage], now: datetime, config: PolicyConfig, *,
+                   fable: bool) -> Tuple[Optional[Profile], str]:
+    """When every account is at its limit: the account whose limit lifts first, if that is at least
+    RESET_WAIT_MARGIN sooner than the current account's (any known time when the current account's is unknown)
+    and its load after the lift is below hard_pct. Returns (target, reason fragment)."""
+    own_at = _limit_lifts_at(own_usage, now, fable)[1] if own_usage is not None else None
+    best: Optional[Tuple[datetime, str, Profile]] = None
+    for p in profiles:
+        if p.account_id == exclude_account_id:
+            continue
+        u = usages.get(p.account_id)
+        cu, _ = _usable(u, now, config, require_fresh=True, fable=fable)
+        if cu is None or u is None:
+            continue
+        limited, at = _limit_lifts_at(u, now, fable)
+        if not limited or at is None:
+            continue
+        after = load(u, now, config.weekly_to_5h_ratio, fable=fable, skip_limited=True)
+        if after is not None and after >= config.hard_pct:
+            # Lifting one limit leaves it at the hard tier anyway: the session would move on right after.
+            continue
+        if best is None or (at, p.account_id) < (best[0], best[1]):
+            best = (at, p.account_id, p)
+    if best is None:
+        return None, "no account resets sooner"
+    if own_at is not None and best[0] > own_at - RESET_WAIT_MARGIN:
+        return None, "current account resets at %s, no account resets %ds sooner (best %s at %s)" % (
+            own_at.isoformat(), int(RESET_WAIT_MARGIN.total_seconds()), best[1], best[0].isoformat())
+    return best[2], "all accounts at the limit; %s resets first at %s" % (best[1], best[0].isoformat())
 
 
 def _select_target(exclude_account_id: str, subject: str, own_u: float, line: Optional[float],
@@ -180,11 +264,11 @@ def decide(session: Session, profiles: Sequence[Profile], usages: Mapping[str, A
     own_usage = usages.get(own.account_id)
     u, cause = _usable(own_usage, now, config, require_fresh=False, fable=fable)
     if not fable:
-        label = "max(5h,7d)"
+        label = "load(5h,7d)"
     elif own_usage is not None and own_usage.fable is not None:
-        label = "max(5h,7d,fable)"
+        label = "load(5h,7d,fable)"
     else:
-        label = "max(5h,7d; fable unknown)"
+        label = "load(5h,7d; fable unknown)"
     # "shell" is Claude Code idle at its prompt with background shells running; switch it like idle.
     if session.status not in ("idle", "busy", "shell"):
         return Decision("none", None,
@@ -201,9 +285,24 @@ def decide(session: Session, profiles: Sequence[Profile], usages: Mapping[str, A
             int((now - last_switch_at).total_seconds()), int(config.cooldown.total_seconds())), u)
     if tier == "soft" and session.status == "busy":
         return Decision("none", None, head + "; session busy, waiting for idle", u)
-    target, tu, fragment = _select_target(own.account_id, "current account", u,
-                                          config.soft_pct - config.target_headroom_pct,
+    # The hard tier is about to stop, so any account with more room will do; below the limit the target must
+    # be out of the hard tier itself, or two accounts near each other would trade the session back and forth.
+    if tier == "soft":
+        line: Optional[float] = config.soft_pct - config.target_headroom_pct
+    elif u < LIMIT_PCT:
+        line = math.nextafter(config.hard_pct, -math.inf)
+    else:
+        line = None
+    target, tu, fragment = _select_target(own.account_id, "current account", u, line,
                                           profiles, usages, now, config, fable=fable)
+    if target is None and tier == "hard" and u >= LIMIT_PCT:
+        wait, why = _soonest_reset(own.account_id, own_usage, profiles, usages, now, config, fable=fable)
+        if wait is not None and session.status == "busy":
+            return Decision("none", None, head + "; session busy, waiting for idle; " + why, u)
+        if wait is not None:
+            # Soft: the wait target is at its limit too, so interrupting a turn would gain nothing.
+            return Decision("soft", wait, head + "; session %s; %s" % (session.status, why), u)
+        fragment += "; " + why
     if target is None:
         return Decision("none", None, head + "; session %s; " % session.status + fragment, u)
     return Decision(tier, target, head + "; session %s; target %s at %s" % (
@@ -227,9 +326,9 @@ def decide_pointer(pointer_profile: Optional[Profile], profiles: Sequence[Profil
     if u is None:
         return PointerDecision(None, "pointer account %s: %s" % (pid, cause))
     if u < config.soft_pct:
-        return PointerDecision(None, "pointer account %s max(5h,7d)=%s below soft %s" % (
+        return PointerDecision(None, "pointer account %s load(5h,7d)=%s below soft %s" % (
             pid, _pct(u), _pct(config.soft_pct)))
-    head = "pointer account %s max(5h,7d)=%s >= soft %s" % (pid, _pct(u), _pct(config.soft_pct))
+    head = "pointer account %s load(5h,7d)=%s >= soft %s" % (pid, _pct(u), _pct(config.soft_pct))
     target, tu, fragment = _select_target(pid, "pointer account", u, None, profiles, usages, now, config)
     if target is None:
         return PointerDecision(None, head + "; " + fragment)

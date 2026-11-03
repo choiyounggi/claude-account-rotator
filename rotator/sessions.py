@@ -8,12 +8,13 @@ import dataclasses
 import glob
 import json
 import logging
+import math
 import os
 import re
 import stat
 import struct
 from datetime import datetime, timezone
-from typing import Callable, Dict, FrozenSet, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Callable, Dict, FrozenSet, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
 from rotator.accounts import _read_text_utf8
 from rotator.models import MODEL_RE, Profile, ReadText, Session
@@ -315,6 +316,45 @@ def _line_model(raw: bytes) -> object:
     return m if MODEL_RE.fullmatch(m) else None
 
 
+def _tail_lines(config_dir: str, cwd: str, session_id: str, tail_bytes: int,
+                chunk_bytes: int) -> Iterator[bytes]:
+    """The transcript's lines within its last tail_bytes, last line first; nothing when there is no transcript.
+    Raises OSError on a read failure."""
+    if tail_bytes <= 0 or chunk_bytes <= 0:
+        raise ValueError("tail_bytes and chunk_bytes must be > 0")
+    if not session_id or os.sep in session_id or "\x00" in session_id or session_id in (".", ".."):
+        return
+    path = _transcript_path(config_dir, cwd, session_id)
+    if path is None:
+        return
+    # A plain open() of a FIFO blocks until a writer appears; open non-blocking and read regular files only.
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+    except OSError:
+        os.close(fd)
+        raise
+    if not regular:
+        os.close(fd)
+        return
+    with open(fd, "rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        pos, carry = size, b""
+        while pos > 0 and size - pos < tail_bytes:
+            n = min(chunk_bytes, pos, tail_bytes - (size - pos))
+            pos -= n
+            f.seek(pos)
+            parts = (f.read(n) + carry).split(b"\n")
+            if pos > 0:
+                # parts[0] may be a partial line, completed by the next chunk; once the bound stops
+                # the loop it is dropped.
+                carry, lines = parts[0], parts[1:]
+            else:
+                carry, lines = b"", parts
+            for raw in reversed(lines):
+                yield raw
+
+
 def read_session_model(config_dir: str, cwd: str, session_id: str, *, tail_bytes: int = TRANSCRIPT_TAIL_BYTES,
                        chunk_bytes: int = TRANSCRIPT_CHUNK_BYTES) -> Optional[str]:
     """Model id of the last real assistant entry within the transcript's last tail_bytes; None when unknown.
@@ -323,40 +363,75 @@ def read_session_model(config_dir: str, cwd: str, session_id: str, *, tail_bytes
     """
     if tail_bytes <= 0 or chunk_bytes <= 0:
         raise ValueError("tail_bytes and chunk_bytes must be > 0")
-    if not session_id or os.sep in session_id or "\x00" in session_id or session_id in (".", ".."):
+    try:
+        for raw in _tail_lines(config_dir, cwd, session_id, tail_bytes, chunk_bytes):
+            verdict = _line_model(raw)
+            if verdict is not _NO_VERDICT:
+                return verdict
+    except OSError:
+        return None
+    return None
+
+
+def _find_key(obj: object, key: str, depth: int = 0) -> object:
+    if depth > 6:
+        return None
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        items: Iterable[object] = obj.values()
+    elif isinstance(obj, list):
+        items = obj
+    else:
+        return None
+    for v in items:
+        found = _find_key(v, key, depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
+def read_session_limit(config_dir: str, cwd: str, session_id: str, since: Optional[datetime], *,
+                       tail_bytes: int = TRANSCRIPT_TAIL_BYTES,
+                       chunk_bytes: int = TRANSCRIPT_CHUNK_BYTES) -> Optional[Tuple[str, datetime]]:
+    """(rate limit type, aware reset time) of the transcript's latest rate-limit entry when Claude Code was
+    refused by a usage limit at or after since (this process's start); None otherwise.
+
+    The usage API can be unreachable for a long time, while the transcript records the refusal the moment it
+    happens. Entries before since may come from another account (the transcript follows a resumed session), so
+    an unknown since reads nothing. A real assistant reply after the refusal means the limit no longer applies.
+    Never logs and never returns transcript text."""
+    if since is None:
         return None
     try:
-        path = _transcript_path(config_dir, cwd, session_id)
-        if path is None:
-            return None
-        # A plain open() of a FIFO blocks until a writer appears; open non-blocking and read regular files only.
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        try:
-            regular = stat.S_ISREG(os.fstat(fd).st_mode)
-        except OSError:
-            os.close(fd)
-            raise
-        if not regular:
-            os.close(fd)
-            return None
-        with open(fd, "rb") as f:
-            size = f.seek(0, os.SEEK_END)
-            pos, carry = size, b""
-            while pos > 0 and size - pos < tail_bytes:
-                n = min(chunk_bytes, pos, tail_bytes - (size - pos))
-                pos -= n
-                f.seek(pos)
-                parts = (f.read(n) + carry).split(b"\n")
-                if pos > 0:
-                    # parts[0] may be a partial line, completed by the next chunk; once the bound stops
-                    # the loop it is dropped.
-                    carry, lines = parts[0], parts[1:]
-                else:
-                    carry, lines = b"", parts
-                for raw in reversed(lines):
-                    verdict = _line_model(raw)
-                    if verdict is not _NO_VERDICT:
-                        return verdict
+        for raw in _tail_lines(config_dir, cwd, session_id, tail_bytes, chunk_bytes):
+            if b'"rate_limit_info"' not in raw:
+                if isinstance(_line_model(raw), str):
+                    return None
+                continue
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError, RecursionError):
+                continue
+            info = _find_key(obj, "rate_limit_info")
+            if not isinstance(info, dict) or not isinstance(obj, dict):
+                continue
+            ts = obj.get("timestamp")
+            try:
+                at = datetime.fromisoformat(ts.replace("Z", "+00:00")) if isinstance(ts, str) else None
+            except ValueError:
+                at = None
+            if at is None or at.utcoffset() is None or at < since:
+                return None
+            kind, reset = info.get("rateLimitType"), info.get("resetsAt")
+            if info.get("status") != "rejected" or not isinstance(kind, str):
+                return None
+            if isinstance(reset, bool) or not isinstance(reset, (int, float)) or not math.isfinite(reset):
+                return None
+            try:
+                return kind, datetime.fromtimestamp(reset, timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
     except OSError:
         return None
     return None

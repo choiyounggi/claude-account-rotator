@@ -23,6 +23,7 @@ from rotator.sessions import (
     discover_sessions_with_model,
     model_from_argv,
     parse_procargs,
+    read_session_limit,
     read_session_model,
     session_homes,
 )
@@ -881,3 +882,58 @@ class DiscoverModelTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def limit_line(ts, kind="five_hour", reset=1793682600, status="rejected"):
+    info = {"status": status, "resetsAt": reset, "rateLimitType": kind, "overageStatus": "rejected"}
+    return json.dumps({"type": "assistant", "timestamp": ts, "isApiErrorMessage": True,
+                       "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "SECRET-PROMPT-TEXT"}]},
+                       "apiErrorParams": {"rate_limit_info": info}})
+
+
+class ReadSessionLimitTest(unittest.TestCase):
+    cwd, sid = ReadSessionModelTest.cwd, ReadSessionModelTest.sid
+    setUpClass = ReadSessionModelTest.setUpClass
+    setUp = ReadSessionModelTest.setUp
+    write_bytes = ReadSessionModelTest.write_bytes
+    write = ReadSessionModelTest.write
+    since = datetime(2026, 11, 3, 4, 0, tzinfo=timezone.utc)
+
+    def limit(self, since=since, **kw):
+        return read_session_limit(self.home, self.cwd, self.sid, since, **kw)
+
+    def test_refusal_after_start(self):
+        self.write([a_line("claude-opus-5-5"), limit_line("2026-11-03T04:59:22.526Z")])
+        self.assertEqual(self.limit(), ("five_hour", datetime(2026, 11, 3, 5, 10, tzinfo=timezone.utc)))
+
+    def test_refusal_before_start_is_another_process(self):
+        self.write([limit_line("2026-11-03T03:59:59Z")])
+        self.assertIsNone(self.limit())
+        self.assertIsNone(self.limit(since=None))
+
+    def test_reply_after_the_refusal_clears_it(self):
+        self.write([limit_line("2026-11-03T04:20:00Z"), u_line(), a_line("claude-opus-5-5")])
+        self.assertIsNone(self.limit())
+        self.write([limit_line("2026-11-03T04:20:00Z"), u_line(), a_line("<synthetic>")])
+        self.assertIsNotNone(self.limit())
+
+    def test_latest_entry_wins(self):
+        self.write([limit_line("2026-11-03T04:10:00Z", kind="seven_day", reset=1793900000),
+                    u_line(), limit_line("2026-11-03T04:20:00Z")])
+        self.assertEqual(self.limit()[0], "five_hour")
+
+    def test_not_rejected_or_malformed(self):
+        for line in (limit_line("2026-11-03T04:20:00Z", status="allowed"),
+                     limit_line("2026-11-03T04:20:00Z", reset="soon"),
+                     limit_line("2026-11-03T04:20:00Z", reset=True),
+                     limit_line("not-a-time"), "{\"rate_limit_info\": broken"):
+            with self.subTest(line=line[:60]):
+                self.write([line])
+                self.assertIsNone(self.limit())
+
+    def test_no_transcript(self):
+        self.assertIsNone(self.limit())
+
+    def test_never_returns_text(self):
+        self.write([limit_line("2026-11-03T04:59:22Z")])
+        self.assertNotIn("SECRET", repr(self.limit()))

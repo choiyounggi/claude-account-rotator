@@ -35,7 +35,7 @@ from rotator.daemon import (
 )
 from rotator.launchd import LABEL, exit_timeout_for
 from rotator.models import AccountUsage, Profile, Session, UsageWindow
-from rotator.policy import DEFAULT_CONFIG
+from rotator.policy import DEFAULT_CONFIG, PolicyConfig
 from rotator.switcher import DEFAULT_CONTINUE_PROMPT, STATE_HINTS, SwitchResult, Timeouts, switch_session
 
 CFG = "/Users/user/Library/Application Support/claude-account-rotator-test/config.json"
@@ -139,6 +139,8 @@ class TestConfigDefaults(unittest.TestCase):
         pc = cfg.policy_config()
         self.assertEqual(pc.cooldown, timedelta(seconds=60))
         self.assertEqual(pc.stale_max_age, timedelta(seconds=120))
+        self.assertEqual(load('{"weekly_to_5h_ratio": 3}').policy_config().weekly_to_5h_ratio, 3.0)
+        self.assertEqual(load("{}").policy_config().weekly_to_5h_ratio, PolicyConfig().weekly_to_5h_ratio)
 
 
 class TestConfigValidation(unittest.TestCase):
@@ -149,6 +151,9 @@ class TestConfigValidation(unittest.TestCase):
         ('{"soft_pct": NaN}', "soft_pct"),
         ('{"soft_pct": 90, "hard_pct": 80}', "hard_pct"),
         ('{"soft_pct": 5, "target_headroom_pct": 10}', "target_headroom_pct"),
+        ('{"weekly_to_5h_ratio": 0.5}', "weekly_to_5h_ratio"),
+        ('{"weekly_to_5h_ratio": 51}', "weekly_to_5h_ratio"),
+        ('{"weekly_to_5h_ratio": true}', "weekly_to_5h_ratio"),
         ('{"cooldown_s": -1}', "cooldown_s"),
         ('{"session_poll_s": 0}', "session_poll_s"),
         ('{"usage_poll_s": 900}', "usage_poll_s"),
@@ -213,6 +218,8 @@ class TestConfigValidation(unittest.TestCase):
             ('{"usage_poll_s": 15}', "usage_poll_s", 15.0),
             ('{"usage_poll_s": 29.9}', "usage_poll_s", 29.9),
             ('{"cooldown_s": 0}', "cooldown_s", 0.0),
+            ('{"weekly_to_5h_ratio": 1}', "weekly_to_5h_ratio", 1.0),
+            ('{"weekly_to_5h_ratio": 50}', "weekly_to_5h_ratio", 50.0),
         ]
         for text, key, value in accepted:
             with self.subTest(text=text):
@@ -481,7 +488,7 @@ class CliEnv:
         fields = dict(
             discover_profiles=discover_profiles, fetch_usage=fetch_usage,
             refresh_token=_no_refresh, refresh_held=_no_refresh,
-            discover_sessions=discover_sessions, switch=switch, make_driver=_NoDriver,
+            discover_sessions=discover_sessions, read_limit=lambda s: None, switch=switch, make_driver=_NoDriver,
             procs=_NullProbe(), read_pointer=read_pointer, write_pointer=_not_used,
             now=lambda: env.now_v, monotonic=lambda: env.mono_v, spawn=_not_used, wait_stop=wait_stop, lock=lock,
             read_text=read_text, write_text=write_text, list_dir=list_dir, isdir=lambda p: True,

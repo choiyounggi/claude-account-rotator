@@ -9,11 +9,13 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import signal
 import sys
 import tempfile
 import threading
 import time
+import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Sequence, Set, Tuple
@@ -237,6 +239,7 @@ class Deps:
     refresh_token: Callable[..., dict]
     refresh_held: Callable[..., List[str]]
     discover_sessions: Callable[[Sequence[str]], List[Session]]
+    read_limit: Callable[[Session], Optional[Tuple[str, datetime]]]
     switch: Callable[..., SwitchResult]
     make_driver: Callable[[], TerminalDriver]
     procs: ProcessProbe
@@ -633,7 +636,30 @@ def setup_logging(log_dir: str, stderr_is_tty: bool) -> logging.Logger:
 USAGE_BACKOFF_MAX_S = 300.0
 _cache_log = logging.getLogger("rotator.daemon")
 RETRY_AFTER_MAX_S = 900.0
+DECISION_RELOG_S = 600.0
+DECISION_KEYS_KEPT = 8
 RATE_LIMITED_TOKEN = "http_429"
+
+
+def limit_window(kind: str) -> Optional[str]:
+    """The AccountUsage window a Claude Code rateLimitType refers to, or None for a type with no window."""
+    if kind in ("five_hour", "seven_day"):
+        return kind
+    # A model-scoped weekly cap (seven_day_sonnet, seven_day_opus) blocks only that model, not the account.
+    if "fable" in kind:
+        return "fable"
+    return None
+
+
+def with_limit(u: Optional[AccountUsage], account_id: str, window: str, resets_at: datetime,
+               now: datetime) -> AccountUsage:
+    """u with window at 100% until resets_at: a session's refusal by the limit is surer than any usage reading.
+    The other windows keep their own fetched_at, so an old reading of them still counts as old."""
+    w = UsageWindow(100.0, resets_at)
+    if u is None or u.source == "unavailable":
+        return AccountUsage(account_id=account_id, source="cache", fetched_at=now,
+                            **{window: w})  # type: ignore[arg-type]
+    return dataclasses.replace(u, source="cache", error=None, retry_after_s=None, **{window: w})
 
 
 def rate_limited(u: AccountUsage) -> bool:
@@ -982,6 +1008,12 @@ class Daemon:
         self._pointer: Tuple[Optional[str], Optional[str]] = (None, None)
         self._orphans_logged: Set[Identity] = set()
         self._hold_logged: Dict[str, str] = {}
+        # session_id -> {decision key: monotonic time it was last logged}
+        self._decision_logged: Dict[str, Dict[Tuple[str, Optional[str], str], float]] = {}
+        # (account_id, window) -> (resets_at, when it was recorded)
+        self._limits: Dict[Tuple[str, str], Tuple[datetime, datetime]] = {}
+        # (account_id, window) -> resets_at of a limit a later live reading showed lifted; not recorded again
+        self._limits_lifted: Dict[Tuple[str, str], datetime] = {}
         self._would: Dict[str, Tuple[str, str]] = {}
         self._excluded_logged: Dict[str, Tuple[str, str]] = {}
 
@@ -1009,7 +1041,7 @@ class Daemon:
             self._write_snapshot()
             return
         self._refresh_usage(profiles, now)
-        usages = self._usage.usages()
+        usages = self._overlay_limits(self._usage.usages(), now)
         self._pointer_step(profiles, usages, now)
         try:
             found = deps.discover_sessions(session_homes(profiles))
@@ -1017,12 +1049,68 @@ class Daemon:
             log.error("event=discover_error what=sessions exc=%s", type(e).__name__)
             self._write_snapshot()
             return
+        self._record_session_limits(profiles, found, now)
+        usages = self._overlay_limits(usages, now)
         self._handle_sessions(profiles, usages, found, now)
+        live = {s.session_id for s in found}
+        for sid in [k for k in self._decision_logged if k not in live]:
+            del self._decision_logged[sid]
         if not self.stopping():
             self._usage.refresh_one(profiles, call=self._deps.refresh_token, held=self._deps.refresh_held,
                                     skip=self._switch_accounts(),
                                     warm=self._cfg.session_token_warmup and not self._cfg.dry_run)
         self._write_snapshot()
+
+    def _record_session_limits(self, profiles: Sequence[Profile], found: Sequence[Session], now: datetime) -> None:
+        """Remember every account a live session was refused on, until the reset: once that session moves away
+        its new process no longer shows the refusal, while the usage API may still be unreachable."""
+        for s in found:
+            own = profile_for_config_dir(profiles, s.config_dir)
+            if own is None:
+                continue
+            try:
+                hit = self._deps.read_limit(s)
+            except Exception as e:
+                self._log.warning("event=limit_read_error pid=%d exc=%s", s.pid, type(e).__name__)
+                continue
+            if hit is None:
+                continue
+            kind, resets_at = hit
+            window = limit_window(kind)
+            if window is None or resets_at <= now:
+                continue
+            key = (own.account_id, window)
+            prev = self._limits.get(key)
+            if (prev is not None and prev[0] >= resets_at) or self._limits_lifted.get(key) == resets_at:
+                continue
+            self._limits[key] = (resets_at, now)
+            self._log.warning("event=limit_seen pid=%d account=%s window=%s until=%s", s.pid, own.account_id,
+                              window, _iso(resets_at))
+
+    def _overlay_limits(self, usages: Mapping[str, AccountUsage], now: datetime) -> Mapping[str, AccountUsage]:
+        """usages with every remembered limit at 100% until its reset. A limit is forgotten at its reset, or when
+        a live reading taken after it was recorded shows the window below 100% (the limit lifted early)."""
+        out = dict(usages)
+        for key in [k for k, t in self._limits_lifted.items() if t <= now]:
+            del self._limits_lifted[key]
+        for key in list(self._limits):
+            aid, window = key
+            resets_at, recorded_at = self._limits[key]
+            cur = out.get(aid)
+            cw = getattr(cur, window) if cur is not None else None
+            if resets_at <= now:
+                del self._limits[key]
+                continue
+            if (cur is not None and cur.source == "live" and cur.fetched_at > recorded_at and cw is not None
+                    and cw.utilization < 100.0):
+                del self._limits[key]
+                self._limits_lifted[key] = resets_at
+                self._log.info("event=limit_lifted account=%s window=%s", aid, window)
+                continue
+            if cw is not None and cw.utilization >= 100.0 and cw.resets_at is not None and cw.resets_at >= resets_at:
+                continue
+            out[aid] = with_limit(cur, aid, window, resets_at, now)
+        return out
 
     def _refresh_usage(self, profiles: Sequence[Profile], now: datetime) -> None:
         self._usage.refresh(profiles, fetch=self._deps.fetch_usage, monotonic=self._deps.monotonic, now=now,
@@ -1153,6 +1241,7 @@ class Daemon:
         row["decision"] = {"action": d.action,
                            "target_account_id": d.target.account_id if d.target is not None else None,
                            "reason": reason}
+        self._log_decision(s, row["decision"])
         if d.action == "none" or d.target is None:
             self._would.pop(s.session_id, None)
             return row
@@ -1178,6 +1267,22 @@ class Daemon:
         if self._dispatch_locked(s, own, d.action, d.target, profiles, usages, pc, ls, mono):
             row.update(in_flight=True, in_flight_pid=s.pid)
         return row
+
+    def _log_decision(self, s: Session, decision: Mapping[str, Any]) -> None:
+        """Log a session's decision when it changes, so a session that is never switched leaves the reason in
+        the log. Numbers are ignored (moving percentages), and a decision seen within DECISION_RELOG_S is not
+        logged again (a session flipping between idle and busy alternates two reasons every turn)."""
+        key = (decision["action"], decision["target_account_id"], re.sub(r"\d+(\.\d+)?", "#", decision["reason"]))
+        seen = self._decision_logged.setdefault(s.session_id, {})
+        mono = self._deps.monotonic()
+        last = seen.get(key)
+        seen[key] = mono
+        if last is not None and mono - last < DECISION_RELOG_S:
+            return
+        if len(seen) > DECISION_KEYS_KEPT:
+            del seen[min(seen, key=lambda k: seen[k])]
+        self._log.info("event=decision pid=%d action=%s target=%s reason=%r", s.pid, decision["action"],
+                       decision["target_account_id"], decision["reason"])
 
     def _held_filter(self, candidates: Sequence[Profile], target_id: str,
                      keep_id: Optional[str]) -> Optional[Tuple[str, List[str], List[Profile]]]:
@@ -1481,6 +1586,10 @@ def _make_logger() -> logging.Logger:
     return setup_logging(LOG_DIR_DEFAULT, sys.stderr.isatty())
 
 
+def _read_limit(s: Session) -> Optional[Tuple[str, datetime]]:
+    return sessions.read_session_limit(s.config_dir, s.cwd, s.session_id, s.started_at)
+
+
 def real_deps(cfg: Config) -> Deps:
     """The only constructor of real seams; building it touches nothing."""
     r = refresh.Refresher(cfg, read_item=accounts.read_keychain_item, item_exists=accounts.keychain_item_exists,
@@ -1492,7 +1601,8 @@ def real_deps(cfg: Config) -> Deps:
                           run_claude=refresh.run_claude_quiet, environ=os.environ.copy)
     return Deps(discover_profiles=accounts.discover_profiles, fetch_usage=usage.fetch_usage,
                 refresh_token=r.refresh, refresh_held=r.held_accounts,
-                discover_sessions=sessions.discover_sessions_with_model, switch=switcher.switch_session,
+                discover_sessions=sessions.discover_sessions_with_model, read_limit=_read_limit,
+                switch=switcher.switch_session,
                 make_driver=switcher.OrcaCliDriver, procs=switcher.OsProcessProbe(),
                 read_pointer=pointer.read_selected_host, write_pointer=pointer.set_selected_host,
                 now=_utc_now, monotonic=time.monotonic, spawn=_spawn, wait_stop=_wait_stop, lock=try_lock,

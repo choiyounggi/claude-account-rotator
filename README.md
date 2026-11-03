@@ -13,7 +13,37 @@ Orca's global `selected-host` pointer on a usable account.
   with the terminal.
 - **Automatic per-session rotation** — soft switch when idle, hard switch near the limit, then the session
   continues on the new account with `--resume`.
-- **Fable-aware** — Fable sessions are judged by the highest of the 5-hour, weekly and Fable windows.
+  - Every account is scored by its load: how close it is to being blocked, in percent of a 5-hour window.
+    The load is `max(5h, 100 - weekly_to_5h_ratio × (100 - 7d))`, plus the raw Fable window for Fable sessions
+    (see Fable-aware). Decision reasons print it as `load(5h,7d)=…`.
+    The weekly window is scaled because its remaining room lasts longer. With the measured ratio 6, an account at
+    3% / 93% (7 weekly points ≈ 42 points of a 5-hour window) has more room than one at 81% / 62%.
+    `weekly_to_5h_ratio: 1` restores the plain `max(5h, 7d)`.
+  - Soft tier (`soft_pct` to `hard_pct`): only to an account at or below `soft_pct - target_headroom_pct`.
+  - Hard tier (`hard_pct` and up): to the account with the most room (lowest load) below the session's own
+    account. While the own account is below 100%, the target must also be below `hard_pct`, so two accounts in
+    the hard tier never trade a session back and forth. At 100%, any account with room will do.
+  - When the session's account is at 100% and every fresh account is at 100% too, the session moves to the
+    account whose limit lifts first, and waits there. The move happens only if that account lifts at least
+    5 minutes sooner than its own (any known time when its own is unknown), and only if its load after the
+    lift is below `hard_pct`. It is soft, so a running turn is never interrupted for it. Accounts with stale or
+    unavailable usage are not considered.
+  - A session refused by a usage limit marks its account at 100% until the reset, even when the usage API is
+    unreachable (HTTP 429) and the last reading is older and lower.
+    - The daemon reads the latest rate-limit entry in the session's transcript that is newer than the process
+      start. Earlier entries can belong to another account the session ran on. A real reply after the refusal
+      cancels it.
+    - The daemon remembers the limit until the reset, also after the refused session moves away. It forgets the
+      limit early when a live reading taken later shows the window below 100% (`event=limit_lifted`).
+    - Only `five_hour`, `seven_day` and Fable-scoped refusals count. A model-scoped weekly cap such as
+      `seven_day_sonnet` does not block the whole account.
+    - It logs `event=limit_seen` once per account and reset.
+    - The status table still shows the last usage reading.
+  - The daemon logs each session's decision when it changes (`event=decision`), including why it does not
+    switch. Numbers are ignored, and a decision seen within the last 10 minutes is not logged again.
+- **Fable-aware** — Fable sessions are judged by a load that also counts the Fable window. That window is weekly
+  too, but it is counted raw, unscaled: its ratio to the 5-hour window has not been measured, and counting it raw
+  can only switch earlier, never later.
 - **Idle-account token refresh** — the daemon refreshes OAuth tokens of accounts with no live session, the same
   way Claude Code does, and writes them back to the same Keychain item.
 - **Shared, rate-limit friendly polling** — one usage request per account per interval across all rotator
@@ -140,7 +170,8 @@ q 또는 Ctrl-C 종료
   With the daemon off and at least one `갱신 필요` row, a footer says `토큰 만료 계정은 데몬이 자동 갱신해: rotator
   install (또는 rotator daemon)`; only the daemon refreshes tokens.
 - Colours (only when stdout is a terminal and `NO_COLOR` is unset or empty): yellow at `soft_pct`, red at
-  `hard_pct`, cache rows dimmed. Without colour the layout is the same.
+  `hard_pct` on each raw window value (the policy acts on the scaled load, so a yellow weekly cell does not
+  mean a switch is near), cache rows dimmed. Without colour the layout is the same.
 - Every line is measured in terminal columns (Hangul counts 2). Columns are as wide as their widest cell, so on
   a wide enough terminal nothing is cut. When the table does not fit, the label, the 갱신 text and the
   unavailable reason are cut step by step down to 18, 20 and 24 columns; then it drops the bars, then the 플랜
@@ -430,7 +461,8 @@ starts with the key.
 |-----|---------|------------|
 | `soft_pct` | `85` | number 0-100, <= `hard_pct` |
 | `hard_pct` | `95` | number 0-100, >= `soft_pct` |
-| `target_headroom_pct` | `10` | number 0-100, <= `soft_pct`; a target must be at or below `soft_pct - target_headroom_pct` |
+| `weekly_to_5h_ratio` | `6` | number 1-50; percent of a 5-hour window that one percent of the weekly window holds (see the load above) |
+| `target_headroom_pct` | `10` | number 0-100, <= `soft_pct`; a soft-tier target must be at or below `soft_pct - target_headroom_pct` (the hard tier follows the rules under Features) |
 | `stale_max_age_s` | `900` | number >= 0; older usage is not trusted for a target |
 | `cooldown_s` | `300` | number >= 0; minimum time between switches of one session, and the hard-mode hold after an aborted hard switch |
 | `clock_skew_tolerance_s` | `300` | number >= 0 |
