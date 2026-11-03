@@ -72,15 +72,24 @@ export function planRelease({ previousTag, packageVersion, commits }) {
   return { release: true, version, previous, bump, commits: classified };
 }
 
+// The bot's own release commits; never listed in notes.
+const RELEASE_COMMIT = /^chore\(release\): (v\d+\.\d+\.\d+|update Homebrew formula for v\S+)$/;
+// Every commit since the last tag lands in one section, in `git log` order; only the bot's release
+// commits and git merge commits (whose merged commits are listed themselves) are left out.
+const NOTE_SECTIONS = [
+  ['Breaking changes', (c) => c.bump === 'major'],
+  ['Features', (c) => c.bump === 'minor'],
+  ['Fixes', (c) => c.bump === 'patch' && c.type === 'fix'],
+  ['Other changes', (c) => c.bump === 'patch' && c.type !== 'fix'],
+  ['Documentation', (c) => c.bump === 'none' && c.type === 'docs'],
+  ['Maintenance', (c) => c.bump === 'none' && c.type !== 'docs'],
+];
+
 export function renderNotes({ version, previous, commits }, repoUrl) {
-  const groups = [
-    ['Breaking changes', (c) => c.bump === 'major'],
-    ['Features', (c) => c.bump === 'minor'],
-    ['Fixes and other changes', (c) => c.bump === 'patch'],
-  ];
+  const listed = commits.filter((c) => c.type !== 'merge' && !RELEASE_COMMIT.test(c.subject));
   const lines = [];
-  for (const [heading, belongs] of groups) {
-    const items = commits.filter(belongs);
+  for (const [heading, belongs] of NOTE_SECTIONS) {
+    const items = listed.filter(belongs);
     if (items.length === 0) continue;
     lines.push(`## ${heading}`, '', ...items.map((c) => `- ${c.title} (${c.hash.slice(0, 7)})`), '');
   }
