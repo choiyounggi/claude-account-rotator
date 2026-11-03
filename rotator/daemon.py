@@ -125,6 +125,31 @@ def touched(record: Mapping[str, Any]) -> bool:
     return res.get("state") != "untouched"
 
 
+# Results where the only input the session received was one Ctrl-C: nothing was typed, so a later soft switch
+# (which never interrupts) cannot collide with the user's input.
+INTERRUPT_ONLY_REASONS = frozenset({"interrupt_timeout", "dialog_open"})
+
+
+def interrupt_only(record: Mapping[str, Any]) -> bool:
+    """True when the record's switch stopped after its Ctrl-C with nothing typed."""
+    if record.get("record_state") != "final" or record.get("worker_error") is not None:
+        return False
+    res = record.get("result")
+    return (isinstance(res, dict) and res.get("step") == "interrupt" and res.get("state") == "interrupted"
+            and res.get("reason") in INTERRUPT_ONLY_REASONS)
+
+
+def soft_only(record: Optional[Mapping[str, Any]]) -> bool:
+    """True when this identity already got a Ctrl-C from a switch: it may still be switched, but never
+    interrupted again (a hard decision runs as soft, and only while the session is idle)."""
+    return record is not None and (record.get("soft_only") is True or interrupt_only(record))
+
+
+def may_retry(record: Mapping[str, Any]) -> bool:
+    """True when another switch of the record's identity is allowed."""
+    return not touched(record) or interrupt_only(record)
+
+
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
@@ -404,7 +429,8 @@ def post_verify(new_pid: int, target: Profile, procs: ProcessProbe) -> str:
 
 def _new_record(session: Session, *, source: str, mode: str, target: Profile, attempt: int, now: datetime,
                 record_state: str, excluded: Sequence[Mapping[str, Any]], hold: Optional[str],
-                result: Optional[SwitchResult] = None, unswitchable: Optional[str] = None) -> dict:
+                result: Optional[SwitchResult] = None, unswitchable: Optional[str] = None,
+                soft: bool = False) -> dict:
     rec = {
         "schema": RECORD_SCHEMA,
         "record_state": record_state,
@@ -423,6 +449,7 @@ def _new_record(session: Session, *, source: str, mode: str, target: Profile, at
         "unswitchable": unswitchable,
         "excluded": [dict(e) for e in excluded],
         "hard_hold_until": hold,
+        "soft_only": soft,
         "post_verify": None,
         "worker_error": None,
     }
@@ -479,9 +506,10 @@ def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cf
                 same = False
             # A record of another identity in the same file is an earlier process that reused this pid.
             prev = raw if same else None
-        if (prev is not None and touched(prev)) or (is_touched is not None and is_touched(ident)):
+        if (prev is not None and not may_retry(prev)) or (is_touched is not None and is_touched(ident)):
             logger.warning("event=switch_refused pid=%d source=%s reason=touched", pid, source)
             return SwitchOutcome("refused_touched", prev, None)
+        soft = soft_only(prev)
 
         excluded: List[dict] = (active_exclusions(prev.get("excluded"), deps.now(), cfg.exclusion_ttl_s,
                                                   prev.get("updated_at")) if prev else [])
@@ -494,9 +522,12 @@ def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cf
         last_mode, last_target = mode, target
         while True:
             attempt += 1
+            if soft and cur_mode == "hard":
+                logger.info("event=hard_downgraded pid=%d reason=interrupted_before", pid)
+                cur_mode = "soft"
             t = deps.now()
             intent = _new_record(session, source=source, mode=cur_mode, target=cur_target, attempt=attempt, now=t,
-                                 record_state="in_progress", excluded=excluded, hold=hold)
+                                 record_state="in_progress", excluded=excluded, hold=hold, soft=soft)
             try:
                 deps.write_text(path, _dump(intent))
             except Exception as e:
@@ -542,7 +573,7 @@ def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cf
         # After a failed later intent, the final record describes the last call that actually ran.
         final = _new_record(session, source=source, mode=last_mode, target=last_target, attempt=calls,
                             now=deps.now(), record_state="final", excluded=excluded, hold=hold, result=res,
-                            unswitchable=unswitchable)
+                            unswitchable=unswitchable, soft=soft)
         try:
             deps.write_text(path, _dump(final))
         except Exception as e:
@@ -1092,7 +1123,7 @@ class Daemon:
             return row
         ident = identity_of(s)
         rec = self._records.get(ident)
-        if ident in self._touched or (rec is not None and touched(rec)):
+        if ident in self._touched or (rec is not None and not may_retry(rec)):
             return row
         if rec is not None and rec.get("unswitchable"):
             return row
@@ -1122,6 +1153,9 @@ class Daemon:
             if self._hold_logged.get(s.session_id) != rec["hard_hold_until"]:
                 self._hold_logged[s.session_id] = rec["hard_hold_until"]
                 self._log.warning("event=hard_hold_active pid=%d until=%s", s.pid, rec["hard_hold_until"])
+            return row
+        if soft_only(rec) and s.status not in ("idle", "shell"):
+            # Soft would fail not_idle; a hard switch would send this identity a second Ctrl-C.
             return row
         if not self._may_switch():
             pair = (d.action, d.target.account_id)
@@ -1261,7 +1295,7 @@ class Daemon:
                     if not intent_seen[0]:
                         self._touched_at[sid] = deps.now()
                 elif (outcome is not None and outcome.status == "done" and outcome.record is not None
-                      and not touched(outcome.record)):
+                      and may_retry(outcome.record)):
                     self._touched.discard(ident)
                     if prev_touched_at is None:
                         self._touched_at.pop(sid, None)

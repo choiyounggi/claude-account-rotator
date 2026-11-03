@@ -361,6 +361,40 @@ class TestTouched(unittest.TestCase):
         self.assertTrue(touched({}))
 
 
+def interrupted_rec(reason="interrupt_timeout", step="interrupt", state="interrupted", **kw):
+    rec = {"record_state": "final", "worker_error": None,
+           "result": result_dict(result(state, reason, step=step))}
+    rec.update(kw)
+    return rec
+
+
+class TestInterruptOnly(unittest.TestCase):
+    def test_ctrl_c_only_results_may_retry_soft(self):
+        for reason in ("interrupt_timeout", "dialog_open"):
+            rec = interrupted_rec(reason)
+            self.assertTrue(touched(rec))
+            self.assertTrue(daemon.interrupt_only(rec))
+            self.assertTrue(daemon.may_retry(rec))
+            self.assertTrue(daemon.soft_only(rec))
+
+    def test_other_touched_results_stay_blocked(self):
+        for rec in (interrupted_rec("pid_not_alive", state="exited"),
+                    interrupted_rec("exit_timeout", step="wait_exit", state="exit_pending"),
+                    interrupted_rec("input_not_empty", step="exit"),
+                    interrupted_rec(record_state="in_progress"),
+                    interrupted_rec(worker_error="RuntimeError"),
+                    {"record_state": "final", "worker_error": None, "result": None}, {}):
+            self.assertFalse(daemon.interrupt_only(rec), rec)
+            self.assertFalse(daemon.may_retry(rec), rec)
+
+    def test_soft_only_flag_outlives_the_result(self):
+        self.assertTrue(daemon.may_retry(final_rec()))
+        self.assertFalse(daemon.soft_only(final_rec()))
+        self.assertFalse(daemon.soft_only(None))
+        self.assertTrue(daemon.soft_only(dict(final_rec(), soft_only=True)))
+        self.assertFalse(daemon.soft_only(dict(final_rec(), soft_only="yes")))
+
+
 class TestIdentityAndPaths(unittest.TestCase):
     def test_identity(self):
         self.assertEqual(identity_of(sess(101, ACC_A)), (101, SID1, "2026-10-28T12:00:00+00:00"))
@@ -747,6 +781,31 @@ class TestRunSwitch(RunSwitchBase):
         self.assertEqual(self.switch_calls(), [])
         self.assert_released()
         self.assertEqual(len(self.env.logs("switch_refused")), 1)
+
+    def test_interrupt_only_record_retries_as_soft(self):
+        self._store(record(101, result=result_dict(result("interrupted", "interrupt_timeout", step="interrupt"))))
+        self.env.results = [result("untouched", "not_idle")]
+        out = self.run_switch(mode="hard")
+        self.assertEqual(out.status, "done")
+        self.assertEqual(self.switch_calls(), [("switch", 101, ACC_B, "soft")])
+        self.assertEqual(len(self.env.logs("hard_downgraded")), 1)
+        rec = self.stored()
+        self.assertIs(rec["soft_only"], True)
+        self.assertEqual(rec["mode"], "soft")
+        self.assertIsNone(rec["hard_hold_until"])
+
+    def test_soft_only_survives_an_untouched_retry(self):
+        self._store(record(101, soft_only=True))
+        self.env.results = [result("untouched", "not_idle")]
+        self.run_switch(mode="hard")
+        self.assertEqual(self.switch_calls(), [("switch", 101, ACC_B, "soft")])
+        self.assertIs(self.stored()["soft_only"], True)
+
+    def test_new_session_is_not_soft_only(self):
+        self.env.results = [result("untouched", "not_idle")]
+        self.run_switch(mode="hard")
+        self.assertEqual(self.switch_calls(), [("switch", 101, ACC_B, "hard")])
+        self.assertIs(self.stored()["soft_only"], False)
 
     def test_refuses_in_progress_record(self):
         self._store(record(101, record_state="in_progress", result=None, owner_pid=999999))
@@ -2070,7 +2129,7 @@ class TestInFlight(DispatchBase):
 
 class TestTouchedNeverRetried(DispatchBase):
     def test_touched_never_retried(self):
-        self.env.results = [result("interrupted", "interrupt_timeout", step="interrupt")]
+        self.env.results = [result("exit_pending", "exit_timeout", step="wait_exit")]
         self.d.tick()
         self.env.run_worker(0)
         for _ in range(100):
@@ -2106,7 +2165,7 @@ class TestTouchedNeverRetried(DispatchBase):
         self.assertEqual(len(self.spawns()), 1)
 
     def test_lost_record_still_blocked_in_memory(self):
-        self.env.results = [result("interrupted", "interrupt_timeout", step="interrupt")]
+        self.env.results = [result("exit_pending", "exit_timeout", step="wait_exit")]
         self.d.tick()
         self.env.run_worker(0)
         del self.env.files[self.rec_path()]
@@ -2145,6 +2204,47 @@ class TestTouchedNeverRetried(DispatchBase):
         self.assertEqual(self.stored()["worker_error"], "OSError")
         self.assertEqual(self.d._touched_at[SID1], T0)
         self.assertEqual(self.switches(), [])
+
+
+class TestRetryAfterInterrupt(DispatchBase):
+    def first_attempt_interrupted(self):
+        self.env.results = [result("interrupted", "interrupt_timeout", step="interrupt"),
+                            result("continued", None, ok=True, step="continue_prompt", new_pid=303)]
+        self.d.tick()
+        self.env.run_worker(0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_B, "hard")])
+
+    def test_retried_as_soft_once_idle(self):
+        self.first_attempt_interrupted()
+        self.assertNotIn(identity_of(sess(101, ACC_A)), self.d._touched)
+        self.tick_after(400)
+        self.env.run_worker(1)
+        self.assertEqual(self.switches()[1], ("switch", 101, ACC_B, "soft"))
+        self.assertEqual(self.stored()["result"]["state"], "continued")
+
+    def test_waits_while_busy(self):
+        self.first_attempt_interrupted()
+        self.env.sessions = [sess(101, ACC_A, status="busy")]
+        for _ in range(40):
+            self.tick_after(10)
+        self.assertEqual(len(self.spawns()), 1)
+        self.assertIsNotNone(self.row(101)["decision"])
+        self.env.sessions = [sess(101, ACC_A)]
+        self.tick_after(10)
+        self.assertEqual(len(self.spawns()), 2)
+
+    def test_cooldown_still_applies(self):
+        self.first_attempt_interrupted()
+        self.tick_after(10)
+        self.assertEqual(len(self.spawns()), 1)
+
+    def test_retry_survives_a_daemon_restart(self):
+        self.first_attempt_interrupted()
+        self.env.advance(400)
+        fresh = Daemon(self.cfg, self.deps, self.deps.make_logger())
+        fresh._load_state()
+        fresh.tick()
+        self.assertEqual(len(self.spawns()), 2)
 
 
 class TestRetryRules(DispatchBase):

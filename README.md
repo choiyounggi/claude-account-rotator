@@ -465,6 +465,10 @@ Numbers must be finite and not `true`/`false`.
   (`rotator.daemon` never calls a terminal driver method itself).
 - A session whose switch touched the pane (any result state other than `untouched`) is never switched again
   until it reappears as a new process (`daemon.touched`, checked by the tick and again inside `run_switch`).
+  One exception (`daemon.interrupt_only`): a hard switch that stopped right after its Ctrl-C
+  (`interrupt_timeout` or `dialog_open`) typed nothing, so the session is switched again later, but only in
+  soft mode and only while it is idle. The record keeps `soft_only: true`, so that process never gets a
+  second Ctrl-C from the rotator.
 - A switch whose outcome is unknown (an intent record left by a crash, SIGKILL or OOM) is never re-sent and is
   shown as "outcome unknown": the intent record is written before every `switch_session` call.
 - One switch at a time per session and per pane, across the daemon and the CLI (`flock` on
