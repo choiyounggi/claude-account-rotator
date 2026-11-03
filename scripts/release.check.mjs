@@ -59,7 +59,7 @@ test('renderNotes groups changes and links the compare view', () => {
   const plan = planRelease({ previousTag: 'v0.2.0', packageVersion: '0.2.0', commits: [commit('feat: a'), commit('fix: b')] });
   const notes = renderNotes(plan, 'https://github.com/example/repo');
   assert.match(notes, /## Features\n\n- a \(abcdef1\)/);
-  assert.match(notes, /## Fixes and other changes\n\n- b \(abcdef1\)/);
+  assert.match(notes, /## Fixes\n\n- b \(abcdef1\)/);
   assert.match(notes, /https:\/\/github\.com\/example\/repo\/compare\/v0\.2\.0\.\.\.v0\.3\.0/);
   assert.match(renderNotes({ version: '0.2.0', previous: null, commits: [] }, 'https://x'), /Initial release\./);
 });
@@ -100,4 +100,38 @@ test('withPackageVersion changes only the top-level version and keeps the file f
   assert.equal(next, text.replace('"version": "0.1.0",', '"version": "0.1.1",'));
   assert.throws(() => withPackageVersion('{ "name": "pkg" }', '0.1.1'), /no top-level "version"/);
   assert.throws(() => withPackageVersion(text, 'v1'), /not a release version/);
+});
+
+test('renderNotes lists every commit since the last tag by kind, leaving out release and merge commits', () => {
+  const commits = [
+    commit('feat!: drop node 22', '', 'a00000000'),
+    commit('feat: 근태 도구 추가', '', 'b00000000'),
+    commit('fix(cli): keep the exit code', '', 'c00000000'),
+    commit('refactor: split the client', '', 'd00000000'),
+    commit('Update stuff', '', 'e00000000'),
+    commit('docs: README 보강', '', 'f00000000'),
+    commit('ci: cache npm', '', '100000000'),
+    commit('chore(release): v0.2.0', '', '200000000'),
+    commit('Merge pull request #3 from someone/topic', '', '300000000'),
+    commit('test: more cases', '', '400000000'),
+  ];
+  const notes = renderNotes(planRelease({ previousTag: 'v0.2.0', packageVersion: '0.2.0', commits }), 'https://github.com/example/repo');
+  assert.deepEqual([...notes.matchAll(/^## (.+)$/gm)].map((m) => m[1]),
+    ['Breaking changes', 'Features', 'Fixes', 'Other changes', 'Documentation', 'Maintenance']);
+  assert.match(notes, /## Breaking changes\n\n- drop node 22 \(a000000\)\n/);
+  assert.match(notes, /## Other changes\n\n- split the client \(d000000\)\n- Update stuff \(e000000\)\n/);
+  assert.match(notes, /## Documentation\n\n- README 보강 \(f000000\)\n/);
+  assert.match(notes, /## Maintenance\n\n- cache npm \(1000000\)\n- more cases \(4000000\)\n/);
+  assert.doesNotMatch(notes, /\(2000000\)|\(3000000\)|Merge pull request/);
+});
+
+test('renderNotes leaves out only the bot release commits, not a human chore(release) commit', () => {
+  const notes = renderNotes(planRelease({ previousTag: 'v0.2.0', packageVersion: '0.2.0', commits: [
+    commit('chore(release): v0.2.1', '', '500000000'),
+    commit('chore(release): update Homebrew formula for v0.2.1', '', '600000000'),
+    commit('chore(release): switch to trusted publishing (#16)', '', '700000000'),
+    commit('fix: x', '', '800000000'),
+  ] }), 'https://x');
+  assert.match(notes, /## Maintenance\n\n- switch to trusted publishing \(#16\) \(7000000\)\n/);
+  assert.doesNotMatch(notes, /\(5000000\)|\(6000000\)/);
 });
