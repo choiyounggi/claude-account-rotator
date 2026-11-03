@@ -27,7 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, TextIO, Tuple
 
 from rotator import doctor, launchd, refresh
 from rotator.accounts import profile_for_config_dir
-from rotator.config import CONFIG_PATH_DEFAULT, LOG_DIR_DEFAULT, Config, ConfigError, load_config
+from rotator.config import CONFIG_DIR_DEFAULT, CONFIG_PATH_DEFAULT, LOG_DIR_DEFAULT, Config, ConfigError, load_config
 from rotator.daemon import (
     IN_PROGRESS_HINT, ORPHANED_HINT, STATE_FILENAME, Deps, UsageCache, UsageStore, identity_of,
     load_records, real_deps, run_daemon, run_switch, touched,
@@ -1196,12 +1196,13 @@ def _real_orca_gate() -> Optional[str]:
     return doctor.gate(platform.system(), doctor.orca_version())
 
 
-def _doctor(cfg: Config, deps: Deps, out: TextIO, stale: bool) -> int:
+def _doctor(cfg: Config, deps: Deps, out: TextIO, stale: bool, config_error: Optional[str]) -> int:
     try:
         count = len(deps.discover_profiles(cfg.profiles_root))
     except Exception:
         count = 0
     checks = [doctor.check_system(platform.system()), doctor.check_python(sys.version_info[:3]),
+              doctor.check_config(config_error),
               doctor.check_orca(doctor.orca_version()),
               doctor.check_orca_cli(ORCA_BINARY_DEFAULT, os.access(ORCA_BINARY_DEFAULT, os.X_OK)),
               doctor.check_accounts(count, cfg.profiles_root),
@@ -1246,11 +1247,15 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
         parser.print_usage(err)
         return 2
     config_path = os.path.abspath(os.path.expanduser(args.config)) if args.config else CONFIG_PATH_DEFAULT
+    config_error: Optional[str] = None
     try:
         cfg = load_config(config_path)
     except ConfigError as e:
-        print("config error: %s" % e, file=err)
-        return 2
+        if args.command != "doctor":
+            print("config error: %s" % e, file=err)
+            return 2
+        config_error = str(e)
+        cfg = Config(state_dir=CONFIG_DIR_DEFAULT)
     if orca_gate is None and make_deps is None and launchctl is None:
         orca_gate = _real_orca_gate
     if args.command not in ("doctor", "uninstall") and orca_gate is not None:
@@ -1274,7 +1279,7 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
     if args.command == "doctor":
         if stale_check is None and make_deps is None:
             stale_check = _real_stale_check(cfg)
-        return _doctor(cfg, deps, out, _stale_install(stale_check))
+        return _doctor(cfg, deps, out, _stale_install(stale_check), config_error)
     if args.command == "daemon":
         return run_daemon(cfg, deps)
     if args.command == "status":

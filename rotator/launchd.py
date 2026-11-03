@@ -37,7 +37,7 @@ UNKNOWN_COMMIT = "unknown"
 PROTECTED_DIRS = ("Desktop", "Documents", "Downloads")
 _COMMIT_RE = re.compile(r"[0-9a-f]{4,40}")
 # An npm install has no .git; its package.json version stands in for the commit, as "v<version>".
-_RELEASE_RE = re.compile(r"v\d+\.\d+\.\d+")
+_RELEASE_RE = re.compile(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?")
 PACKAGE_JSON = "package.json"
 
 Runner = Callable[[List[str], float], Tuple[int, str, str]]

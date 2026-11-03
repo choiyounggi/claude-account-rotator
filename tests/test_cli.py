@@ -1127,7 +1127,8 @@ class TestStaleInstall(unittest.TestCase):
             raise AssertionError("git must not run without .git")
         pkg = os.path.join(self.source, "package.json")
         self.assertIsNone(launchd.source_commit(self.source, no_git))  # neither .git nor package.json
-        for text, want in (('{"version": "0.1.0"}', "v0.1.0"), ('{"version": "0.1"}', None),
+        for text, want in (('{"version": "0.1.0"}', "v0.1.0"), ('{"version": "0.2.0-rc.1"}', "v0.2.0-rc.1"),
+                           ('{"version": "0.1"}', None),
                            ('{"version": 1}', None), ("[]", None), ("{", None)):
             with open(pkg, "w", encoding="utf-8") as f:
                 f.write(text)
@@ -1140,6 +1141,8 @@ class TestStaleInstall(unittest.TestCase):
     def test_installed_release_version(self):
         self.version("v0.1.0\n2026-11-02T03:04:05Z\n")
         self.assertEqual(launchd.installed_commit(self.state), "v0.1.0")
+        self.version("v0.2.0-rc.1\n")
+        self.assertEqual(launchd.installed_commit(self.state), "v0.2.0-rc.1")
         self.version("0.1.0\n")
         self.assertIsNone(launchd.installed_commit(self.state))
 
@@ -3459,6 +3462,66 @@ class TestPackage(unittest.TestCase):
         self.assertIn("[ROTATOR, 'doctor']", text)
 
 
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
+class TestPostinstall(unittest.TestCase):
+    """Runs scripts/postinstall.js with a stub bin/rotator that records its arguments, under a scratch HOME."""
+
+    def setUp(self):
+        self.dir = scratch("postinstall-" + self._testMethodName)
+        os.makedirs(os.path.join(self.dir, "pkg", "scripts"))
+        os.makedirs(os.path.join(self.dir, "pkg", "bin"))
+        shutil.copyfile(os.path.join(REPO, "scripts", "postinstall.js"),
+                        os.path.join(self.dir, "pkg", "scripts", "postinstall.js"))
+        self.calls = os.path.join(self.dir, "calls.txt")
+        with open(os.path.join(self.dir, "pkg", "bin", "rotator"), "w", encoding="utf-8") as f:
+            f.write("import os, sys\n"
+                    "open(os.environ['STUB_CALLS'], 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                    "sys.exit(int(os.environ.get('STUB_RC_' + sys.argv[1].upper(), '0')))\n")
+        self.home = os.path.join(self.dir, "home")
+        os.makedirs(os.path.join(self.home, "Library", "LaunchAgents"))
+
+    def run_script(self, global_install=True, plist=False, doctor_rc=0, install_rc=0):
+        if plist:
+            with open(os.path.join(self.home, "Library", "LaunchAgents", LABEL + ".plist"), "w") as f:
+                f.write("<plist/>\n")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("npm_config_")}
+        env.update(HOME=self.home, STUB_CALLS=self.calls, STUB_RC_DOCTOR=str(doctor_rc),
+                   STUB_RC_INSTALL=str(install_rc))
+        if global_install:
+            env["npm_config_global"] = "true"
+        p = subprocess.run(["node", os.path.join(self.dir, "pkg", "scripts", "postinstall.js")], env=env,
+                           capture_output=True, text=True, timeout=60)
+        try:
+            with open(self.calls, encoding="utf-8") as f:
+                calls = f.read().split()
+        except FileNotFoundError:
+            calls = []
+        return p, calls
+
+    def test_fresh_install_runs_doctor_only(self):
+        p, calls = self.run_script()
+        self.assertEqual((p.returncode, calls), (0, ["doctor"]), p.stderr)
+        self.assertIn("rotator install", p.stdout)
+
+    def test_failed_doctor_fails_the_install(self):
+        p, calls = self.run_script(plist=True, doctor_rc=1)
+        self.assertEqual((p.returncode, calls), (1, ["doctor"]))
+        self.assertIn("cannot run the rotator", p.stderr)
+
+    def test_global_upgrade_refreshes_the_agent(self):
+        p, calls = self.run_script(plist=True)
+        self.assertEqual((p.returncode, calls), (0, ["doctor", "install"]), p.stderr)
+
+    def test_local_install_leaves_the_agent_alone(self):
+        p, calls = self.run_script(global_install=False, plist=True)
+        self.assertEqual((p.returncode, calls), (0, ["doctor"]), p.stderr)
+
+    def test_failed_refresh_does_not_fail_the_install(self):
+        p, calls = self.run_script(plist=True, install_rc=1)
+        self.assertEqual((p.returncode, calls), (0, ["doctor", "install"]))
+        self.assertIn("run `rotator install`", p.stderr)
+
+
 class TestOrcaGate(MainBase):
     def gated(self, *argv, reason="Orca: 1.4.200 is too old"):
         self.out, self.err = io.StringIO(), io.StringIO()
@@ -3540,6 +3603,16 @@ class TestDoctorCommand(MainBase):
         self.assertTrue(self.line("orca CLI").startswith("[fail]"))
         self.assertEqual(self.doctor(system="Linux"), 1)
         self.assertTrue(self.line("macOS").startswith("[fail]"))
+
+    def test_bad_config_is_a_fail_line(self):
+        self.write_cfg({"no_such_key": 1})
+        self.assertEqual(self.doctor(), 1)
+        self.assertTrue(self.line("config").startswith("[fail]"))
+        self.assertIn("no_such_key", self.line("config"))
+        self.assertTrue(self.line("Orca").startswith("[ok]"))  # the other checks still ran
+        self.assertEqual(self.err.getvalue(), "")
+        self.assertEqual(self.main("status", "--json"), 2)  # every other command still refuses it
+        self.assertIn("config error", self.err.getvalue())
 
     def test_warnings_do_not_fail(self):
         self.env.profiles = []

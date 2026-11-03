@@ -9,8 +9,12 @@ class TestParseVersion(unittest.TestCase):
         self.assertEqual(doctor.parse_version("1.4.241"), (1, 4, 241))
         self.assertEqual(doctor.parse_version(" 1.10.0\n"), (1, 10, 0))
 
+    def test_ignores_a_suffix(self):
+        self.assertEqual(doctor.parse_version("1.4.250-beta.1"), (1, 4, 250))
+        self.assertEqual(doctor.parse_version("1.4.250 (build 7)"), (1, 4, 250))
+
     def test_rejects_other_shapes(self):
-        for text in ("", "1.4", "1.4.241-beta", "v1.4.241", "1.4.x", None, 1.4):
+        for text in ("", "1.4", "v1.4.241", "1.4.x", "1.4.241.1", None, 1.4):
             self.assertIsNone(doctor.parse_version(text), text)
 
 
@@ -46,7 +50,9 @@ class TestCheckOrca(unittest.TestCase):
     def test_missing_or_unreadable_fails(self):
         self.assertIn("not found", doctor.check_orca(None).detail)
         self.assertEqual(doctor.check_orca(None).level, FAIL)
-        self.assertEqual(doctor.check_orca("1.5.0-beta").level, FAIL)
+        self.assertEqual(doctor.check_orca("beta").level, FAIL)
+        self.assertEqual(doctor.check_orca("1.5.0-beta").level, OK)
+        self.assertEqual(doctor.check_orca("1.4.223-beta").level, FAIL)
 
 
 class TestOtherChecks(unittest.TestCase):
@@ -68,6 +74,12 @@ class TestOtherChecks(unittest.TestCase):
         self.assertEqual(doctor.check_accounts(0, "/r").level, WARN)
         self.assertEqual(doctor.check_accounts(1, "/r").level, WARN)
         self.assertEqual(doctor.check_accounts(2, "/r").level, OK)
+
+    def test_config(self):
+        self.assertEqual(doctor.check_config(None).level, OK)
+        bad = doctor.check_config("/x/config.json: unknown key 'old'")
+        self.assertEqual(bad.level, FAIL)
+        self.assertIn("unknown key", bad.detail)
 
     def test_agent(self):
         self.assertEqual(doctor.check_agent(False, False).level, WARN)

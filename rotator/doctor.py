@@ -16,7 +16,8 @@ ORCA_INFO_PLIST = os.path.join(ORCA_APP, "Contents", "Info.plist")
 # cannot switch between.
 ORCA_MIN_VERSION: Tuple[int, int, int] = (1, 4, 224)
 PYTHON_MIN_VERSION: Tuple[int, int] = (3, 9)
-_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+# A suffix after the third number ("1.4.250-beta.1") is ignored; a leading "v" or a missing number is not.
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?![\d.])")
 
 OK = "ok"
 WARN = "warn"
@@ -34,8 +35,8 @@ def _dotted(v: Tuple[int, ...]) -> str:
 
 
 def parse_version(text: str) -> Optional[Tuple[int, int, int]]:
-    """``"1.4.241"`` -> (1, 4, 241); None for anything else (a suffix such as ``-beta`` is not accepted)."""
-    m = _VERSION_RE.fullmatch(text.strip()) if isinstance(text, str) else None
+    """``"1.4.241"`` or ``"1.4.241-beta.1"`` -> (1, 4, 241); None when it does not start with three numbers."""
+    m = _VERSION_RE.match(text.strip()) if isinstance(text, str) else None
     return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
 
@@ -91,6 +92,12 @@ def check_accounts(count: int, root: str) -> Check:
     if count == 1:
         return Check("Claude accounts", WARN, "1 under %s: switching needs at least 2" % root)
     return Check("Claude accounts", OK, "%d under %s" % (count, root))
+
+
+def check_config(error: Optional[str]) -> Check:
+    if error is None:
+        return Check("config", OK, "readable")
+    return Check("config", FAIL, "%s (the other checks use the defaults)" % error)
 
 
 def check_agent(installed: bool, stale: bool) -> Check:

@@ -28,7 +28,8 @@ if (spawnSync('/usr/bin/xcode-select', ['-p'], { stdio: 'ignore' }).status !== 0
 if (spawnSync(PYTHON, [ROTATOR, 'doctor'], { stdio: 'inherit' }).status !== 0) {
   fail('this Mac cannot run the rotator yet: fix the [fail] lines above, then install again');
 }
-if (fs.existsSync(PLIST)) {
+// Only a global install replaces the agent: npx and a local `npm install` (also inside a checkout) leave it alone.
+if (process.env.npm_config_global === 'true' && fs.existsSync(PLIST)) {
   if (process.getuid() === 0) {
     console.warn('claude-account-rotator: installed as root; run `rotator install` as yourself to update the agent');
   } else if (spawnSync(PYTHON, [ROTATOR, 'install'], { stdio: 'inherit' }).status !== 0) {
