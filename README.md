@@ -29,9 +29,16 @@ Orca's global `selected-host` pointer on a usable account.
     lift is below `hard_pct`. It is soft, so a running turn is never interrupted for it. Accounts with stale or
     unavailable usage are not considered.
   - A session refused by a usage limit marks its account at 100% until the reset, even when the usage API is
-    unreachable (HTTP 429) and the last reading is older and lower. The daemon reads the latest rate-limit entry
-    in the session's transcript that is newer than the process start; earlier entries can belong to another
-    account the session ran on. It logs `event=limit_seen` once per account and reset.
+    unreachable (HTTP 429) and the last reading is older and lower.
+    - The daemon reads the latest rate-limit entry in the session's transcript that is newer than the process
+      start. Earlier entries can belong to another account the session ran on. A real reply after the refusal
+      cancels it.
+    - The daemon remembers the limit until the reset, also after the refused session moves away. It forgets the
+      limit early when a live reading taken later shows the window below 100% (`event=limit_lifted`).
+    - Only `five_hour`, `seven_day` and Fable-scoped refusals count. A model-scoped weekly cap such as
+      `seven_day_sonnet` does not block the whole account.
+    - It logs `event=limit_seen` once per account and reset.
+    - The status table still shows the last usage reading.
   - The daemon logs each session's decision when it changes (`event=decision`), including why it does not
     switch. Numbers are ignored, and a decision seen within the last 10 minutes is not logged again.
 - **Fable-aware** — Fable sessions are judged by a load that also counts the Fable window. That window is weekly
