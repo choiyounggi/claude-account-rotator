@@ -95,7 +95,7 @@ bin/rotator uninstall    # stops it and removes the plist and the app copy
   never a pattern), removes the plist, then removes exactly `app/` under the state dir — only if it is a real
   directory there; a symlink or file in its place is reported and left alone.
 - The agent runs `/usr/bin/python3 <state dir>/app/bin/rotator --config <abs path> daemon` from `<state dir>/app`
-  with `RunAtLoad` and `KeepAlive`. Its `ExitTimeOut` is computed from `timeouts` at install time (570 s with the
+  with `RunAtLoad` and `KeepAlive`. Its `ExitTimeOut` is computed from `timeouts` at install time (615 s with the
   defaults: one full switch plus margin), so re-run `rotator install` after changing `timeouts`.
 - Run `rotator uninstall` before running `rotator daemon` in the foreground. Otherwise the second copy finds the
   daemon lock held and exits 1, and with `KeepAlive` launchd restarts the agent copy every 10 s
@@ -416,7 +416,10 @@ Three things used to stop an automatic switch until someone stepped in by hand.
   bottom of the screen (below the last horizontal rule, so the same words quoted in the transcript never count);
   when it finds that title and the option line `1. Exit and stop tasks`, it sends exactly one key: Enter when
   option 1 is highlighted (`❯ 1.`), else `1` then Enter. It never reads the screen again after that key and keeps
-  waiting for the exit. The log says `event=exit_confirm choice=stop_tasks` (no screen text) and the switch hint
+  waiting for the exit. Claude Code first stops the session's background agents, which can take longer than
+  `timeouts.exit_s`. So when the first window ends with no exit and no dialog, the switcher waits one more
+  `exit_s` for either (`event=exit_wait_extended`). The log says `event=exit_confirm choice=stop_tasks` (no
+  screen text) and the switch hint
   adds that the session's background tasks were stopped. Any other dialog gets no key: the wait ends as
   `exit_timeout` as before.
 - **Exclusions expire.** A target refused at preflight is excluded for that session and the next target is
