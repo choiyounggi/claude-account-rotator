@@ -115,13 +115,21 @@ rotator status --watch
 - `install` copies the runnable app into `%APPDATA%\claude-account-rotator\app\` (same layout and
   `VERSION`-staleness tracking as macOS) and registers a Task Scheduler task named `claude-account-rotator`: a
   `LogonTrigger` for the current user that runs `pythonw.exe` (no console window; falls back to `python.exe`
-  when `pythonw.exe` is not next to it on PATH), `MultipleInstancesPolicy IgnoreNew` so a second logon never
-  starts a second copy, and `RestartOnFailure` (every 1 minute, up to 999 times).
+  when `pythonw.exe` is not next to it on PATH) and repeats every 5 minutes, and `MultipleInstancesPolicy
+  IgnoreNew` so a repeat while the daemon is already up never starts a second copy. `RestartOnFailure` (every
+  1 minute, up to 999 times) only covers the task itself failing to *launch*; a daemon that starts and then
+  exits on its own (a config error, the Orca gate, a crash) is not a launch failure, so it is the 5-minute
+  repeat, not `RestartOnFailure`, that gets it running again — within 5 minutes, not instantly.
 - `uninstall` ends and deletes that task, then removes the app copy; running it when nothing is installed
-  prints "not installed" and is not an error.
+  prints "not installed" and is not an error. Both `install` and `uninstall` first ask a running daemon to stop
+  on its own — it polls for a `stop-request` file so a token refresh in flight can finish and write instead of
+  being killed mid-write — and fall back to ending the task outright (`schtasks /End`) if it does not stop in
+  time.
 - **Not yet supported**: `rotator switch` refuses with one clear line and exit code 2. The daemon never switches
   a session that is already running; it logs `event=auto_switch_unavailable os=windows` once at start and keeps
   correcting `selected-host` (both still follow `auto_switch`, `pointer_correction` and `dry_run` as on macOS).
+- **Limits**: a profile's home must be on NTFS; FAT/exFAT's weaker file-locking identity is not supported for
+  token refresh there.
 
 This has been verified in CI only (GitHub Actions `windows-latest`, Python 3.9 and 3.12) — it has not yet been
 run on a real Windows machine.

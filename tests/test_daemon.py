@@ -15,7 +15,7 @@ import unittest.mock
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Set
 
-from rotator import daemon, refresh, switcher, usage
+from rotator import accounts, daemon, refresh, switcher, usage
 from rotator.config import Config
 from rotator.daemon import (
     GONE_REASONS, IN_PROGRESS_HINT, Daemon, SharedUsage, UsageCache, UsageStore, rate_limited, shown_usage, real_deps, run_daemon, ORPHANED_HINT, STRUCTURAL_REASONS, TARGET_REASONS, TOUCHED_ONLY_REASONS, TRANSIENT_REASONS,
@@ -278,6 +278,10 @@ class FakeEnv:
             env.files[path] = text
             env.calls.append(("write", path))
 
+        def unlink(path):
+            env.calls.append(("unlink", path))
+            env.files.pop(path, None)
+
         def list_dir(path):
             prefix = path + os.sep
             names = sorted({k[len(prefix):] for k in env.files
@@ -316,8 +320,8 @@ class FakeEnv:
             refresh_held=refresh_held, discover_sessions=discover_sessions, read_limit=read_limit,
             switch=switch, make_driver=lambda: FakeDriver(env), procs=env.probe, read_pointer=read_pointer,
             write_pointer=write_pointer, now=lambda: env.now_v, monotonic=lambda: env.mono_v, spawn=spawn,
-            wait_stop=wait_stop, lock=lock, read_text=read_text, write_text=write_text, list_dir=list_dir,
-            isdir=lambda path: env.isdir_ok, pid_alive=lambda pid: pid in env.alive_pids,
+            wait_stop=wait_stop, lock=lock, read_text=read_text, write_text=write_text, unlink=unlink,
+            list_dir=list_dir, isdir=lambda path: env.isdir_ok, pid_alive=lambda pid: pid in env.alive_pids,
             install_signals=install_signals, make_logger=env.logger,
         )
         fields.update(overrides)
@@ -443,7 +447,7 @@ class TestDeps(unittest.TestCase):
         fields = dataclasses.fields(Deps)
         with self.assertRaises(TypeError):
             Deps(**{f.name: None for f in fields[:-1]})
-        self.assertEqual(len(fields), 23)
+        self.assertEqual(len(fields), 24)
         for f in fields:
             self.assertIs(f.default, dataclasses.MISSING, f.name)
             self.assertIs(f.default_factory, dataclasses.MISSING, f.name)
@@ -2741,7 +2745,9 @@ class TestRunDaemonWindowsAutoSwitch(RunDaemonBase):
         with unittest.mock.patch.object(daemon, "IS_WINDOWS", True):
             self.assertEqual(self.run_d(), 0)
         self.assertEqual(self.env.logs("auto_switch_unavailable"), ["event=auto_switch_unavailable os=windows"])
-        self.assertEqual(self.spawns(), [])  # a hard switch is due (ACC_A at 97%), but never dispatched
+        # a hard switch is due (ACC_A at 97%), but never dispatched; the one spawn is the stop-request watcher
+        # (Windows only -- see TestWindowsGracefulStop), not a switch worker.
+        self.assertEqual(self.spawns(), [("spawn", "rotator-stop-watch")])
         self.assertEqual(self.switches(), [])
         self.assertEqual(self.snap()["flags"]["auto_switch"], False)
 
@@ -2776,6 +2782,51 @@ class TestDaemonStartNoConsole(RunDaemonBase):
                 unittest.mock.patch.object(daemon.sys, "stderr", None):
             rc = self.run_d(self.env.deps(make_logger=daemon._make_logger))
         self.assertEqual(rc, 2)
+
+
+class TestWindowsGracefulStop(RunDaemonBase):
+    """A stop-request file (schtasks.install/uninstall, asking the daemon to exit before /End TerminateProcess
+    kills a token refresh in flight) is only watched for on Windows, and a stale one must not linger."""
+
+    def setUp(self):
+        super().setUp()
+        self.env.sessions = []  # no unrelated switch dispatch to confuse spawns()
+
+    @property
+    def stop_request_path(self):
+        return os.path.join(self.cfg.state_dir, daemon.STOP_REQUEST_FILENAME)
+
+    def test_stop_request_file_stops_and_drains(self):
+        # The request arrives only after the daemon has started (and cleared any stale file) -- simulate the
+        # real background thread noticing it by writing it, then running the spawned watcher synchronously,
+        # right before the main loop's first wait would otherwise just sleep.
+        def hook(n):
+            if n == 1:
+                self.env.files[self.stop_request_path] = "2026-11-04T00:00:00+00:00\n"
+                self.env.run_worker(0)
+        self.env.wait_hook = hook
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", True):
+            rc = self.run_d()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.spawns(), [("spawn", "rotator-stop-watch")])
+        self.assertEqual(len(self.env.logs("daemon_stop")), 1)
+        self.assertIn(self.state_path, self.env.files)  # drain() wrote a final snapshot
+
+    def test_no_watcher_off_windows(self):
+        self.env.wait_hook = lambda n: self.env.signal_handler() if n == 1 else None
+        self.assertEqual(self.run_d(), 0)
+        self.assertEqual(self.spawns(), [])
+
+    def test_stale_stop_request_is_cleared_on_start(self):
+        self.env.files[self.stop_request_path] = "stale from a previous run\n"
+        self.env.wait_hook = lambda n: self.env.signal_handler() if n == 1 else None
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", True):
+            self.assertEqual(self.run_d(), 0)
+        # Cleared on start, not because the watcher fired (the normal SIGTERM path stopped it instead; the
+        # watcher's own fn was never run -- a stale file left over from the last install/uninstall must not
+        # make a freshly started daemon stop itself right away).
+        self.assertNotIn(self.stop_request_path, self.env.files)
+        self.assertTrue(self.env.spawned[0].alive)
 
 
 # --- token refresh wiring ----------------------------------------------------------------------------------
@@ -3116,6 +3167,32 @@ class TestRealDeps(unittest.TestCase):
         self.assertIs(t.daemon, True)
         self.assertEqual(t.name, "t")
         t.join()
+
+
+class TestRealDepsStoreWiring(unittest.TestCase):
+    """real_deps' Windows/macOS token-store wiring had no test, so dropping store_key, swapping in the
+    Keychain reader, or hardcoding is_windows all stayed green (adversarial review finding)."""
+
+    def refresher(self):
+        return real_deps(make_cfg()).refresh_token.__self__
+
+    def test_windows(self):
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", True):
+            r = self.refresher()
+        self.assertIs(r._read_item, accounts.read_credentials_item)
+        self.assertIs(r._write_item, accounts.write_credentials_item)
+        self.assertIs(r._item_exists, accounts.credentials_item_exists)
+        self.assertEqual(r._store_key(prof(ACC_A)), prof(ACC_A).home)
+        self.assertIs(r._is_windows, True)
+
+    def test_macos(self):
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", False):
+            r = self.refresher()
+        self.assertIs(r._read_item, accounts.read_keychain_item)
+        self.assertIs(r._write_item, accounts.write_keychain_item)
+        self.assertIs(r._item_exists, accounts.keychain_item_exists)
+        self.assertEqual(r._store_key(prof(ACC_A)), prof(ACC_A).keychain_service)
+        self.assertIs(r._is_windows, False)
 
 
 class TestHeldTargets(DispatchBase):

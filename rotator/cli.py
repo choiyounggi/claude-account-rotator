@@ -48,6 +48,9 @@ WINDOWS_UNSUPPORTED_MESSAGE = (
     "rotator %s is not available on Windows yet: switching a running session automatically "
     "comes in a later release"
 )
+# Under pythonw.exe sys.stdout/sys.stderr are None; an early-exit message that would otherwise vanish is
+# appended here instead.
+CONSOLE_LOG_FILENAME = "rotator-console.log"
 
 STATUS_SCHEMA = 1
 STATUS_KEYS = ("schema", "generated_at", "daemon", "accounts", "pointer_account_id", "sessions",
@@ -1252,7 +1255,7 @@ def _install_kwargs(cfg: Config, config_path: str) -> dict:
 
 def _schtasks_install_kwargs(cfg: Config, config_path: str) -> dict:
     return {"python_exe": sys.executable, "source_root": launchd.repo_root(), "state_dir": cfg.state_dir,
-            "config_path": config_path}
+            "config_path": config_path, "timeouts": cfg.timeouts}
 
 
 def _real_stale_check(cfg: Config) -> Callable[[], bool]:
@@ -1343,69 +1346,81 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
     out = stdout or sys.stdout
     inp = stdin if stdin is not None else (sys.stdin if stdout is None else None)
     err = stderr or sys.stderr
-    parser = build_parser()
+    console_log: Optional[TextIO] = None
+    if out is None or err is None:
+        # Under pythonw.exe (no console) sys.stdout/sys.stderr are None, so an early-exit message (a config
+        # error, the Orca gate refusing, an argparse error) would otherwise vanish instead of reaching anyone.
+        os.makedirs(LOG_DIR_DEFAULT, exist_ok=True)
+        console_log = open(os.path.join(LOG_DIR_DEFAULT, CONSOLE_LOG_FILENAME), "a", encoding="utf-8")
+        out = out or console_log
+        err = err or console_log
     try:
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            args = parser.parse_args(argv)
-    except SystemExit as e:
-        return e.code if isinstance(e.code, int) else (0 if e.code is None else 2)
-    if args.command is None:
-        parser.print_usage(err)
-        return 2
-    config_path = os.path.abspath(os.path.expanduser(args.config)) if args.config else CONFIG_PATH_DEFAULT
-    config_error: Optional[str] = None
-    try:
-        cfg = load_config(config_path)
-    except ConfigError as e:
-        if args.command != "doctor":
-            print("config error: %s" % e, file=err)
+        parser = build_parser()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                args = parser.parse_args(argv)
+        except SystemExit as e:
+            return e.code if isinstance(e.code, int) else (0 if e.code is None else 2)
+        if args.command is None:
+            parser.print_usage(err)
             return 2
-        config_error = str(e)
-        cfg = Config(state_dir=CONFIG_DIR_DEFAULT)
-    if args.command in WINDOWS_UNSUPPORTED_COMMANDS and platform.system() == "Windows":
-        print(WINDOWS_UNSUPPORTED_MESSAGE % args.command, file=err)
-        return 2
-    if orca_gate is None and make_deps is None and launchctl is None:
-        orca_gate = _real_orca_gate
-    if args.command not in ("doctor", "uninstall") and orca_gate is not None:
-        reason = orca_gate()
-        if reason is not None:
-            print("cannot run here: %s (see: rotator doctor)" % reason, file=err)
+        config_path = os.path.abspath(os.path.expanduser(args.config)) if args.config else CONFIG_PATH_DEFAULT
+        config_error: Optional[str] = None
+        try:
+            cfg = load_config(config_path)
+        except ConfigError as e:
+            if args.command != "doctor":
+                print("config error: %s" % e, file=err)
+                return 2
+            config_error = str(e)
+            cfg = Config(state_dir=CONFIG_DIR_DEFAULT)
+        if args.command in WINDOWS_UNSUPPORTED_COMMANDS and platform.system() == "Windows":
+            print(WINDOWS_UNSUPPORTED_MESSAGE % args.command, file=err)
             return 2
-    if args.command in ("install", "uninstall"):
-        if platform.system() == "Windows":
-            run = launchctl or schtasks.run_schtasks
-            # Never os.getuid()/uid() here: Windows has no uid, and Task Scheduler takes the logon user instead.
-            if args.command == "install":
-                rc, msg = schtasks.install(runner=run, **_schtasks_install_kwargs(cfg, config_path))
+        if orca_gate is None and make_deps is None and launchctl is None:
+            orca_gate = _real_orca_gate
+        if args.command not in ("doctor", "uninstall") and orca_gate is not None:
+            reason = orca_gate()
+            if reason is not None:
+                print("cannot run here: %s (see: rotator doctor)" % reason, file=err)
+                return 2
+        if args.command in ("install", "uninstall"):
+            if platform.system() == "Windows":
+                run = launchctl or schtasks.run_schtasks
+                # Never os.getuid()/uid() here: Windows has no uid, and Task Scheduler takes the logon user instead.
+                if args.command == "install":
+                    rc, msg = schtasks.install(runner=run, **_schtasks_install_kwargs(cfg, config_path))
+                else:
+                    rc, msg = schtasks.uninstall(runner=run, state_dir=cfg.state_dir, timeouts=cfg.timeouts)
             else:
-                rc, msg = schtasks.uninstall(runner=run, state_dir=cfg.state_dir)
-        else:
-            run = launchctl or launchd.run_launchctl
-            u = (uid or os.getuid)()
-            if args.command == "install":
-                rc, msg = launchd.install(runner=run, uid=u, **_install_kwargs(cfg, config_path))
-            else:
-                rc, msg = launchd.uninstall(runner=run, uid=u, plist_path=launchd.plist_path_default(),
-                                            state_dir=cfg.state_dir)
-        print(msg, file=out if rc == 0 else err)
-        return rc
-    if args.command == "daemon" and args.dry_run:
-        cfg = dataclasses.replace(cfg, dry_run=True)
-    deps = (make_deps or real_deps)(cfg)
-    if args.command == "doctor":
-        if stale_check is None and make_deps is None:
-            stale_check = _real_stale_check(cfg)
-        doctor_runner = launchctl or (schtasks.run_schtasks if platform.system() == "Windows" else None)
-        return _doctor(cfg, deps, out, _stale_install(stale_check), config_error, runner=doctor_runner)
-    if args.command == "daemon":
-        return run_daemon(cfg, deps)
-    if args.command == "status":
-        if stale_check is None and make_deps is None:
-            stale_check = _real_stale_check(cfg)
-        return _status(args, cfg, deps, out, err, tz or datetime.now().astimezone().tzinfo, term_ctl, read_key, inp,
-                       stale_check)
-    return _switch(args, cfg, deps, out, err)
+                run = launchctl or launchd.run_launchctl
+                u = (uid or os.getuid)()
+                if args.command == "install":
+                    rc, msg = launchd.install(runner=run, uid=u, **_install_kwargs(cfg, config_path))
+                else:
+                    rc, msg = launchd.uninstall(runner=run, uid=u, plist_path=launchd.plist_path_default(),
+                                                state_dir=cfg.state_dir)
+            print(msg, file=out if rc == 0 else err)
+            return rc
+        if args.command == "daemon" and args.dry_run:
+            cfg = dataclasses.replace(cfg, dry_run=True)
+        deps = (make_deps or real_deps)(cfg)
+        if args.command == "doctor":
+            if stale_check is None and make_deps is None:
+                stale_check = _real_stale_check(cfg)
+            doctor_runner = launchctl or (schtasks.run_schtasks if platform.system() == "Windows" else None)
+            return _doctor(cfg, deps, out, _stale_install(stale_check), config_error, runner=doctor_runner)
+        if args.command == "daemon":
+            return run_daemon(cfg, deps)
+        if args.command == "status":
+            if stale_check is None and make_deps is None:
+                stale_check = _real_stale_check(cfg)
+            return _status(args, cfg, deps, out, err, tz or datetime.now().astimezone().tzinfo, term_ctl,
+                           read_key, inp, stale_check)
+        return _switch(args, cfg, deps, out, err)
+    finally:
+        if console_log is not None:
+            console_log.close()
 
 
 def _status(args: argparse.Namespace, cfg: Config, deps: Deps, out: TextIO, err: TextIO, tz: tzinfo,

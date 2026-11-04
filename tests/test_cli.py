@@ -490,6 +490,10 @@ class CliEnv:
             env.files[path] = text
             env.calls.append(("write", path))
 
+        def unlink(path):
+            env.calls.append(("unlink", path))
+            env.files.pop(path, None)
+
         def list_dir(path):
             env.calls.append(("list_dir", path))
             prefix = path + os.sep
@@ -513,7 +517,7 @@ class CliEnv:
             discover_sessions=discover_sessions, read_limit=lambda s: None, switch=switch, make_driver=_NoDriver,
             procs=_NullProbe(), read_pointer=read_pointer, write_pointer=_not_used,
             now=lambda: env.now_v, monotonic=lambda: env.mono_v, spawn=_not_used, wait_stop=wait_stop, lock=lock,
-            read_text=read_text, write_text=write_text, list_dir=list_dir, isdir=lambda p: True,
+            read_text=read_text, write_text=write_text, unlink=unlink, list_dir=list_dir, isdir=lambda p: True,
             pid_alive=lambda pid: pid in env.alive_pids, install_signals=_not_used, make_logger=self.make_logger,
         )
         fields.update(overrides)
@@ -2864,6 +2868,45 @@ class TestMainParser(MainBase):
         self.assertIn("soft_pct", self.err.getvalue())
         self.assertEqual(self.env.fetches(), [])
         self.assertEqual(self.cfg_seen, [])
+
+
+class TestConsoleLogFallback(MainBase):
+    """Under pythonw.exe sys.stdout/sys.stderr are None; an early-exit message (a config error, the Orca gate
+    refusing) must land in a log file instead of vanishing."""
+
+    def test_config_error_without_a_console_goes_to_the_log_file(self):
+        self.write_cfg({"soft_pct": 101})
+        log_dir = scratch("console-log-" + self._testMethodName)
+        with mock.patch.object(cli, "LOG_DIR_DEFAULT", log_dir), \
+                mock.patch.object(cli.sys, "stdout", None), mock.patch.object(cli.sys, "stderr", None), \
+                mock.patch.object(cli.platform, "system", return_value="Windows"):
+            rc = main(["--config", self.cfg_path, "daemon"])
+        self.assertEqual(rc, 2)
+        log_path = os.path.join(log_dir, cli.CONSOLE_LOG_FILENAME)
+        with open(log_path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("soft_pct", text)
+
+    def test_log_file_is_appended_not_overwritten_and_closed(self):
+        self.write_cfg({"soft_pct": 101})
+        log_dir = scratch("console-log-" + self._testMethodName)
+        log_path = os.path.join(log_dir, cli.CONSOLE_LOG_FILENAME)
+        with mock.patch.object(cli, "LOG_DIR_DEFAULT", log_dir), \
+                mock.patch.object(cli.sys, "stdout", None), mock.patch.object(cli.sys, "stderr", None):
+            main(["--config", self.cfg_path, "daemon"])
+            main(["--config", self.cfg_path, "daemon"])
+        with open(log_path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertEqual(text.count("soft_pct"), 2)  # appended, not truncated on the second run
+
+    def test_injected_streams_never_touch_the_log_file(self):
+        self.write_cfg({"soft_pct": 101})
+        log_dir = scratch("console-log-" + self._testMethodName)
+        with mock.patch.object(cli, "LOG_DIR_DEFAULT", log_dir):
+            rc = self.main("status")
+        self.assertEqual(rc, 2)
+        self.assertIn("soft_pct", self.err.getvalue())
+        self.assertFalse(os.path.isfile(os.path.join(log_dir, cli.CONSOLE_LOG_FILENAME)))
 
 
 class TestStatusCommand(MainBase):

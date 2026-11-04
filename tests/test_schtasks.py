@@ -1,12 +1,14 @@
 import os
 import shutil
+import subprocess
 import unittest
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import List
 from unittest import mock
 
-from rotator import launchd, schtasks
+from rotator import daemon, launchd, schtasks
+from rotator.switcher import Timeouts
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE = os.path.join(REPO, ".claude", "tmp", "test-schtasks")
@@ -34,15 +36,23 @@ def make_source(root):
 
 
 class FakeRunner:
-    """schtasks.exe by verb (argv[1]). A list answers one call per item (the last repeats)."""
+    """schtasks.exe by verb (argv[1]). A list answers one call per item (the last repeats).
 
-    def __init__(self, script=None):
+    When ``lock_path`` is set, ``/Run`` grabs the real daemon lock there (never released), simulating the
+    daemon install() just launched taking it -- what install()'s post-/Run poll (1c) waits for.
+    """
+
+    def __init__(self, script=None, lock_path=None):
         self.script = script or {}
         self.calls: List[tuple] = []
+        self.lock_path = lock_path
+        self._held_lock = None
 
     def __call__(self, argv, timeout):
         self.calls.append((list(argv), timeout))
         verb = argv[1]
+        if verb == "/Run" and self.lock_path is not None and self._held_lock is None:
+            self._held_lock = daemon.try_lock(self.lock_path)
         v = self.script.get(verb, (0, "", ""))
         if isinstance(v, list):
             v = v.pop(0) if len(v) > 1 else v[0]
@@ -50,6 +60,22 @@ class FakeRunner:
 
     def verbs(self):
         return [argv[1] for argv, _ in self.calls]
+
+
+class FakeClock:
+    """An injectable clock/sleep pair for install()/uninstall()'s polling: ``sleep`` advances the clock instead
+    of actually blocking, so a poll that waits out a full timeout still runs instantly."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.t = start
+        self.sleeps: List[float] = []
+
+    def clock(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.t += seconds
 
 
 # --- schtasks_exe ------------------------------------------------------------------------------------------
@@ -73,11 +99,13 @@ class TestSchtasksExe(unittest.TestCase):
 class TestBuildTaskXml(unittest.TestCase):
     PYTHON = r"C:\Program Files\Python39\python.exe"
     APP_ROOT = r"C:\Users\Test & User\AppData\Local\claude-account-rotator\app"
+    STATE_DIR = r"C:\Users\Test & User\AppData\Local\claude-account-rotator"
     CONFIG = r"C:\Users\Test & User\AppData\Roaming\claude-account-rotator\config.json"
     USER_ID = r"EXAMPLE-DOMAIN\test&user"
 
     def build(self, exists):
-        xml = schtasks.build_task_xml(self.PYTHON, self.APP_ROOT, self.CONFIG, self.USER_ID, exists=exists)
+        xml = schtasks.build_task_xml(self.PYTHON, self.APP_ROOT, self.CONFIG, self.USER_ID, self.STATE_DIR,
+                                      exists=exists)
         self.assertIn('encoding="UTF-16"', xml.splitlines()[0])
         return ET.fromstring(xml.encode("utf-16"))
 
@@ -89,6 +117,16 @@ class TestBuildTaskXml(unittest.TestCase):
         self.assertEqual(principal.find(NS + "UserId").text, self.USER_ID)
         self.assertEqual(principal.find(NS + "LogonType").text, "InteractiveToken")
         self.assertEqual(principal.find(NS + "RunLevel").text, "LeastPrivilege")
+
+    def test_trigger_repeats_every_5_minutes_indefinitely(self):
+        # A daemon that merely exits (config error, Orca gate, crash) is not a launch failure, so
+        # RestartOnFailure alone never revives it; Repetition is what gets it back within 5 minutes.
+        root = self.build(exists=lambda p: False)
+        rep = root.find(NS + "Triggers/" + NS + "LogonTrigger/" + NS + "Repetition")
+        self.assertIsNotNone(rep)
+        self.assertEqual(rep.find(NS + "Interval").text, "PT5M")
+        self.assertIsNone(rep.find(NS + "Duration"))  # absent Duration: repeats indefinitely
+        self.assertEqual(rep.find(NS + "StopAtDurationEnd").text, "false")
 
     def test_settings(self):
         root = self.build(exists=lambda p: False)
@@ -105,8 +143,8 @@ class TestBuildTaskXml(unittest.TestCase):
     def test_action_falls_back_to_python_exe_without_pythonw(self):
         root = self.build(exists=lambda p: False)
         exe = root.find(NS + "Actions/" + NS + "Exec")
-        self.assertEqual(exe.find(NS + "Command").text, self.PYTHON)
-        self.assertEqual(exe.find(NS + "WorkingDirectory").text, self.APP_ROOT)
+        self.assertEqual(exe.find(NS + "Command").text, '"%s"' % self.PYTHON)
+        self.assertEqual(exe.find(NS + "WorkingDirectory").text, self.STATE_DIR)
         args = exe.find(NS + "Arguments").text
         self.assertIn(os.path.join(self.APP_ROOT, "bin", "rotator"), args)
         self.assertIn("daemon", args)
@@ -117,13 +155,13 @@ class TestBuildTaskXml(unittest.TestCase):
         pythonw = os.path.join(os.path.dirname(self.PYTHON), "pythonw.exe")
         root = self.build(exists=lambda p: p == pythonw)
         exe = root.find(NS + "Actions/" + NS + "Exec")
-        self.assertEqual(exe.find(NS + "Command").text, pythonw)
+        self.assertEqual(exe.find(NS + "Command").text, '"%s"' % pythonw)
 
     def test_ampersand_and_spaces_survive_the_round_trip(self):
         # "Test & User" and the spaces must read back exactly: escape() must have been applied, and nothing more.
         root = self.build(exists=lambda p: False)
         self.assertEqual(root.find(NS + "Principals/" + NS + "Principal/" + NS + "UserId").text, self.USER_ID)
-        self.assertIn(self.APP_ROOT, root.find(NS + "Actions/" + NS + "Exec/" + NS + "WorkingDirectory").text)
+        self.assertEqual(root.find(NS + "Actions/" + NS + "Exec/" + NS + "WorkingDirectory").text, self.STATE_DIR)
 
 
 # --- query_installed / install_stale --------------------------------------------------------------------
@@ -180,14 +218,27 @@ class InstallBase(unittest.TestCase):
         self.app = os.path.join(self.state, "app")
         self.task_xml = os.path.join(self.state, schtasks.TASK_XML_FILENAME)
         self.commit = "abc1234"
+        self.clock = FakeClock()
+
+    def lock_path(self, state_dir=None):
+        return os.path.join(state_dir or self.state, daemon.LOCK_FILENAME)
 
     def install(self, runner, **kw):
+        if isinstance(runner, FakeRunner) and runner.lock_path is None:
+            runner.lock_path = self.lock_path(kw.get("state_dir"))
         args = dict(runner=runner, python_exe=r"C:\Python39\python.exe", source_root=self.source,
                     state_dir=self.state, config_path=r"C:\Users\test\config.json",
-                    commit_of=lambda root: self.commit, now=lambda: COPIED_AT,
-                    environ={"USERDOMAIN": "EXAMPLE", "USERNAME": "test"})
+                    commit_of=lambda root: self.commit, now=lambda: COPIED_AT, timeouts=Timeouts(),
+                    environ={"USERDOMAIN": "EXAMPLE", "USERNAME": "test"},
+                    sleep=self.clock.sleep, clock=self.clock.clock)
         args.update(kw)
         return schtasks.install(**args)
+
+    def uninstall(self, runner, **kw):
+        args = dict(runner=runner, state_dir=self.state, timeouts=Timeouts(),
+                    sleep=self.clock.sleep, clock=self.clock.clock)
+        args.update(kw)
+        return schtasks.uninstall(**args)
 
 
 class TestInstall(InstallBase):
@@ -259,6 +310,8 @@ class TestInstall(InstallBase):
 
         def runner(argv, timeout):
             events.append(("run", argv[1]))
+            if argv[1] == "/Run":
+                daemon.try_lock(self.lock_path())  # simulate the daemon starting and taking its lock
             return (0, "", "")
 
         def copy_file(src, dst):
@@ -285,7 +338,7 @@ class TestUninstall(InstallBase):
     def test_uninstalls_when_installed(self):
         self.install(FakeRunner())
         r = FakeRunner()
-        rc, msg = schtasks.uninstall(runner=r, state_dir=self.state)
+        rc, msg = self.uninstall(r)
         self.assertEqual(rc, 0)
         self.assertIn(schtasks.TASK_NAME, msg)
         self.assertEqual(r.verbs(), ["/Query", "/End", "/Delete"])
@@ -294,7 +347,7 @@ class TestUninstall(InstallBase):
 
     def test_not_installed_is_not_an_error(self):
         r = FakeRunner({"/Query": (1, "", "")})
-        rc, msg = schtasks.uninstall(runner=r, state_dir=self.state)
+        rc, msg = self.uninstall(r)
         self.assertEqual(rc, 0)
         self.assertEqual(msg, "not installed")
         self.assertEqual(r.verbs(), ["/Query"])
@@ -302,15 +355,147 @@ class TestUninstall(InstallBase):
     def test_delete_failure_reports_stderr(self):
         self.install(FakeRunner())
         r = FakeRunner({"/Delete": (1, "", "ERROR: Access is denied.")})
-        rc, msg = schtasks.uninstall(runner=r, state_dir=self.state)
+        rc, msg = self.uninstall(r)
         self.assertEqual(rc, 1)
         self.assertIn("Access is denied", msg)
         self.assertTrue(os.path.isdir(self.app))  # the app copy is only removed after a successful delete
 
     def test_uninstall_without_ever_installing(self):
         r = FakeRunner({"/Query": (1, "", "")})
-        rc, msg = schtasks.uninstall(runner=r, state_dir=scratch("never-" + self._testMethodName))
+        rc, msg = self.uninstall(r, state_dir=scratch("never-" + self._testMethodName))
         self.assertEqual((rc, msg), (0, "not installed"))
+
+
+# --- install's post-/Run poll (1c) ----------------------------------------------------------------------
+
+
+class TestInstallWaitsForDaemonStart(InstallBase):
+    def test_reports_error_when_the_daemon_never_takes_the_lock(self):
+        def runner(argv, timeout):  # a plain runner, never grabs the lock -- nothing ever "starts"
+            return (0, "", "")
+        rc, msg = self.install(runner)
+        self.assertEqual(rc, 1)
+        self.assertIn("did not start", msg)
+        self.assertIn(schtasks.LOG_DIR_DEFAULT, msg)
+        self.assertEqual(self.clock.t, schtasks.DAEMON_START_TIMEOUT_S)  # waited the full budget
+        # The probe must not have leaked the lock itself: it is still free afterward.
+        lk = daemon.try_lock(self.lock_path())
+        self.assertIsNotNone(lk)
+        lk.release()
+
+    def test_succeeds_as_soon_as_the_daemon_takes_the_lock(self):
+        rc, _ = self.install(FakeRunner())  # auto-wired: /Run grabs the lock, as a real daemon would
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.clock.t, 0.0)  # held on the very first check: no polling needed
+
+
+# --- graceful stop before /End (finding 2) --------------------------------------------------------------
+
+
+class TestGracefulStop(InstallBase):
+    def stop_request_path(self):
+        return os.path.join(self.state, daemon.STOP_REQUEST_FILENAME)
+
+    def test_install_writes_the_request_and_removes_it_after_end(self):
+        seen = {}
+
+        def runner(argv, timeout):
+            if argv[1] == "/End":
+                seen["present_at_end"] = os.path.isfile(self.stop_request_path())
+            if argv[1] == "/Run":
+                daemon.try_lock(self.lock_path())
+            return (0, "", "")
+
+        rc, _ = self.install(runner)
+        self.assertEqual(rc, 0)
+        self.assertTrue(seen["present_at_end"])
+        self.assertFalse(os.path.isfile(self.stop_request_path()))
+
+    def test_install_proceeds_as_soon_as_an_already_running_daemon_frees_the_lock(self):
+        lk = daemon.try_lock(self.lock_path())
+        self.assertIsNotNone(lk)
+        released_after = 3
+        real_sleep = self.clock.sleep
+
+        def sleep(seconds):
+            real_sleep(seconds)
+            if len(self.clock.sleeps) == released_after:
+                lk.release()
+        self.clock.sleep = sleep
+
+        def runner(argv, timeout):
+            if argv[1] == "/Run":
+                daemon.try_lock(self.lock_path())
+            return (0, "", "")
+
+        rc, _ = self.install(runner)
+        self.assertEqual(rc, 0)
+        full_budget = launchd.exit_timeout_for(Timeouts())
+        self.assertLess(self.clock.t, full_budget)  # stopped well short of the full wait, not a fixed sleep
+
+    def test_uninstall_falls_back_to_end_after_the_full_wait(self):
+        lk = daemon.try_lock(self.lock_path())
+        self.assertIsNotNone(lk)
+        self.addCleanup(lambda: lk.release())
+        order = []
+
+        def runner(argv, timeout):
+            order.append(argv[1])
+            return (0, "", "")
+
+        timeouts = Timeouts()
+        rc, msg = self.uninstall(runner, timeouts=timeouts)
+        self.assertEqual(rc, 0)
+        self.assertEqual(order, ["/Query", "/End", "/Delete"])  # /End still runs, as a fallback
+        self.assertEqual(self.clock.t, launchd.exit_timeout_for(timeouts))  # waited the full budget first
+        self.assertFalse(os.path.isfile(self.stop_request_path()))  # removed whether or not the wait succeeded
+
+    def test_uninstall_skips_the_request_when_nothing_is_installed(self):
+        r = FakeRunner({"/Query": (1, "", "")})
+        rc, msg = self.uninstall(r)
+        self.assertEqual((rc, msg), (0, "not installed"))
+        self.assertEqual(r.verbs(), ["/Query"])  # no stop-request write, no /End
+        self.assertFalse(os.path.isfile(self.stop_request_path()))
+
+
+# --- run_schtasks (finding 7 and the Windows half of finding 5) ------------------------------------------
+
+
+class TestRunSchtasks(unittest.TestCase):
+    def test_oserror_is_caught(self):
+        with mock.patch.object(schtasks.subprocess, "run", side_effect=OSError("no such file")):
+            rc, out, err = schtasks.run_schtasks(["schtasks.exe", "/Query"], 5.0)
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("no such file", err)
+
+    def test_timeout_still_returns_124(self):
+        with mock.patch.object(schtasks.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired(cmd="schtasks", timeout=5.0)):
+            rc, out, err = schtasks.run_schtasks(["schtasks.exe"], 5.0)
+        self.assertEqual((rc, out, err), (124, "", "timeout"))
+
+    def test_none_output_is_coerced_to_empty_string(self):
+        cp = mock.Mock(returncode=0, stdout=None, stderr=None)
+        with mock.patch.object(schtasks.subprocess, "run", return_value=cp):
+            rc, out, err = schtasks.run_schtasks(["schtasks.exe"], 5.0)
+        self.assertEqual((rc, out, err), (0, "", ""))
+        err.strip()  # must not raise AttributeError on None
+
+    def test_creationflags_applied_only_when_windows(self):
+        captured = []
+
+        def fake_run(argv, **kw):
+            captured.append(kw.get("creationflags"))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(schtasks.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True):
+            with mock.patch.object(schtasks, "IS_WINDOWS", True):
+                schtasks.run_schtasks(["schtasks.exe"], 5.0)
+            with mock.patch.object(schtasks, "IS_WINDOWS", False):
+                schtasks.run_schtasks(["schtasks.exe"], 5.0)
+        self.assertEqual(captured, [0x08000000, 0])
 
 
 if __name__ == "__main__":

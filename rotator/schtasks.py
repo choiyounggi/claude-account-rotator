@@ -14,16 +14,23 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone
 from typing import Callable, List, Mapping, Optional, Tuple
 from xml.sax.saxutils import escape
 
-from rotator import launchd
+from rotator import daemon, launchd
+from rotator.config import LOG_DIR_DEFAULT
+from rotator.switcher import Timeouts
+from rotator.windows import IS_WINDOWS
 
 TASK_NAME = "claude-account-rotator"
 TASK_XML_FILENAME = "task.xml"
 QUERY_TIMEOUT_S = 30.0
 CREATE_TIMEOUT_S = 30.0
+# How long install() waits, after /Run, for the daemon to take its lock before reporting it never started.
+DAEMON_START_TIMEOUT_S = 10.0
+LOCK_POLL_INTERVAL_S = 0.5
 
 Runner = Callable[[List[str], float], Tuple[int, str, str]]
 
@@ -35,12 +42,17 @@ def schtasks_exe(environ: Mapping[str, str] = os.environ) -> str:
 
 
 def run_schtasks(argv: List[str], timeout_s: float) -> Tuple[int, str, str]:
-    """The real schtasks runner."""
+    """The real schtasks runner. ``creationflags`` suppresses the console schtasks.exe would otherwise flash
+    under pythonw.exe; ``errors="replace"`` keeps output that fails to decode from coming back as None, which
+    would make a later ``.strip()`` raise."""
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+        p = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout_s,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0)
     except subprocess.TimeoutExpired:
         return (124, "", "timeout")
-    return (p.returncode, p.stdout, p.stderr)
+    except OSError as e:
+        return (1, "", "%s: %s" % (type(e).__name__, e))
+    return (p.returncode, p.stdout or "", p.stderr or "")
 
 
 def _user_id(environ: Mapping[str, str]) -> Optional[str]:
@@ -53,19 +65,28 @@ def _user_id(environ: Mapping[str, str]) -> Optional[str]:
     return "%s\\%s" % (domain, username) if domain else username
 
 
-def build_task_xml(python_exe: str, app_root: str, config_path: str, user_id: str, *,
+def build_task_xml(python_exe: str, app_root: str, config_path: str, user_id: str, state_dir: str, *,
                    exists: Callable[[str], bool] = os.path.isfile) -> str:
-    """Task Scheduler schema 1.2 XML: a LogonTrigger for ``user_id``, an InteractiveToken/LeastPrivilege
-    principal, and an Exec action that runs the daemon with no console window.
+    """Task Scheduler schema 1.2 XML: a LogonTrigger for ``user_id`` that repeats every 5 minutes so a daemon
+    that merely exits (a config error, the Orca gate, a crash -- none of which is a launch failure) is revived
+    instead of staying dead until the next logon; an InteractiveToken/LeastPrivilege principal; and an Exec
+    action that runs the daemon with no console window.
 
-    Every value is escaped; the result must be written as UTF-16 with a BOM (``_write_task_xml``), which is
-    what the declared ``encoding="UTF-16"`` promises and what ``schtasks /XML`` reliably accepts.
+    ``WorkingDirectory`` is ``state_dir``, not the app copy: Windows refuses to rename a running process's
+    current working directory, and the app copy under ``state_dir`` is exactly what install() renames.
+
+    Every value is escaped; ``Command`` is additionally wrapped in literal double quotes so a path containing a
+    space (``C:\\Program Files\\...``) does not split into two tokens -- ``escape()`` does not touch ``"`` in
+    element text, so the quotes survive verbatim. The result must be written as UTF-16 with a BOM
+    (``_write_task_xml``), which is what the declared ``encoding="UTF-16"`` promises and what ``schtasks /XML``
+    reliably accepts.
     """
     pythonw = os.path.join(os.path.dirname(python_exe), "pythonw.exe")
     command = pythonw if exists(pythonw) else python_exe
     entry = os.path.join(app_root, "bin", "rotator")
     args = subprocess.list2cmdline([entry, "daemon", "--config", config_path])
-    uid, cmd, arglist, cwd = escape(user_id), escape(command), escape(args), escape(app_root)
+    uid, cmd = escape(user_id), escape('"%s"' % command)
+    arglist, cwd = escape(args), escape(state_dir)
     return (
         '<?xml version="1.0" encoding="UTF-16"?>\n'
         '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
@@ -73,6 +94,10 @@ def build_task_xml(python_exe: str, app_root: str, config_path: str, user_id: st
         '    <LogonTrigger>\n'
         '      <Enabled>true</Enabled>\n'
         '      <UserId>%(uid)s</UserId>\n'
+        '      <Repetition>\n'
+        '        <Interval>PT5M</Interval>\n'
+        '        <StopAtDurationEnd>false</StopAtDurationEnd>\n'
+        '      </Repetition>\n'
         '    </LogonTrigger>\n'
         '  </Triggers>\n'
         '  <Principals>\n'
@@ -141,10 +166,51 @@ def install_stale(runner: Runner, state_dir: str, source_root: str,
         return False
 
 
+def _lock_is_free(lock_path: str) -> bool:
+    """True when the daemon's lock can be taken (so nothing holds it); releases it immediately when it can,
+    per daemon.try_lock's own contract."""
+    lk = daemon.try_lock(lock_path)
+    if lk is None:
+        return False
+    lk.release()
+    return True
+
+
+def _poll_until(condition: Callable[[], bool], timeout_s: float, *, sleep: Callable[[float], None],
+                clock: Callable[[], float], interval_s: float = LOCK_POLL_INTERVAL_S) -> bool:
+    """True once ``condition()`` is true (checked immediately, then every ``interval_s``); False if it never
+    becomes true within ``timeout_s``."""
+    deadline = clock() + timeout_s
+    while True:
+        if condition():
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(interval_s)
+
+
+def _stop_daemon(runner: Runner, sch: str, state_dir: str, timeout_s: float, *,
+                 sleep: Callable[[float], None], clock: Callable[[], float]) -> None:
+    """Ask a running daemon to exit on its own -- writing ``<state_dir>/stop-request``, which it polls for --
+    and wait up to ``timeout_s`` for its lock to free up, so a token refresh in flight can finish and write
+    instead of being killed mid-write by ``/End`` (TerminateProcess). ``/End`` still runs as a fallback
+    afterward either way (its rc is ignored, as before this existed: fine whether or not an instance was ever
+    running), and the request file is removed whether or not the wait succeeded.
+    """
+    stop_path = os.path.join(state_dir, daemon.STOP_REQUEST_FILENAME)
+    daemon.atomic_write_text(stop_path, "%s\n" % _utc_now().isoformat())
+    lock_path = os.path.join(state_dir, daemon.LOCK_FILENAME)
+    _poll_until(lambda: _lock_is_free(lock_path), timeout_s, sleep=sleep, clock=clock)
+    runner([sch, "/End", "/TN", TASK_NAME], QUERY_TIMEOUT_S)  # ignore rc: fine whether or not it was running
+    with contextlib.suppress(OSError):
+        os.remove(stop_path)
+
+
 def install(*, runner: Runner, python_exe: str, source_root: str, state_dir: str, config_path: str,
-            commit_of: Callable[[str], Optional[str]] = launchd.source_commit,
+            timeouts: Timeouts, commit_of: Callable[[str], Optional[str]] = launchd.source_commit,
             now: Callable[[], datetime] = _utc_now, copy_file: launchd.CopyFile = shutil.copyfile,
-            environ: Mapping[str, str] = os.environ) -> Tuple[int, str]:
+            environ: Mapping[str, str] = os.environ, sleep: Callable[[float], None] = time.sleep,
+            clock: Callable[[], float] = time.monotonic) -> Tuple[int, str]:
     """Copy the app out of ``source_root``, write the task XML and register it; returns (exit code, message).
 
     Nothing is written when USERNAME is missing or the app copy fails."""
@@ -154,16 +220,16 @@ def install(*, runner: Runner, python_exe: str, source_root: str, state_dir: str
     sch = schtasks_exe(environ)
     # Before touching the app directory: unlike POSIX rename(), Windows refuses to rename/replace a directory
     # that is a running process's current working directory -- and that directory is exactly what the task's
-    # WorkingDirectory points a running instance at. Ending it first is what makes a reinstall over an already
-    # running daemon (the normal upgrade path) succeed instead of failing every time with a copy error.
-    runner([sch, "/End", "/TN", TASK_NAME], QUERY_TIMEOUT_S)  # ignore rc: fine whether or not it was running
+    # WorkingDirectory points a running instance at. Stopping it first is what makes a reinstall over an
+    # already running daemon (the normal upgrade path) succeed instead of failing every time with a copy error.
+    _stop_daemon(runner, sch, state_dir, launchd.exit_timeout_for(timeouts), sleep=sleep, clock=clock)
     commit = commit_of(source_root) or launchd.UNKNOWN_COMMIT
     try:
         app_root = launchd.copy_app(source_root, state_dir, commit=commit, copied_at=now(), copy_file=copy_file)
     except (launchd.AppCopyError, OSError) as e:
         return (1, "app copy failed: %s" % (e if isinstance(e, launchd.AppCopyError)
                                             else "%s (%s)" % (type(e).__name__, e)))
-    xml = build_task_xml(python_exe, app_root, config_path, user_id)
+    xml = build_task_xml(python_exe, app_root, config_path, user_id, state_dir)
     task_xml_path = os.path.join(state_dir, TASK_XML_FILENAME)
     _write_task_xml(task_xml_path, xml)
     rc, _, err = runner([sch, "/Create", "/TN", TASK_NAME, "/XML", task_xml_path, "/F"], CREATE_TIMEOUT_S)
@@ -172,19 +238,25 @@ def install(*, runner: Runner, python_exe: str, source_root: str, state_dir: str
     rc, _, err = runner([sch, "/Run", "/TN", TASK_NAME], QUERY_TIMEOUT_S)
     if rc != 0:
         return (1, "schtasks /Run failed: %s" % err.strip())
+    lock_path = os.path.join(state_dir, daemon.LOCK_FILENAME)
+    started = _poll_until(lambda: not _lock_is_free(lock_path), DAEMON_START_TIMEOUT_S, sleep=sleep, clock=clock)
+    if not started:
+        return (1, "task registered but the daemon did not start; see %s" % LOG_DIR_DEFAULT)
     rc, _, err = runner([sch, "/Query", "/TN", TASK_NAME], QUERY_TIMEOUT_S)
     if rc != 0:
         return (1, "schtasks /Query does not show %s after /Create: %s" % (TASK_NAME, err.strip()))
     return (0, "installed %s (%s); app copy %s at %s" % (TASK_NAME, task_xml_path, app_root, commit))
 
 
-def uninstall(*, runner: Runner, state_dir: str, environ: Mapping[str, str] = os.environ) -> Tuple[int, str]:
+def uninstall(*, runner: Runner, state_dir: str, timeouts: Timeouts,
+             environ: Mapping[str, str] = os.environ, sleep: Callable[[float], None] = time.sleep,
+             clock: Callable[[], float] = time.monotonic) -> Tuple[int, str]:
     """End and delete the task (if registered), then remove the app copy and task.xml. Returns (0, "not
     installed") when the task was never registered -- that is not an error."""
     sch = schtasks_exe(environ)
     rc, _, _ = runner([sch, "/Query", "/TN", TASK_NAME], QUERY_TIMEOUT_S)
     if rc == 0:
-        runner([sch, "/End", "/TN", TASK_NAME], QUERY_TIMEOUT_S)  # ignore rc: it may already be stopped
+        _stop_daemon(runner, sch, state_dir, launchd.exit_timeout_for(timeouts), sleep=sleep, clock=clock)
         rc2, _, err2 = runner([sch, "/Delete", "/TN", TASK_NAME, "/F"], QUERY_TIMEOUT_S)
         if rc2 != 0:
             return (1, "schtasks /Delete failed: %s" % err2.strip())

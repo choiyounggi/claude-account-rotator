@@ -1,4 +1,5 @@
 import os
+import subprocess
 import unittest
 from unittest import mock
 
@@ -75,6 +76,17 @@ class TestOrcaVersionWindows(unittest.TestCase):
     def test_run_failure_is_none(self):
         run = mock.Mock(side_effect=OSError("not found"))
         self.assertIsNone(doctor.orca_version_windows(r"C:\orca.exe", run=run))
+
+    def test_creationflags_applied_only_when_windows(self):
+        # cmd.exe would otherwise flash a console under pythonw.exe at every daemon start.
+        run = mock.Mock(return_value=mock.Mock(returncode=0, stdout="1.4.241\n"))
+        with mock.patch.object(subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True):
+            with mock.patch.object(doctor, "IS_WINDOWS", True):
+                doctor.orca_version_windows(r"C:\orca.exe", run=run)
+            self.assertEqual(run.call_args.kwargs["creationflags"], 0x08000000)
+            with mock.patch.object(doctor, "IS_WINDOWS", False):
+                doctor.orca_version_windows(r"C:\orca.exe", run=run)
+            self.assertEqual(run.call_args.kwargs["creationflags"], 0)
 
 
 class TestOtherChecks(unittest.TestCase):

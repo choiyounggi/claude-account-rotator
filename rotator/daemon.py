@@ -40,6 +40,11 @@ Identity = Tuple[int, str, Optional[str]]
 LEASE_MARGIN_S = 30.0
 STATE_FILENAME = "state.json"
 LOCK_FILENAME = "daemon.lock"
+# Windows only (see run_daemon/_watch_stop_request): a graceful-stop signal schtasks.install/uninstall write
+# before falling back to schtasks /End (TerminateProcess), which could otherwise kill a token refresh between
+# the token response and the write.
+STOP_REQUEST_FILENAME = "stop-request"
+STOP_REQUEST_POLL_S = 1.0
 SESSIONS_DIRNAME = "sessions"
 BACKUPS_DIRNAME = "backups"
 LOCKS_DIRNAME = "locks"
@@ -259,6 +264,7 @@ class Deps:
     lock: Callable[[str], Optional["FileLock"]]
     read_text: Callable[[str], str]
     write_text: Callable[[str, str], None]
+    unlink: Callable[[str], None]
     list_dir: Callable[[str], List[str]]
     isdir: Callable[[str], bool]
     pid_alive: Callable[[int], bool]
@@ -1555,8 +1561,18 @@ def run_daemon(cfg: Config, deps: Deps) -> int:
     held_logged = False
     try:
         lk.write_owner(os.getpid())
+        # Clear a stop-request left by a previous run: without this, a stale file from the last graceful
+        # stop (schtasks.install/uninstall) would make a freshly (re)started daemon stop itself right away.
+        deps.unlink(os.path.join(cfg.state_dir, STOP_REQUEST_FILENAME))
         d = Daemon(cfg, deps, log)
         deps.install_signals(d.request_stop)
+        if IS_WINDOWS:
+            stop_request_path = os.path.join(cfg.state_dir, STOP_REQUEST_FILENAME)
+            try:
+                deps.spawn(lambda: _watch_stop_request(deps, d._stop, stop_request_path, d.request_stop),
+                          "rotator-stop-watch")
+            except Exception as e:
+                log.error("event=stop_watch_spawn_error exc=%s", type(e).__name__)
         d._load_state()
         log.info("event=daemon_start pid=%d dry_run=%s auto_switch=%s pointer_correction=%s",
                  os.getpid(), cfg.dry_run, cfg.auto_switch, cfg.pointer_correction)
@@ -1596,6 +1612,23 @@ def _spawn(fn: Callable[[], None], name: str) -> threading.Thread:
 
 def _wait_stop(event: threading.Event, timeout: float) -> bool:
     return event.wait(timeout)
+
+
+def _watch_stop_request(deps: Deps, stop_event: threading.Event, path: str,
+                        request_stop: Callable[[], None]) -> None:
+    """Windows only (see run_daemon): calls ``request_stop`` once ``path`` exists, polling every
+    STOP_REQUEST_POLL_S. schtasks.install/uninstall write that file to ask the daemon to exit on its own --
+    draining in-flight token writes -- before falling back to ``/End`` (TerminateProcess)."""
+    while not stop_event.is_set():
+        try:
+            deps.read_text(path)
+        except Exception:
+            pass
+        else:
+            request_stop()
+            return
+        if deps.wait_stop(stop_event, STOP_REQUEST_POLL_S):
+            return
 
 
 def _pid_alive(pid: object) -> bool:
@@ -1643,6 +1676,6 @@ def real_deps(cfg: Config) -> Deps:
                 make_driver=switcher.OrcaCliDriver, procs=switcher.OsProcessProbe(),
                 read_pointer=pointer.read_selected_host, write_pointer=pointer.set_selected_host,
                 now=_utc_now, monotonic=time.monotonic, spawn=_spawn, wait_stop=_wait_stop, lock=try_lock,
-                read_text=_read_text_utf8, write_text=atomic_write_text, list_dir=os.listdir,
+                read_text=_read_text_utf8, write_text=atomic_write_text, unlink=_unlink_quiet, list_dir=os.listdir,
                 isdir=os.path.isdir, pid_alive=_pid_alive, install_signals=_install_signals,
                 make_logger=_make_logger)
