@@ -727,6 +727,22 @@ class TestOsProcessProbe(unittest.TestCase):
         self.assertIs(p._kill, os.kill)
         self.assertIs(p._run, sw._run_subprocess)
 
+    def test_default_kill_never_calls_os_kill_directly(self):
+        # The untouched default routes through the cross-platform check instead: on Windows, signal 0
+        # is CTRL_C_EVENT, not a liveness probe.
+        calls = []
+        with mock.patch.object(sw, "_cross_platform_pid_alive", lambda pid: calls.append(pid) or True), \
+                mock.patch("os.kill", side_effect=AssertionError("os.kill must not be called")):
+            self.assertIs(OsProcessProbe().is_alive(42), True)
+        self.assertEqual(calls, [42])
+
+    def test_injected_kill_keeps_the_signal_0_behaviour(self):
+        kill, calls = self._kill()
+        with mock.patch.object(sw, "_cross_platform_pid_alive",
+                               side_effect=AssertionError("must not be used with an injected kill")):
+            self.assertIs(OsProcessProbe(kill=kill).is_alive(42), True)
+        self.assertEqual(calls, [(42, 0)])
+
 
 # ---------------------------------------------------------------- Task 06
 

@@ -416,6 +416,53 @@ class CredentialTest(unittest.TestCase):
         self.assertEqual(cred.access_token, TOKEN)
 
 
+class CredentialWindowsTest(unittest.TestCase):
+    """Windows has no Keychain: read_credential reads <home>/.credentials.json instead (is_windows is
+    injectable so this runs on any OS)."""
+
+    def _read_text(self, mapping):
+        def rt(path):
+            try:
+                return mapping[path]
+            except KeyError:
+                raise FileNotFoundError(path) from None
+        return rt
+
+    def test_reads_the_credentials_file_under_home(self):
+        expected_path = os.path.join(CRED_HOME, ".credentials.json")
+        cred = read_credential(CRED_PROFILE, is_windows=True,
+                               read_text=self._read_text({expected_path: cred_json()}))
+        self.assertIsInstance(cred, Credential)
+        self.assertEqual(cred.access_token, TOKEN)
+        self.assertEqual(cred.expires_at_ms, EXP)
+
+    def test_missing_file_is_none(self):
+        self.assertIsNone(read_credential(CRED_PROFILE, is_windows=True, read_text=self._read_text({})))
+
+    def test_bad_json_is_none(self):
+        expected_path = os.path.join(CRED_HOME, ".credentials.json")
+        rt = self._read_text({expected_path: "not json"})
+        self.assertIsNone(read_credential(CRED_PROFILE, is_windows=True, read_text=rt))
+
+    def test_never_touches_the_keychain_seam(self):
+        kc = FakeKeychain(value=cred_json())
+        expected_path = os.path.join(CRED_HOME, ".credentials.json")
+        cred = read_credential(CRED_PROFILE, is_windows=True, keychain=kc,
+                               read_text=self._read_text({expected_path: cred_json()}))
+        self.assertIsNotNone(cred)
+        self.assertEqual(kc.services, [])  # the macOS seam is never called on the Windows branch
+
+    def test_default_read_text_seam(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = os.path.join(d, "home")
+            os.makedirs(home)
+            with open(os.path.join(home, ".credentials.json"), "w", encoding="utf-8") as f:
+                f.write(cred_json())
+            profile = Profile(account_id=ACC1, home=home, keychain_service=keychain_service_for(home))
+            cred = read_credential(profile, is_windows=True)
+        self.assertEqual(cred.access_token, TOKEN)
+
+
 class DefaultKeychainSeamTest(unittest.TestCase):
     def test_default_keychain_seam_argv(self):
         with unittest.mock.patch("rotator.accounts.subprocess.run", return_value=fake_run(0, cred_json() + "\n")) as run:

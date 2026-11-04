@@ -12,11 +12,15 @@ from typing import Any, Dict, Optional
 from rotator.models import PROFILES_ROOT_DEFAULT, ReadText
 from rotator.policy import WEEKLY_TO_5H_RATIO_DEFAULT, WEEKLY_TO_5H_RATIO_MAX, PolicyConfig
 from rotator.switcher import DEFAULT_CONTINUE_PROMPT, MAX_PROMPT_CHARS, Timeouts
+from rotator.windows import IS_WINDOWS, rotator_config_dir, rotator_log_dir
 
-CONFIG_DIR_DEFAULT = os.path.expanduser("~/Library/Application Support/claude-account-rotator")
+CONFIG_DIR_DEFAULT = (
+    rotator_config_dir() if IS_WINDOWS
+    else os.path.expanduser("~/Library/Application Support/claude-account-rotator")
+)
 CONFIG_FILENAME = "config.json"
 CONFIG_PATH_DEFAULT = os.path.join(CONFIG_DIR_DEFAULT, CONFIG_FILENAME)
-LOG_DIR_DEFAULT = os.path.expanduser("~/Library/Logs/claude-account-rotator")
+LOG_DIR_DEFAULT = rotator_log_dir() if IS_WINDOWS else os.path.expanduser("~/Library/Logs/claude-account-rotator")
 # Must stay below the policy's stale_max_age so a polled account never turns stale between fetches.
 MIN_USAGE_POLL_S = 15.0
 

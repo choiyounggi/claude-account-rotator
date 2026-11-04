@@ -2187,5 +2187,29 @@ class TestWarmUpReal(TripwireCase):
         self.assertLess(time.monotonic() - t, 10)
 
 
+class TestDefaultKillpg(TripwireCase):
+    """run_claude_quiet's killpg default must not crash evaluating os.killpg at import time on
+    Windows (it has no process groups); it is unreachable there this release (refresh/daemon stay
+    macOS-only, the CLI refuses those commands first), but it must still resolve safely."""
+
+    def test_uses_os_killpg_when_present(self):
+        calls = []
+        with mock.patch.object(refresh.os, "killpg", lambda pid, sig: calls.append((pid, sig)), create=True):
+            refresh._default_killpg(123, 9)
+        self.assertEqual(calls, [(123, 9)])
+
+    def test_falls_back_to_os_kill_without_os_killpg(self):
+        calls = []
+        with mock.patch.object(refresh.os, "killpg", None, create=True), \
+                mock.patch.object(refresh.os, "kill", lambda pid, sig: calls.append((pid, sig))):
+            refresh._default_killpg(123, 9)
+        self.assertEqual(calls, [(123, 9)])
+
+    def test_is_the_real_default_of_run_claude_quiet(self):
+        import inspect
+        sig = inspect.signature(refresh.run_claude_quiet)
+        self.assertIs(sig.parameters["killpg"].default, refresh._default_killpg)
+
+
 if __name__ == "__main__":
     unittest.main()

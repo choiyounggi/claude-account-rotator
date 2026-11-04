@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Tuple
 
 from rotator.models import PROFILES_ROOT_DEFAULT, Profile, ReadText, Session
+from rotator.procutil import pid_alive as _cross_platform_pid_alive
 
 logger = logging.getLogger("rotator.switcher")
 
@@ -459,6 +460,11 @@ class OsProcessProbe:
         self._run = _run_subprocess if run is None else run
 
     def is_alive(self, pid: int) -> bool:
+        # The untouched default (os.kill) is routed through the cross-platform check instead of
+        # called directly: on Windows, signal 0 is CTRL_C_EVENT, not a liveness probe. An injected
+        # ``kill`` (tests) keeps the original signal-0 try/except behaviour unchanged.
+        if self._kill is os.kill:
+            return _cross_platform_pid_alive(pid)
         try:
             self._kill(pid, 0)
         except ProcessLookupError:

@@ -16,8 +16,10 @@ import struct
 from datetime import datetime, timezone
 from typing import Callable, Dict, FrozenSet, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
+from rotator import windows as _win
 from rotator.accounts import _read_text_utf8
 from rotator.models import MODEL_RE, Profile, ReadText, Session
+from rotator.procutil import pid_alive as _cross_platform_pid_alive
 
 log = logging.getLogger("rotator.sessions")
 
@@ -131,22 +133,14 @@ def _list_dir(path: str) -> List[str]:
 
 
 def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return False
-    return True
+    return _cross_platform_pid_alive(pid)
 
 
-def _read_proc(pid: int) -> ProcInfo:
+def _read_proc_macos(pid: int) -> ProcInfo:
     return parse_procargs(_sysctl((_CTL_KERN, _KERN_PROCARGS2, pid), _sysctl_int((_CTL_KERN, _KERN_ARGMAX))))
 
 
-def _proc_start(pid: int) -> Optional[datetime]:
+def _proc_start_macos(pid: int) -> Optional[datetime]:
     try:
         raw = _sysctl((_CTL_KERN, _KERN_PROC, _KERN_PROC_PID, pid), _KINFO_BUFSIZE)
     except OSError:
@@ -158,6 +152,17 @@ def _proc_start(pid: int) -> Optional[datetime]:
         return datetime.fromtimestamp(sec + usec / 1e6, tz=timezone.utc)
     except (OverflowError, OSError, ValueError):
         return None
+
+
+def _read_proc(pid: int) -> ProcInfo:
+    """exec_path/argv/env for a live pid: macOS sysctl KERN_PROCARGS2, or rotator.windows.read_proc
+    (exec path only -- Windows cannot read another process's argv/env without elevation)."""
+    return _win.read_proc(pid) if _win.IS_WINDOWS else _read_proc_macos(pid)
+
+
+def _proc_start(pid: int) -> Optional[datetime]:
+    """A live pid's start time: macOS sysctl KERN_PROC, or Windows GetProcessTimes."""
+    return _win.proc_start(pid) if _win.IS_WINDOWS else _proc_start_macos(pid)
 
 
 _PID_MAX = 2147483647
