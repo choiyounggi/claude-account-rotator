@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import plistlib
-import pty
 import re
 import select
 import shutil
@@ -15,13 +14,19 @@ import signal
 import stat
 import subprocess
 import sys
-import termios
 import threading
 import time
 import unittest
 from unittest import mock
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Set
+
+try:
+    import pty
+    import termios
+except ImportError:  # Windows has neither; see TestWindowsTerm for the msvcrt-based equivalent
+    pty = None
+    termios = None
 
 from rotator import cli, daemon, launchd, refresh, switcher
 from rotator.cli import STATUS_KEYS, build_status, main, render
@@ -3162,6 +3167,9 @@ class TestWatchTerminal(MainBase):
                     self.assertEqual(self.run_main("status", out=out), 0)
                 self.assertEqual("\x1b[33m" in self.out.getvalue(), colored)
 
+    @unittest.skipIf(sys.platform == "win32",
+                     "TtyIO has no real console handle, so WindowsTerm cannot enable VT mode here; "
+                     "see TestWindowsTerm for the Windows ANSI/fallback behaviour")
     def test_real_tty_watch_uses_alt_screen(self):
         self.stop_after(2)
         os.environ.pop("NO_COLOR", None)
@@ -3178,6 +3186,7 @@ class TestWatchTerminal(MainBase):
         self.addCleanup(os.close, slave)
         return os.fdopen(slave, "rb", buffering=0, closefd=False)
 
+    @unittest.skipIf(sys.platform == "win32", "pty is POSIX-only; the Windows key reader uses msvcrt")
     def test_tty_stdin_wires_real_key_reader(self):
         os.environ.pop("NO_COLOR", None)
         stdin = self.pty_stdin()
@@ -3190,6 +3199,7 @@ class TestWatchTerminal(MainBase):
         self.assertIs(rk.call_args.args[0].inp, stdin)
         self.assertEqual(self.env.waits, [])  # keys, not wait_stop, pace the frames
 
+    @unittest.skipIf(sys.platform == "win32", "pty is POSIX-only; the Windows key reader uses msvcrt")
     def test_stdin_defaults_to_sys_stdin_only_without_injected_stdout(self):
         stdin = self.pty_stdin()
         out = TtyIO()
@@ -3221,6 +3231,7 @@ class TestWatchTerminal(MainBase):
         self.assertIn("--ascii", self.out.getvalue())
 
 
+@unittest.skipIf(sys.platform == "win32", "pty/termios are POSIX-only; see TestWindowsTerm for the Windows console")
 class TestRealTerm(unittest.TestCase):
     def setUp(self):
         self.master, self.slave = pty.openpty()
@@ -3328,6 +3339,64 @@ class TestRealTerm(unittest.TestCase):
         self.assertFalse(cli.RealTerm(self.out, None).probe_ambiguous_wide())
 
 
+class FakeFdOut(io.StringIO):
+    """A writable stream that claims a real fd, so WindowsTerm's enable_vt_mode path is reachable."""
+
+    def __init__(self, fd=7):
+        super().__init__()
+        self._fd = fd
+
+    def fileno(self):
+        return self._fd
+
+
+class TestWindowsTerm(unittest.TestCase):
+    """cli.WindowsTerm: msvcrt keys and VT-mode ANSI, with a plain fallback when VT mode cannot be enabled
+    (e.g. an old console or a non-console stream) -- exercised through fakes on any OS."""
+
+    def test_enter_leave_alt_write_ansi_when_vt_mode_succeeds(self):
+        out = FakeFdOut()
+        t = cli.WindowsTerm(out, None)
+        with mock.patch.object(cli._win, "enable_vt_mode", return_value=True):
+            t.hide_cursor()  # no-op before enter_alt: VT mode is not known yet
+            t.enter_alt()
+            t.hide_cursor()
+            t.show_cursor()
+            t.leave_alt()
+        self.assertEqual(out.getvalue(), "\x1b[?1049h\x1b[?25l\x1b[?25h\x1b[?1049l")
+
+    def test_no_ansi_when_vt_mode_fails(self):
+        out = FakeFdOut()
+        t = cli.WindowsTerm(out, None)
+        with mock.patch.object(cli._win, "enable_vt_mode", return_value=False):
+            t.enter_alt()
+            t.hide_cursor()
+            t.show_cursor()
+            t.leave_alt()
+        self.assertEqual(out.getvalue(), "")
+
+    def test_no_ansi_without_a_real_fd(self):
+        t = cli.WindowsTerm(io.StringIO(), None)  # plain StringIO: fileno() raises
+        t.enter_alt()
+        self.assertEqual(t.out.getvalue(), "")
+
+    def test_read_key_uses_msvcrt_on_a_tty(self):
+        t = cli.WindowsTerm(io.StringIO(), TtyIO())
+        with mock.patch.object(cli._win, "read_key_msvcrt", return_value="q") as rk:
+            self.assertEqual(t.read_key(1.5), "q")
+        rk.assert_called_once_with(1.5)
+
+    def test_read_key_without_a_tty_sleeps(self):
+        t = cli.WindowsTerm(io.StringIO(), io.StringIO())  # not a tty
+        with mock.patch.object(cli.time, "sleep") as sleep:
+            self.assertIsNone(t.read_key(0.3))
+        sleep.assert_called_once_with(0.3)
+
+    def test_probe_ambiguous_wide_is_always_false(self):
+        self.assertFalse(cli.WindowsTerm(io.StringIO(), None).probe_ambiguous_wide())
+
+
+@unittest.skipIf(sys.platform == "win32", "daemon is macOS-only in this release; it refuses cleanly on Windows (see TestWindowsUnsupportedCommands)")
 class TestDaemonCommand(MainBase):
     def test_daemon_dry_run_forces_flag(self):
         self.env.held = {os.path.join(self.state_dir, "daemon.lock")}
@@ -3346,6 +3415,7 @@ class _FinishedWorker:
         return False
 
 
+@unittest.skipIf(sys.platform == "win32", "daemon/switch are macOS-only in this release; they refuse cleanly on Windows (see TestWindowsUnsupportedCommands)")
 class TestCrossConfigContention(MainBase):
     """A daemon and a CLI started with different --config paths must contend on the same locks."""
 
@@ -3405,6 +3475,9 @@ class TestInstallWiring(unittest.TestCase):
         self.assertEqual(kw["timeouts"], Timeouts())
         self.assertNotIn("repo_root", kw)
 
+    @unittest.skipIf(sys.platform == "win32",
+                     "install/uninstall are macOS-only in this release; they refuse cleanly on Windows "
+                     "(see TestWindowsUnsupportedCommands)")
     def test_main_passes_state_dir_to_install_and_uninstall(self):
         seen = {}
 
@@ -3441,6 +3514,26 @@ class TestBinEntrypoint(unittest.TestCase):
             self.assertIn(name, p.stdout)
 
 
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
+class TestRotatorCjsLauncher(unittest.TestCase):
+    """bin/rotator.cjs: the npm "bin" entry npm's Windows shim can run (it cannot run bin/rotator's
+    Python shebang directly). Finds a Python 3 per OS and forwards argv/exit code to bin/rotator."""
+
+    def run_cjs(self, *argv):
+        return subprocess.run(["node", os.path.join(REPO, "bin", "rotator.cjs")] + list(argv),
+                              capture_output=True, text=True, timeout=30)
+
+    def test_help_runs_the_real_rotator_entry(self):
+        p = self.run_cjs("--help")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for name in ("status", "daemon", "switch", "install", "uninstall", "doctor"):
+            self.assertIn(name, p.stdout)
+
+    def test_forwards_the_exit_code(self):
+        p = self.run_cjs("status", "--bogus")
+        self.assertEqual(p.returncode, 2)
+
+
 class TestPackage(unittest.TestCase):
     def setUp(self):
         with open(os.path.join(REPO, "package.json"), encoding="utf-8") as f:
@@ -3448,11 +3541,12 @@ class TestPackage(unittest.TestCase):
 
     def test_ships_the_app_and_runs_doctor(self):
         self.assertRegex(self.pkg["version"], r"^\d+\.\d+\.\d+$")  # launchd.release_version reads it
-        self.assertEqual(self.pkg["bin"], {"rotator": "bin/rotator"})
-        self.assertEqual(self.pkg["os"], ["darwin"])
-        self.assertEqual(set(self.pkg["files"]), {"bin/rotator", "rotator/*.py", "scripts/postinstall.js"})
+        self.assertEqual(self.pkg["bin"], {"rotator": "bin/rotator.cjs"})
+        self.assertEqual(self.pkg["os"], ["darwin", "win32"])
+        self.assertEqual(set(self.pkg["files"]),
+                         {"bin/rotator", "bin/rotator.cjs", "rotator/*.py", "scripts/postinstall.js"})
         self.assertEqual(self.pkg["scripts"], {"postinstall": "node scripts/postinstall.js"})
-        for rel in ("bin/rotator", "scripts/postinstall.js"):
+        for rel in ("bin/rotator", "bin/rotator.cjs", "scripts/postinstall.js"):
             self.assertTrue(os.path.isfile(os.path.join(REPO, rel)), rel)
 
     def test_postinstall_names_the_agent_plist(self):
@@ -3532,17 +3626,23 @@ class TestOrcaGate(MainBase):
         return rc, calls
 
     def test_refuses_every_command_that_uses_orca(self):
-        for argv in (["status", "--json"], ["daemon", "--dry-run"], ["switch", "--session", "1", "--to", ACC_B],
-                     ["install"]):
-            rc, calls = self.gated(*argv)
-            self.assertEqual(rc, 2, argv)
-            self.assertEqual(calls, [1])
-            self.assertEqual(self.err.getvalue(),
-                             "cannot run here: Orca: 1.4.200 is too old (see: rotator doctor)\n")
-            self.assertEqual(self.cfg_seen, [], argv)  # refused before any deps were built
+        # Darwin pinned: on Windows, daemon/switch/install refuse earlier for a different reason (see
+        # TestWindowsUnsupportedCommands), before this orca_gate seam ever runs.
+        with mock.patch("rotator.cli.platform.system", return_value="Darwin"):
+            for argv in (["status", "--json"], ["daemon", "--dry-run"],
+                        ["switch", "--session", "1", "--to", ACC_B], ["install"]):
+                rc, calls = self.gated(*argv)
+                self.assertEqual(rc, 2, argv)
+                self.assertEqual(calls, [1])
+                self.assertEqual(self.err.getvalue(),
+                                 "cannot run here: Orca: 1.4.200 is too old (see: rotator doctor)\n")
+                self.assertEqual(self.cfg_seen, [], argv)  # refused before any deps were built
 
     def test_doctor_and_uninstall_are_never_gated(self):
-        with mock.patch("rotator.launchd.uninstall", lambda **kw: (0, "uninstall ok")):
+        # Darwin pinned: on Windows, uninstall refuses before reaching the orca_gate seam at all
+        # (see TestWindowsUnsupportedCommands) -- a separate, later check from the one this covers.
+        with mock.patch("rotator.launchd.uninstall", lambda **kw: (0, "uninstall ok")), \
+                mock.patch("rotator.cli.platform.system", return_value="Darwin"):
             rc, calls = self.gated("uninstall")
         self.assertEqual((rc, calls), (0, []))
         with mock.patch("rotator.cli.doctor.orca_version", return_value="1.4.241"):
@@ -3572,6 +3672,55 @@ class TestOrcaGate(MainBase):
         with mock.patch("rotator.cli.platform.system", return_value="Darwin"), \
                 mock.patch("rotator.cli.doctor.orca_version", return_value="1.4.224"):
             self.assertIsNone(cli._real_orca_gate())
+
+    def test_real_gate_on_windows_uses_the_cli_version_flag(self):
+        with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
+                mock.patch("rotator.cli.shutil.which", return_value=r"C:\orca\orca.exe"), \
+                mock.patch("rotator.cli.doctor.orca_version_windows", return_value="1.4.223"):
+            self.assertIn("too old", cli._real_orca_gate())
+        with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
+                mock.patch("rotator.cli.shutil.which", return_value=r"C:\orca\orca.exe"), \
+                mock.patch("rotator.cli.doctor.orca_version_windows", return_value="1.4.241"):
+            self.assertIsNone(cli._real_orca_gate())
+
+    def test_real_gate_on_windows_without_orca_on_path(self):
+        with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
+                mock.patch("rotator.cli.shutil.which", return_value=None):
+            reason = cli._real_orca_gate()
+        self.assertIn("not found", reason)
+        self.assertIn(cli.WINDOWS_ORCA_CLI_WHERE, reason)
+
+
+class TestWindowsUnsupportedCommands(MainBase):
+    """daemon/switch/install/uninstall refuse cleanly on Windows; doctor and status are unaffected."""
+
+    def windows(self, *argv):
+        self.out, self.err = io.StringIO(), io.StringIO()
+        with mock.patch("rotator.cli.platform.system", return_value="Windows"):
+            rc = main(["--config", self.cfg_path] + list(argv), make_deps=self.make_deps, launchctl=FakeRunner(),
+                      uid=lambda: 501, stdout=self.out, stderr=self.err, tz=timezone.utc)
+        return rc
+
+    def test_daemon_switch_install_uninstall_refuse_with_exit_2(self):
+        for argv in (["daemon"], ["switch", "--session", "1", "--to", ACC_B], ["install"], ["uninstall"]):
+            with self.subTest(argv=argv):
+                rc = self.windows(*argv)
+                self.assertEqual(rc, 2)
+                self.assertIn(argv[0], self.err.getvalue())
+                self.assertIn("not available on Windows yet", self.err.getvalue())
+                self.assertEqual(self.cfg_seen, [])  # refused before any deps were built
+                self.cfg_seen.clear()
+
+    def test_uninstall_refuses_before_touching_os_getuid(self):
+        # uninstall skips the Orca gate entirely, so the Windows refusal must come before os.getuid().
+        with mock.patch("os.getuid", side_effect=AssertionError("os.getuid is not available on Windows")):
+            rc = self.windows("uninstall")
+        self.assertEqual(rc, 2)
+
+    def test_status_is_not_refused_on_windows(self):
+        rc = self.windows("status", "--json")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.err.getvalue(), "")
 
 
 class TestDoctorCommand(MainBase):
@@ -3619,10 +3768,36 @@ class TestDoctorCommand(MainBase):
         self.assertEqual(self.doctor(stale=True), 0)
         self.assertTrue(self.line("Claude accounts").startswith("[warn]"))
 
+    def windows_doctor(self, cli_path=r"C:\orca\orca.exe", version="1.4.241"):
+        self.out, self.err = io.StringIO(), io.StringIO()
+        with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
+                mock.patch("rotator.cli.shutil.which", return_value=cli_path), \
+                mock.patch("rotator.cli.doctor.orca_version_windows", return_value=version):
+            return main(["--config", self.cfg_path, "doctor"], make_deps=self.make_deps, launchctl=FakeRunner(),
+                        uid=lambda: 501, stdout=self.out, stderr=self.err)
+
+    def test_windows_all_good(self):
+        self.write_cfg({"profiles_root": ROOT})
+        self.assertEqual(self.windows_doctor(), 0)
+        self.assertTrue(self.line("Orca").startswith("[ok]"))
+        self.assertTrue(self.line("orca CLI").startswith("[ok]"))
+        self.assertTrue(self.line("background agent").startswith("[warn]"))
+        self.assertIn("not available on Windows yet", self.line("background agent"))
+
+    def test_windows_orca_not_on_path_fails(self):
+        self.assertEqual(self.windows_doctor(cli_path=None, version=None), 1)
+        self.assertTrue(self.line("Orca").startswith("[fail]"))
+        self.assertTrue(self.line("orca CLI").startswith("[fail]"))
+
+    def test_windows_old_orca_fails(self):
+        self.assertEqual(self.windows_doctor(version="1.4.200"), 1)
+        self.assertTrue(self.line("Orca").startswith("[fail]"))
+
 
 # --- Task 14 ---------------------------------------------------------------------------------------------
 
 
+@unittest.skipIf(sys.platform == "win32", "switch is macOS-only in this release; it refuses cleanly on Windows (see TestWindowsUnsupportedCommands)")
 class TestSwitchCommand(MainBase):
     def setUp(self):
         super().setUp()
