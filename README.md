@@ -87,11 +87,18 @@ has a default. From a checkout, run `bin/rotator` instead of `rotator`
 
 ## Windows
 
-Windows support starts with `doctor` and the dashboard; automatic switching is still macOS-only.
+Windows support now covers `doctor`, the dashboard, `install`/`uninstall` (a Task Scheduler task) and the
+daemon with pointer correction — repointing Orca's `selected-host` so a *new* session starts on the account
+with the most headroom. Automatic switching of a session that is already running, and `rotator switch`, are
+still macOS-only (stage 3): the daemon never drives Orca's terminal on Windows this release.
 
 **Works today**: `rotator doctor` (OS-aware checks: Orca's version via `orca.cmd --version`, the orca CLI on
-PATH, Claude accounts under `%APPDATA%\orca\claude-profiles`) and the dashboard (`rotator status`,
-`rotator status --watch`, `rotator status --json`).
+PATH, Claude accounts under `%APPDATA%\orca\claude-profiles`, the Task Scheduler task), the dashboard
+(`rotator status`, `rotator status --watch`, `rotator status --json`), `rotator install`/`uninstall`, and
+`rotator daemon`. Idle accounts' OAuth tokens are refreshed the same way as on macOS, writing the new tokens
+into each account's `.credentials.json` instead of the Keychain. The live-session token warm-up (see
+[Idle-account token refresh](#idle-account-token-refresh)) is macOS-only, since it needs a live session to
+drive.
 
 **Requirements**: Windows 10 or 11; Python 3.9 or newer from [python.org](https://www.python.org/) or the
 Microsoft Store (`python` or `py -3` on PATH); Orca **1.4.224 or newer** with its CLI (`orca.cmd`, under `resources\bin`) on PATH.
@@ -101,11 +108,19 @@ Microsoft Store (`python` or `py -3` on PATH); Orca **1.4.224 or newer** with it
 ```sh
 npm install -g claude-account-rotator
 rotator doctor
+rotator install      # copies the app and registers the claude-account-rotator Task Scheduler task
 rotator status --watch
 ```
 
-**Not yet supported**: `rotator install`/`uninstall` (the background agent), `rotator daemon`, automatic
-switching, and `rotator switch`. Each refuses with one clear line and exit code 2 instead of running.
+- `install` copies the runnable app into `%APPDATA%\claude-account-rotator\app\` (same layout and
+  `VERSION`-staleness tracking as macOS) and registers a Task Scheduler task named `claude-account-rotator`: a
+  `LogonTrigger` for the current user that runs `pythonw.exe` (no console window; falls back to `python.exe`
+  when `pythonw.exe` is not next to it on PATH), `MultipleInstancesPolicy IgnoreNew` so a second logon never
+  starts a second copy, and `RestartOnFailure` (every 1 minute, up to 999 times).
+- `uninstall` ends and deletes that task, then removes the app copy; running it when nothing is installed
+  prints "not installed" and is not an error.
+- **Not yet supported**: `rotator switch`, and automatic switching of a session that is already running. Each
+  refuses with one clear line and exit code 2 instead of running.
 
 This has been verified in CI only (GitHub Actions `windows-latest`, Python 3.9 and 3.12) — it has not yet been
 run on a real Windows machine.

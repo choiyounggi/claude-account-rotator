@@ -1055,7 +1055,9 @@ class Daemon:
         return self._cfg.auto_switch and not self._cfg.dry_run
 
     def _may_write_pointer(self) -> bool:
-        return self._may_switch() and self._cfg.pointer_correction
+        # Independent of auto_switch: pointer correction only points new sessions, never touches a running one,
+        # so it stays on even where auto_switch is forced off (Windows; see run_daemon).
+        return self._cfg.pointer_correction and not self._cfg.dry_run
 
     # -- tick ----------------------------------------------------------------------------------------------
 
@@ -1533,6 +1535,10 @@ def run_daemon(cfg: Config, deps: Deps) -> int:
     """Run the daemon until SIGTERM/SIGINT; 0 on a clean stop, 1 when another daemon holds the lock,
     2 when profiles_root is missing."""
     log = deps.make_logger()
+    if IS_WINDOWS and cfg.auto_switch:
+        # Live-session switching drives Orca's terminal (rotator.switcher), which is macOS-only this release.
+        log.info("event=auto_switch_unavailable os=windows")
+        cfg = dataclasses.replace(cfg, auto_switch=False)
     if not deps.isdir(cfg.profiles_root):
         log.error("event=profiles_root_missing path=%s", cfg.profiles_root)
         return 2
@@ -1605,7 +1611,8 @@ def _install_signals(handler: Callable[[], None]) -> None:
 
 
 def _make_logger() -> logging.Logger:
-    return setup_logging(LOG_DIR_DEFAULT, sys.stderr.isatty())
+    # Under pythonw.exe (no console) sys.stderr is None.
+    return setup_logging(LOG_DIR_DEFAULT, sys.stderr is not None and sys.stderr.isatty())
 
 
 def _read_limit(s: Session) -> Optional[Tuple[str, datetime]]:

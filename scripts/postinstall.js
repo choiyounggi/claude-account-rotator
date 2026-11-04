@@ -1,6 +1,6 @@
 // Runs after `npm install -g claude-account-rotator`: fails the install on a machine that cannot run
-// the rotator (rotator doctor), and on macOS refreshes an already installed background agent so it
-// runs the new version (Windows has no background agent yet).
+// the rotator (rotator doctor), and refreshes an already installed background agent so it runs the new
+// version (a launchd agent on macOS, a Task Scheduler task on Windows).
 'use strict';
 
 const { spawnSync } = require('child_process');
@@ -12,6 +12,8 @@ const ROTATOR = path.join(__dirname, '..', 'bin', 'rotator');
 // Same label as rotator/launchd.py LABEL.
 const PLIST = path.join(os.homedir(), 'Library', 'LaunchAgents',
   'io.github.choiyounggi.claude-account-rotator.plist');
+// Same name as rotator/schtasks.py TASK_NAME.
+const TASK_NAME = 'claude-account-rotator';
 
 function fail(message) {
   console.error('claude-account-rotator: ' + message);
@@ -57,7 +59,16 @@ if (process.platform === 'darwin') {
   if (spawnSync(cmd, [...baseArgs, ROTATOR, 'doctor'], { stdio: 'inherit' }).status !== 0) {
     fail('this machine cannot run the rotator yet: fix the [fail] lines above, then install again');
   }
-  console.log('next: `rotator status --watch` for the dashboard (automatic switching is not yet available on Windows)');
+  // Only a global install replaces the task: npx and a local `npm install` (also inside a checkout) leave it alone.
+  const alreadyInstalled = process.env.npm_config_global === 'true'
+    && spawnSync('schtasks', ['/Query', '/TN', TASK_NAME], { stdio: 'ignore' }).status === 0;
+  if (alreadyInstalled) {
+    if (spawnSync(cmd, [...baseArgs, ROTATOR, 'install'], { stdio: 'inherit' }).status !== 0) {
+      console.warn('claude-account-rotator: could not update the Task Scheduler task; run `rotator install`');
+    }
+  } else {
+    console.log('next: `rotator status --watch` for the dashboard, `rotator install` to run the daemon at logon');
+  }
 } else {
   fail('runs only on macOS or Windows');
 }

@@ -1763,14 +1763,20 @@ class TestTickPointer(TickBase):
         self.assertEqual(len(self.env.logs("pointer_write")), 1)
 
     def test_pointer_gates(self):
-        for kw in ({"dry_run": True}, {"auto_switch": False, "pointer_correction": True},
-                   {"pointer_correction": False}):
+        for kw in ({"dry_run": True}, {"pointer_correction": False}):
             with self.subTest(kw=kw):
                 self.env.calls.clear()
                 self.make(make_cfg(usage_poll_s=60.0, **kw))
                 self.d.tick()
                 self.assertEqual(self.pointer_writes(), [])
                 self.assertEqual(self.snap()["pointer_target_account_id"], ACC_B)
+
+    def test_pointer_correction_independent_of_auto_switch(self):
+        # auto_switch only gates live-session switching; pointer correction (which new sessions start on) is a
+        # separate feature and stays on so it still works on Windows, where auto_switch is always forced off.
+        self.make(make_cfg(usage_poll_s=60.0, auto_switch=False, pointer_correction=True))
+        self.d.tick()
+        self.assertEqual(self.pointer_writes(), [("write_pointer", ACC_B)])
 
     def test_pointer_none_or_unknown(self):
         for text in (None, "/Users/user/elsewhere"):
@@ -2725,6 +2731,54 @@ class TestRunDaemon(RunDaemonBase):
         self.assertEqual(self.run_d(self.env.deps(now=now)), 0)
         self.assertEqual(len([r for r in self.env.log_records if r == "event=tick_error exc=RuntimeError"]), 1)
         self.assertEqual(len(self.fetches()), 3)
+
+
+class TestRunDaemonWindowsAutoSwitch(RunDaemonBase):
+    """Windows forces auto_switch off at daemon start (switcher.* must stay macOS-only); pointer correction
+    stays on, since it is a separate feature from live-session switching (see TestTickPointer)."""
+
+    def setUp(self):
+        super().setUp()
+        self.env.pointer_text = prof(ACC_A).home
+        self.env.wait_hook = lambda n: self.env.signal_handler() if n == 1 else None
+
+    def test_forces_auto_switch_off_and_logs_once(self):
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", True):
+            self.assertEqual(self.run_d(), 0)
+        self.assertEqual(self.env.logs("auto_switch_unavailable"), ["event=auto_switch_unavailable os=windows"])
+        self.assertEqual(self.spawns(), [])  # a hard switch is due (ACC_A at 97%), but never dispatched
+        self.assertEqual(self.switches(), [])
+        self.assertEqual(self.snap()["flags"]["auto_switch"], False)
+
+    def test_pointer_correction_still_runs(self):
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", True):
+            self.assertEqual(self.run_d(), 0)
+        self.assertEqual([c for c in self.env.calls if c[0] == "write_pointer"], [("write_pointer", ACC_B)])
+
+    def test_left_alone_off_windows(self):
+        self.assertEqual(self.run_d(), 0)
+        self.assertEqual(self.env.logs("auto_switch_unavailable"), [])
+        self.assertEqual(self.snap()["flags"]["auto_switch"], True)
+
+    def test_not_forced_when_already_off(self):
+        self.make(make_cfg(auto_switch=False))
+        self.env.wait_hook = lambda n: self.env.signal_handler() if n == 1 else None
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", True):
+            self.assertEqual(self.run_d(), 0)
+        self.assertEqual(self.env.logs("auto_switch_unavailable"), [])
+
+
+class TestDaemonStartNoConsole(RunDaemonBase):
+    """Under pythonw.exe (no console) sys.stdout/sys.stderr are None; the real logger must not crash on that."""
+
+    def test_profiles_root_missing_exits_2_without_a_console(self):
+        self.env.isdir_ok = False
+        log_dir = scratch("no-console-logs-" + self._testMethodName)
+        with unittest.mock.patch.object(daemon, "LOG_DIR_DEFAULT", log_dir), \
+                unittest.mock.patch.object(daemon.sys, "stdout", None), \
+                unittest.mock.patch.object(daemon.sys, "stderr", None):
+            rc = self.run_d(self.env.deps(make_logger=daemon._make_logger))
+        self.assertEqual(rc, 2)
 
 
 # --- token refresh wiring ----------------------------------------------------------------------------------

@@ -28,7 +28,7 @@ except ImportError:  # Windows has neither; see TestWindowsTerm for the msvcrt-b
     pty = None
     termios = None
 
-from rotator import cli, daemon, launchd, refresh, switcher
+from rotator import cli, daemon, launchd, refresh, schtasks, switcher
 from rotator.cli import STATUS_KEYS, build_status, main, render
 from rotator.daemon import UsageCache, UsageStore
 from rotator.config import (
@@ -1236,6 +1236,13 @@ class TestStaleInstallWiring(unittest.TestCase):
         with mock.patch("rotator.launchd.install_stale", lambda *a, **k: seen.append(a) or True):
             self.assertIs(cli._real_stale_check(load_config(self.cfg_path))(), True)
         self.assertEqual(seen, [(launchd.plist_path_default(), CONFIG_DIR_DEFAULT, launchd.repo_root())])
+
+    def test_real_check_dispatches_to_schtasks_on_windows(self):
+        seen = []
+        with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
+                mock.patch("rotator.schtasks.install_stale", lambda *a, **k: seen.append(a) or True):
+            self.assertIs(cli._real_stale_check(load_config(self.cfg_path))(), True)
+        self.assertEqual(seen, [(schtasks.run_schtasks, CONFIG_DIR_DEFAULT, launchd.repo_root())])
 
     def test_json_has_no_line(self):
         rc, out, _ = self.run_status("--json", stale_check=lambda: True)
@@ -2834,6 +2841,15 @@ class TestMainParser(MainBase):
                 self.assertEqual(self.main(name, "--help"), 0)
         self.assertEqual(self.runner.calls, [])
 
+    def test_install_uninstall_doctor_help_is_os_neutral(self):
+        # install/uninstall/doctor now run on both OSes; their help text must not say "launchd" or "Mac" only.
+        for name in ("install", "uninstall", "doctor"):
+            with self.subTest(name=name):
+                self.assertEqual(self.main(name, "--help"), 0)
+                text = self.out.getvalue()
+                self.assertNotIn("launchd", text)
+                self.assertNotIn("Mac", text)
+
     def test_usage_errors(self):
         self.assertEqual(self.main(), 2)
         self.assertIn("usage:", self.err.getvalue())
@@ -3562,6 +3578,59 @@ class TestInstallWiring(unittest.TestCase):
         self.assertEqual(seen["uninstall"]["state_dir"], CONFIG_DIR_DEFAULT)
         self.assertEqual(seen["uninstall"]["plist_path"], launchd.plist_path_default())
 
+    def test_schtasks_kwargs(self):
+        cfg = load_config(os.path.join(BASE, "missing", "config.json"))
+        kw = cli._schtasks_install_kwargs(cfg, "/Users/user/cfg/config.json")
+        self.assertEqual(kw["config_path"], "/Users/user/cfg/config.json")
+        self.assertEqual(kw["source_root"], REPO)
+        self.assertEqual(kw["state_dir"], CONFIG_DIR_DEFAULT)
+        self.assertEqual(kw["python_exe"], sys.executable)
+        self.assertNotIn("plist_path", kw)
+        self.assertNotIn("log_dir", kw)
+
+
+class TestWindowsInstallWiring(unittest.TestCase):
+    """install/uninstall dispatch to rotator.schtasks on Windows, and never touch os.getuid (TestInstallWiring
+    covers the macOS/launchd dispatch)."""
+
+    def test_install_and_uninstall_dispatch_to_schtasks_without_os_getuid(self):
+        seen = {}
+
+        def fake(name):
+            def call(**kw):
+                seen[name] = kw
+                return (0, name + " ok")
+            return call
+        cfg_path = os.path.join(scratch("win-install-wiring-" + self._testMethodName), "config.json")
+        with mock.patch("rotator.schtasks.install", fake("install")), \
+                mock.patch("rotator.schtasks.uninstall", fake("uninstall")), \
+                mock.patch("rotator.cli.platform.system", return_value="Windows"), \
+                mock.patch("os.getuid", create=True,
+                           side_effect=AssertionError("os.getuid is not available on Windows")) as getuid:
+            for verb in ("install", "uninstall"):
+                out, err = io.StringIO(), io.StringIO()
+                rc = main(["--config", cfg_path, verb], launchctl=FakeRunner(), uid=None, stdout=out, stderr=err)
+                self.assertEqual(rc, 0)
+                self.assertEqual(out.getvalue(), verb + " ok\n")
+        getuid.assert_not_called()
+        self.assertEqual(seen["install"]["state_dir"], CONFIG_DIR_DEFAULT)
+        self.assertEqual(seen["install"]["source_root"], REPO)
+        self.assertEqual(seen["install"]["python_exe"], sys.executable)
+        self.assertNotIn("uid", seen["install"])
+        self.assertEqual(seen["uninstall"]["state_dir"], CONFIG_DIR_DEFAULT)
+        self.assertNotIn("uid", seen["uninstall"])
+        self.assertNotIn("plist_path", seen["uninstall"])
+
+    def test_install_failure_reports_the_message_on_stderr(self):
+        cfg_path = os.path.join(scratch("win-install-fail-" + self._testMethodName), "config.json")
+        with mock.patch("rotator.schtasks.install", return_value=(2, "USERNAME is not set")), \
+                mock.patch("rotator.cli.platform.system", return_value="Windows"):
+            out, err = io.StringIO(), io.StringIO()
+            rc = main(["--config", cfg_path, "install"], launchctl=FakeRunner(), uid=None, stdout=out, stderr=err)
+        self.assertEqual(rc, 2)
+        self.assertEqual(err.getvalue(), "USERNAME is not set\n")
+        self.assertEqual(out.getvalue(), "")
+
 
 class TestBinEntrypoint(unittest.TestCase):
     def test_help_from_any_cwd(self):
@@ -3728,18 +3797,19 @@ class TestPostinstall(unittest.TestCase):
     def test_fresh_install_runs_doctor_only(self):
         p, calls = self.run_script()
         self.assertEqual((p.returncode, calls), (0, ["doctor"]), p.stderr)
-        # Windows has no background agent this release, so its next-steps line never mentions install.
-        if sys.platform == "win32":
-            self.assertIn("rotator status --watch", p.stdout)
-        else:
-            self.assertIn("rotator install", p.stdout)
+        # A fresh machine has no task registered yet (real `schtasks /Query` against the live system, which
+        # this harness cannot fake), so the Windows branch takes its "otherwise" next-steps line too.
+        self.assertIn("rotator status --watch", p.stdout)
+        self.assertIn("rotator install", p.stdout)
 
     def test_failed_doctor_fails_the_install(self):
         p, calls = self.run_script(plist=True, doctor_rc=1)
         self.assertEqual((p.returncode, calls), (1, ["doctor"]))
         self.assertIn("cannot run the rotator", p.stderr)
 
-    @unittest.skipIf(sys.platform == "win32", "no background agent to refresh on Windows this release")
+    @unittest.skipIf(sys.platform == "win32",
+                     "on Windows, the fixture's `plist=True` has no effect: an upgrade is detected by a real "
+                     "`schtasks /Query` against the live system, which this harness cannot fake")
     def test_global_upgrade_refreshes_the_agent(self):
         p, calls = self.run_script(plist=True)
         self.assertEqual((p.returncode, calls), (0, ["doctor", "install"]), p.stderr)
@@ -3748,7 +3818,9 @@ class TestPostinstall(unittest.TestCase):
         p, calls = self.run_script(global_install=False, plist=True)
         self.assertEqual((p.returncode, calls), (0, ["doctor"]), p.stderr)
 
-    @unittest.skipIf(sys.platform == "win32", "no background agent to refresh on Windows this release")
+    @unittest.skipIf(sys.platform == "win32",
+                     "on Windows, the fixture's `plist=True` has no effect: an upgrade is detected by a real "
+                     "`schtasks /Query` against the live system, which this harness cannot fake")
     def test_failed_refresh_does_not_fail_the_install(self):
         p, calls = self.run_script(plist=True, install_rc=1)
         self.assertEqual((p.returncode, calls), (0, ["doctor", "install"]))
@@ -3765,7 +3837,7 @@ class TestOrcaGate(MainBase):
         return rc, calls
 
     def test_refuses_every_command_that_uses_orca(self):
-        # Darwin pinned: on Windows, daemon/switch/install refuse earlier for a different reason (see
+        # Darwin pinned: on Windows, switch refuses earlier for a different reason (see
         # TestWindowsUnsupportedCommands), before this orca_gate seam ever runs.
         with mock.patch("rotator.cli.platform.system", return_value="Darwin"):
             for argv in (["status", "--json"], ["daemon", "--dry-run"],
@@ -3778,8 +3850,8 @@ class TestOrcaGate(MainBase):
                 self.assertEqual(self.cfg_seen, [], argv)  # refused before any deps were built
 
     def test_doctor_and_uninstall_are_never_gated(self):
-        # Darwin pinned: on Windows, uninstall refuses before reaching the orca_gate seam at all
-        # (see TestWindowsUnsupportedCommands) -- a separate, later check from the one this covers.
+        # uninstall is excluded from the orca_gate check above on every OS (it must always be able to remove
+        # the agent/task, even on a machine too old or missing Orca entirely).
         with mock.patch("rotator.launchd.uninstall", lambda **kw: (0, "uninstall ok")), \
                 mock.patch("rotator.cli.platform.system", return_value="Darwin"):
             rc, calls = self.gated("uninstall")
@@ -3871,7 +3943,9 @@ class TestWindowsOrcaCliPath(unittest.TestCase):
 
 
 class TestWindowsUnsupportedCommands(MainBase):
-    """daemon/switch/install/uninstall refuse cleanly on Windows; doctor and status are unaffected."""
+    """switch refuses cleanly on Windows (switching a running session needs rotator.switcher, macOS-only this
+    release). daemon/install/uninstall/doctor/status are supported on Windows since stage 2 (see
+    TestRunDaemonWindowsAutoSwitch in test_daemon.py and TestWindowsInstallWiring)."""
 
     def windows(self, *argv):
         self.out, self.err = io.StringIO(), io.StringIO()
@@ -3880,34 +3954,21 @@ class TestWindowsUnsupportedCommands(MainBase):
                       uid=lambda: 501, stdout=self.out, stderr=self.err, tz=timezone.utc)
         return rc
 
-    def test_daemon_switch_install_uninstall_refuse_with_exit_2(self):
-        for argv in (["daemon"], ["switch", "--session", "1", "--to", ACC_B], ["install"], ["uninstall"]):
-            with self.subTest(argv=argv):
-                rc = self.windows(*argv)
-                self.assertEqual(rc, 2)
-                self.assertIn(argv[0], self.err.getvalue())
-                self.assertIn("not available on Windows yet", self.err.getvalue())
-                self.assertEqual(self.cfg_seen, [])  # refused before any deps were built
-                self.cfg_seen.clear()
-
-    def test_uninstall_refuses_before_touching_os_getuid(self):
-        # uninstall skips the Orca gate entirely, so the Windows refusal must come before os.getuid().
-        # create=True: real Windows has no os.getuid attribute at all to patch.
-        # uid=None so main() would fall back to the real os.getuid; the injected uid of self.windows() never would.
-        self.out, self.err = io.StringIO(), io.StringIO()
-        with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
-                mock.patch("os.getuid", create=True,
-                           side_effect=AssertionError("os.getuid is not available on Windows")) as getuid:
-            rc = main(["--config", self.cfg_path, "uninstall"], make_deps=self.make_deps, launchctl=FakeRunner(),
-                      uid=None, stdout=self.out, stderr=self.err, tz=timezone.utc)
+    def test_switch_refuses_with_exit_2(self):
+        rc = self.windows("switch", "--session", "1", "--to", ACC_B)
         self.assertEqual(rc, 2)
-        getuid.assert_not_called()
+        self.assertIn("switch", self.err.getvalue())
         self.assertIn("not available on Windows yet", self.err.getvalue())
+        self.assertEqual(self.cfg_seen, [])  # refused before any deps were built
 
     def test_status_is_not_refused_on_windows(self):
         rc = self.windows("status", "--json")
         self.assertEqual(rc, 0)
         self.assertEqual(self.err.getvalue(), "")
+
+    # install/uninstall are no longer refused on Windows (stage 2): see TestWindowsInstallWiring, which mocks
+    # rotator.schtasks.install/uninstall so the test never touches the real machine's app-copy state dir.
+    # daemon is covered by TestRunDaemonWindowsAutoSwitch in test_daemon.py.
 
 
 class TestDoctorCommand(MainBase):
@@ -3955,21 +4016,32 @@ class TestDoctorCommand(MainBase):
         self.assertEqual(self.doctor(stale=True), 0)
         self.assertTrue(self.line("Claude accounts").startswith("[warn]"))
 
-    def windows_doctor(self, cli_path=WIN_ORCA_CMD, version="1.4.241"):
+    def windows_doctor(self, cli_path=WIN_ORCA_CMD, version="1.4.241", runner=None, stale_check=None):
         self.out, self.err = io.StringIO(), io.StringIO()
         with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
                 mock.patch("rotator.cli.shutil.which", side_effect={"orca.cmd": cli_path}.get), \
                 mock.patch("rotator.cli.doctor.orca_version_windows", return_value=version):
-            return main(["--config", self.cfg_path, "doctor"], make_deps=self.make_deps, launchctl=FakeRunner(),
-                        uid=lambda: 501, stdout=self.out, stderr=self.err)
+            return main(["--config", self.cfg_path, "doctor"], make_deps=self.make_deps,
+                        launchctl=runner or FakeRunner(), uid=lambda: 501, stdout=self.out, stderr=self.err,
+                        stale_check=stale_check)
 
     def test_windows_all_good(self):
         self.write_cfg({"profiles_root": ROOT})
         self.assertEqual(self.windows_doctor(), 0)
         self.assertTrue(self.line("Orca").startswith("[ok]"))
         self.assertTrue(self.line("orca CLI").startswith("[ok]"))
+        self.assertTrue(self.line("background agent").startswith("[ok]"))
+        self.assertIn("installed", self.line("background agent"))
+
+    def test_windows_background_agent_not_installed(self):
+        self.assertEqual(self.windows_doctor(runner=FakeRunner({"/Query": (1, "", "")})), 0)
         self.assertTrue(self.line("background agent").startswith("[warn]"))
-        self.assertIn("not available on Windows yet", self.line("background agent"))
+        self.assertIn("not installed", self.line("background agent"))
+
+    def test_windows_background_agent_stale(self):
+        self.assertEqual(self.windows_doctor(stale_check=lambda: True), 0)
+        self.assertTrue(self.line("background agent").startswith("[warn]"))
+        self.assertIn("older copy", self.line("background agent"))
 
     def test_windows_orca_not_on_path_fails(self):
         self.assertEqual(self.windows_doctor(cli_path=None, version=None), 1)

@@ -31,7 +31,7 @@ except ImportError:  # Windows has neither; status --watch uses rotator.windows 
     termios = None
     tty = None
 
-from rotator import doctor, launchd, refresh
+from rotator import doctor, launchd, refresh, schtasks
 from rotator import windows as _win
 from rotator.accounts import profile_for_config_dir
 from rotator.config import CONFIG_DIR_DEFAULT, CONFIG_PATH_DEFAULT, LOG_DIR_DEFAULT, Config, ConfigError, load_config
@@ -43,10 +43,10 @@ from rotator.policy import decide
 from rotator.sessions import session_homes
 from rotator.switcher import ORCA_BINARY_DEFAULT, build_relaunch_command, result_hint
 
-WINDOWS_UNSUPPORTED_COMMANDS: Tuple[str, ...] = ("daemon", "switch", "install", "uninstall")
+WINDOWS_UNSUPPORTED_COMMANDS: Tuple[str, ...] = ("switch",)
 WINDOWS_UNSUPPORTED_MESSAGE = (
-    "rotator %s is not available on Windows yet: automatic switching and the background agent "
-    "come in a later release"
+    "rotator %s is not available on Windows yet: switching a running session automatically "
+    "comes in a later release"
 )
 
 STATUS_SCHEMA = 1
@@ -1237,9 +1237,10 @@ def build_parser() -> argparse.ArgumentParser:
     how.add_argument("--hard", dest="mode", action="store_const", const="hard", help="interrupt a running turn first")
     sw.set_defaults(mode="soft")
     sw.add_argument("--dry-run", action="store_true", help="print the decision and relaunch line; send nothing")
-    sub.add_parser("install", help="install and start the launchd user agent")
-    sub.add_parser("uninstall", help="stop and remove the launchd user agent")
-    sub.add_parser("doctor", help="check that this Mac can run the rotator (macOS, Orca version, accounts)")
+    sub.add_parser("install", help="install and start the background agent "
+                                   "(launchd on macOS, Task Scheduler on Windows)")
+    sub.add_parser("uninstall", help="stop and remove the background agent")
+    sub.add_parser("doctor", help="check that this computer can run the rotator (OS, Orca version, accounts)")
     return p
 
 
@@ -1249,7 +1250,14 @@ def _install_kwargs(cfg: Config, config_path: str) -> dict:
             "timeouts": cfg.timeouts}
 
 
+def _schtasks_install_kwargs(cfg: Config, config_path: str) -> dict:
+    return {"python_exe": sys.executable, "source_root": launchd.repo_root(), "state_dir": cfg.state_dir,
+            "config_path": config_path}
+
+
 def _real_stale_check(cfg: Config) -> Callable[[], bool]:
+    if platform.system() == "Windows":
+        return lambda: schtasks.install_stale(schtasks.run_schtasks, cfg.state_dir, launchd.repo_root())
     return lambda: launchd.install_stale(launchd.plist_path_default(), cfg.state_dir, launchd.repo_root())
 
 
@@ -1281,7 +1289,8 @@ def _real_orca_gate() -> Optional[str]:
     return doctor.gate(system, doctor.orca_version())
 
 
-def _doctor(cfg: Config, deps: Deps, out: TextIO, stale: bool, config_error: Optional[str]) -> int:
+def _doctor(cfg: Config, deps: Deps, out: TextIO, stale: bool, config_error: Optional[str],
+            runner: Optional[schtasks.Runner] = None) -> int:
     try:
         count = len(deps.discover_profiles(cfg.profiles_root))
     except Exception:
@@ -1290,12 +1299,13 @@ def _doctor(cfg: Config, deps: Deps, out: TextIO, stale: bool, config_error: Opt
     if system == "Windows":
         cli_path = _windows_orca_cli_path()
         version = doctor.orca_version_windows(cli_path) if cli_path else None
+        installed = schtasks.query_installed(runner or schtasks.run_schtasks)
         checks = [doctor.check_system(system), doctor.check_python(sys.version_info[:3]),
                   doctor.check_config(config_error),
                   doctor.check_orca(version, where=WINDOWS_ORCA_CLI_WHERE),
                   doctor.check_orca_cli(cli_path or "orca.cmd", cli_path is not None),
                   doctor.check_accounts(count, cfg.profiles_root),
-                  doctor.check_agent(False, False, supported=False)]
+                  doctor.check_agent(installed, stale, supported=True)]
     else:
         checks = [doctor.check_system(system), doctor.check_python(sys.version_info[:3]),
                   doctor.check_config(config_error),
@@ -1363,13 +1373,21 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
             print("cannot run here: %s (see: rotator doctor)" % reason, file=err)
             return 2
     if args.command in ("install", "uninstall"):
-        run = launchctl or launchd.run_launchctl
-        u = (uid or os.getuid)()
-        if args.command == "install":
-            rc, msg = launchd.install(runner=run, uid=u, **_install_kwargs(cfg, config_path))
+        if platform.system() == "Windows":
+            run = launchctl or schtasks.run_schtasks
+            # Never os.getuid()/uid() here: Windows has no uid, and Task Scheduler takes the logon user instead.
+            if args.command == "install":
+                rc, msg = schtasks.install(runner=run, **_schtasks_install_kwargs(cfg, config_path))
+            else:
+                rc, msg = schtasks.uninstall(runner=run, state_dir=cfg.state_dir)
         else:
-            rc, msg = launchd.uninstall(runner=run, uid=u, plist_path=launchd.plist_path_default(),
-                                        state_dir=cfg.state_dir)
+            run = launchctl or launchd.run_launchctl
+            u = (uid or os.getuid)()
+            if args.command == "install":
+                rc, msg = launchd.install(runner=run, uid=u, **_install_kwargs(cfg, config_path))
+            else:
+                rc, msg = launchd.uninstall(runner=run, uid=u, plist_path=launchd.plist_path_default(),
+                                            state_dir=cfg.state_dir)
         print(msg, file=out if rc == 0 else err)
         return rc
     if args.command == "daemon" and args.dry_run:
@@ -1378,7 +1396,8 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
     if args.command == "doctor":
         if stale_check is None and make_deps is None:
             stale_check = _real_stale_check(cfg)
-        return _doctor(cfg, deps, out, _stale_install(stale_check), config_error)
+        doctor_runner = launchctl or (schtasks.run_schtasks if platform.system() == "Windows" else None)
+        return _doctor(cfg, deps, out, _stale_install(stale_check), config_error, runner=doctor_runner)
     if args.command == "daemon":
         return run_daemon(cfg, deps)
     if args.command == "status":

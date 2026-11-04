@@ -140,24 +140,27 @@ def installed_commit(state_dir: str) -> Optional[str]:
     return first if _COMMIT_RE.fullmatch(first) or _RELEASE_RE.fullmatch(first) else None
 
 
-def install_stale(plist_path: str, state_dir: str, source_root: str,
-                  commit_of: Callable[[str], Optional[str]] = source_commit) -> bool:
-    """True only when the agent is installed and its app copy came from a different commit than source_root.
+def commits_differ(installed: Optional[str], current: Optional[str]) -> bool:
+    """True only when two app-copy commits read as different versions (shared by install_stale on both OSes).
 
     Either commit unknown means not stale; short hashes of different lengths match on their common prefix, and
     a release version ("v1.2.3", an npm install) matches only itself."""
-    try:
-        if not os.path.isfile(plist_path):
-            return False
-        installed = installed_commit(state_dir)
-        current = commit_of(source_root)
-    except Exception:
-        return False
     if installed is None or current is None:
         return False
     if not (_COMMIT_RE.fullmatch(installed) and _COMMIT_RE.fullmatch(current)):
         return installed != current
     return not (installed.startswith(current) or current.startswith(installed))
+
+
+def install_stale(plist_path: str, state_dir: str, source_root: str,
+                  commit_of: Callable[[str], Optional[str]] = source_commit) -> bool:
+    """True only when the agent is installed and its app copy came from a different commit than source_root."""
+    try:
+        if not os.path.isfile(plist_path):
+            return False
+        return commits_differ(installed_commit(state_dir), commit_of(source_root))
+    except Exception:
+        return False
 
 
 class AppCopyError(Exception):
