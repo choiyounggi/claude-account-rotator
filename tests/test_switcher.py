@@ -1021,7 +1021,8 @@ class FakeFs:
 
     def glob_paths(self, pattern):
         pattern = _slash(pattern)
-        return sorted(k for k in self.files if self._get(k, False) is not None and fnmatch.fnmatchcase(k, pattern))
+        return sorted(k for k in self.files
+                     if self._get(k, False) is not None and fnmatch.fnmatchcase(_slash(k), pattern))
 
     def isdir(self, path):
         return _slash(path) in self.dirs
@@ -2285,7 +2286,8 @@ class TestTrustCopyPreflight(unittest.TestCase):
         with self.assertLogs("rotator.switcher", "INFO") as cm:
             res = self.run_world(w)
         self.assertEqual(res, HAPPY)
-        self.assertEqual(self.calls, [(TRUST_FILE, CWD, BACKUP_DIR, ACC_NEW)])
+        got_calls = [(_slash(p), cwd, backup_dir, account_id) for p, cwd, backup_dir, account_id in self.calls]
+        self.assertEqual(got_calls, [(_slash(TRUST_FILE), CWD, BACKUP_DIR, ACC_NEW)])
         self.assertIn("event=trust_copied account=%s path=%s" % (ACC_NEW, CWD), [r.getMessage() for r in cm.records])
 
     def test_source_trust_of_the_folder_itself(self):
@@ -2629,7 +2631,7 @@ def _read_text_raising_for(w, path, exc):
     orig = w.fs.read_text
 
     def read_text(p):
-        if p == path:
+        if _slash(p) == _slash(path):
             w.fs.reads.append(p)
             raise exc
         return orig(p)
@@ -2726,7 +2728,7 @@ class TestSeamFailures(unittest.TestCase):
         orig = w.fs.read_text
 
         def read_text(p):
-            if p == OLD_REG:
+            if _slash(p) == _slash(OLD_REG):
                 calls.append(p)
                 if len(calls) > 1:
                     raise RuntimeError("x")
@@ -2738,7 +2740,7 @@ class TestSeamFailures(unittest.TestCase):
     def test_read_text_returns_non_str(self):
         w = World()
         orig = w.fs.read_text
-        res = w.run(read_text=lambda p: 5 if p == TRUST_FILE else orig(p))
+        res = w.run(read_text=lambda p: 5 if _slash(p) == _slash(TRUST_FILE) else orig(p))
         assert_untouched(self, res, "target_untrusted", w)
 
     def test_registry_nested_too_deep(self):
@@ -3041,7 +3043,9 @@ class TestAdoptForeignResume(unittest.TestCase):
         self.assertIs(w.driver.sent("prompt"), False)
 
     def test_default_home_is_left_alone(self):
-        home = os.path.expanduser("~/.claude")
+        # Matches switcher.py's own os.path.normpath(_default_home()): expanduser alone can mix
+        # separators on Windows ("C:\Users\you" + "/.claude"), which would never compare equal there.
+        home = os.path.normpath(os.path.expanduser("~/.claude"))
         w = self._already_running(["idle"], home=home)
         self.assertEqual(w.run().reason, "session_already_running")
         self.assertIs(w.driver.sent("prompt"), False)

@@ -4,6 +4,7 @@ import io
 import json
 import os
 import socket
+import sys
 import tempfile
 import unittest
 import unittest.mock
@@ -321,7 +322,9 @@ EXCEPTION_KINDS = [
     ("IncompleteRead", http.client.IncompleteRead(b"part"), "network"),
     ("BadStatusLine", http.client.BadStatusLine("x"), "network"),
     ("ConnectionResetError", ConnectionResetError(), "network"),
-    ("TimeoutError", TimeoutError(), "network"),
+    # socket.timeout became an alias of the builtin TimeoutError in Python 3.10 (bpo-29017): a bare
+    # TimeoutError is indistinguishable from socket.timeout there, so it classifies as "timeout" too.
+    ("TimeoutError", TimeoutError(), "timeout" if sys.version_info >= (3, 10) else "network"),
     ("HTTPError 401", http_error(401), "http_401"),
     ("header ValueError", ValueError("Invalid header value b'Bearer " + TOKEN + "'"), "request_error"),
     ("UnicodeEncodeError", UnicodeEncodeError("latin-1", "x", 0, 1, "bad"), "request_error"),

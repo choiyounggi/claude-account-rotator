@@ -216,7 +216,7 @@ class RegistryScanTest(unittest.TestCase):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             cands, _ = self.scan_one_dir({name: text, "9.json": json.dumps(entry(9))})
         self.assertEqual([c.pid for c in cands], [9])
-        self.assertIn("skip session %s/%s: %s" % (ACC1, name, reason), "\n".join(cm.output))
+        self.assertIn("skip session %s/%s: %s" % (ACC1, name, reason), _slash("\n".join(cm.output)))
 
     def test_normal(self):
         cands, _ = self.scan_one_dir({"4242.json": json.dumps(entry(4242))})
@@ -229,7 +229,7 @@ class RegistryScanTest(unittest.TestCase):
         self.assertEqual(c.proc_start_raw, "Wed Oct 28 04:21:59 2026")
         self.assertEqual(c.started_at_raw, 1793161321336)
         self.assertEqual(c.status_updated_at, 1793161321400)
-        self.assertEqual(c.path, "/h/acc1/sessions/4242.json")
+        self.assertEqual(_slash(c.path), "/h/acc1/sessions/4242.json")
         self.assertEqual(c.order, 0)
 
     def test_file_name_filter_reads_only_pid_json_sorted(self):
@@ -286,7 +286,7 @@ class RegistryScanTest(unittest.TestCase):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             cands, _ = self.scan_one_dir(files)
         self.assertEqual([c.pid for c in cands], [2147483647])
-        out = "\n".join(cm.output)
+        out = _slash("\n".join(cm.output))
         self.assertIn("skip session %s/2147483648.json: bad_shape" % ACC1, out)
         self.assertIn("skip session %s/0.json: bad_shape" % ACC1, out)
 
@@ -451,13 +451,13 @@ class DiscoverTest(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertEqual(proc.calls, [])
         self.assertEqual(start.calls, [])
-        self.assertIn("skip session %s: dead" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: dead" % P4242, _slash("\n".join(cm.output)))
 
     def test_unreadable_process_skipped(self):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             result, _, _, _ = run({P4242: entry(4242)}, proc=FakeProc({4242: OSError(22, "Invalid argument")}))
         self.assertEqual(result, [])
-        self.assertIn("skip session %s: unreadable" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: unreadable" % P4242, _slash("\n".join(cm.output)))
 
     def test_malformed_procargs_skipped(self):
         result, _, _, _ = run({P4242: entry(4242)}, proc=lambda pid: parse_procargs(b"\x01"))
@@ -468,7 +468,7 @@ class DiscoverTest(unittest.TestCase):
             result, _, proc, _ = run({P4242: entry(4242)}, start=FakeStart({4242: LATER}))
         self.assertEqual(result, [])
         self.assertEqual(proc.calls, [])
-        self.assertIn("skip session %s: pid_reused" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: pid_reused" % P4242, _slash("\n".join(cm.output)))
 
     def test_start_within_one_second_kept(self):
         result, _, _, _ = run({P4242: entry(4242)}, start=FakeStart({4242: T0.replace(microsecond=900000)}))
@@ -484,14 +484,14 @@ class DiscoverTest(unittest.TestCase):
                 result, _, proc, _ = run({P4242: entry(4242)}, start=FakeStart({4242: live}))
             self.assertEqual(result, [])
             self.assertEqual(proc.calls, [])
-            self.assertIn("skip session %s: unreadable" % P4242, "\n".join(cm.output))
+            self.assertIn("skip session %s: unreadable" % P4242, _slash("\n".join(cm.output)))
 
     def test_pid_reused_during_read_race(self):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             result, _, proc, _ = run({P4242: entry(4242)}, start=FakeStart({4242: [T0, LATER]}))
         self.assertEqual(result, [])
         self.assertEqual(proc.calls, [4242])
-        self.assertIn("skip session %s: pid_reused" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: pid_reused" % P4242, _slash("\n".join(cm.output)))
 
     def test_live_start_vanishes_after_read(self):
         result, _, proc, _ = run({P4242: entry(4242)}, start=FakeStart({4242: [T0, None]}))
@@ -520,7 +520,7 @@ class DiscoverTest(unittest.TestCase):
                         self.assertEqual([s.argv for s in result], [argv])
                     else:
                         self.assertEqual(result, [])
-                        self.assertIn("skip session %s: not_claude" % P4242, "\n".join(cm.output))
+                        self.assertIn("skip session %s: not_claude" % P4242, _slash("\n".join(cm.output)))
 
     def test_duplicate_pid_newest_status_wins(self):
         files = {
@@ -547,7 +547,7 @@ class DiscoverTest(unittest.TestCase):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             result, _, _, _ = run(files)
         self.assertEqual([s.status for s in result], ["idle"])
-        self.assertIn("skip session %s: pid_reused" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: pid_reused" % P4242, _slash("\n".join(cm.output)))
 
     def test_winner_without_proc_start_uses_sibling_anchor(self):
         files = {
@@ -562,7 +562,7 @@ class DiscoverTest(unittest.TestCase):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             result, _, _, _ = run(files, proc=python, start=FakeStart({4242: [T0, LATER]}))
         self.assertEqual(result, [])
-        self.assertIn("skip session %s: pid_reused" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: pid_reused" % P4242, _slash("\n".join(cm.output)))
 
     def discover_with_env(self, env):
         proc = FakeProc({4242: ("/usr/local/bin/claude", ("claude",), env)})
@@ -582,7 +582,7 @@ class DiscoverTest(unittest.TestCase):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             result = self.discover_with_env({"CLAUDE_CONFIG_DIR": "rel/home"})
         self.assertEqual(result, [])
-        self.assertIn("skip session %s: config_dir_relative" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: config_dir_relative" % P4242, _slash("\n".join(cm.output)))
 
     def test_empty_terminal_handle_is_none(self):
         result = self.discover_with_env({"CLAUDE_CONFIG_DIR": "/h/acc1", "ORCA_TERMINAL_HANDLE": ""})
@@ -605,7 +605,7 @@ class DiscoverTest(unittest.TestCase):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             result, _, _, _ = run(files)
         self.assertEqual([s.pid for s in result], [9])
-        self.assertIn("skip session %s: invalid" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: invalid" % P4242, _slash("\n".join(cm.output)))
 
     def test_argv_preserved(self):
         argv = ("claude", "--resume", "00000000-0000-4000-8000-000000000042")

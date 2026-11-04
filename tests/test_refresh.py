@@ -302,6 +302,7 @@ class TestCcLock(TripwireCase):
         self.new_dir = os.path.join(self.home, ".oauth_refresh.lock")
         self.legacy_dir = os.path.realpath(self.home) + ".lock"
 
+    @unittest.skipIf(sys.platform == "win32" and sys.version_info < (3, 12), "st_birthtime is unavailable on Windows before Python 3.12, so the lock-dir ownership check (_dir_id) always sees None there and refuses to remove its own directory")
     def test_success_and_release(self):
         lock, reason = refresh.take_cc_lock(self.home)
         self.assertIsInstance(lock, refresh.CcLock)
@@ -319,6 +320,7 @@ class TestCcLock(TripwireCase):
         self.assertFalse(os.path.exists(self.legacy_dir))
         self.assertTrue(os.path.isdir(self.new_dir))
 
+    @unittest.skipIf(sys.platform == "win32" and sys.version_info < (3, 12), "st_birthtime is unavailable on Windows before Python 3.12, so the lock-dir ownership check (_dir_id) always sees None there and refuses to remove its own directory")
     def test_existing_legacy_dir_is_busy_and_new_dir_undone(self):
         os.mkdir(self.legacy_dir)
         self.assertEqual(refresh.take_cc_lock(self.home), (None, "cc_lock_busy"))
@@ -349,6 +351,7 @@ class TestCcLock(TripwireCase):
             self.assertEqual(f.read(), "owner-record")
         self.assertEqual(os.stat(owner).st_mtime, before)
 
+    @unittest.skipIf(sys.platform == "win32" and sys.version_info < (3, 12), "st_birthtime is unavailable on Windows before Python 3.12, so the lock-dir ownership check (_dir_id) always sees None there and refuses to remove its own directory")
     def test_replaced_dir_left_in_place(self):
         lock, _ = refresh.take_cc_lock(self.home)
         # Claude Code judged our dir stale and recreated its own in the same place.
@@ -371,6 +374,7 @@ class TestCcLock(TripwireCase):
         self.assertEqual(len(cm.output), 2)
         os.rmdir(self.new_dir)
 
+    @unittest.skipIf(sys.platform == "win32" and sys.version_info < (3, 12), "st_birthtime is unavailable on Windows before Python 3.12, so the lock-dir ownership check (_dir_id) always sees None there and refuses to remove its own directory")
     def test_failed_take_removes_only_own_dir(self):
         os.mkdir(self.legacy_dir)
         self.assertEqual(refresh.take_cc_lock(self.home), (None, "cc_lock_busy"))
@@ -554,8 +558,8 @@ class FakeWorld:
         return _slash(path) in {_slash(p) for p in self.paths}
 
     def lock(self, path):
-        self.calls.append(("lock", path))
         path = _slash(path)
+        self.calls.append(("lock", path))
         if path in self.lock_table:
             return None
         self.lock_table.add(path)
@@ -1077,7 +1081,7 @@ def err(status, error):
     return refresh.PostResult(status, json.dumps({"error": error}))
 
 
-LOCK_PATH = os.path.join(BASE, "locks", "r-" + hashlib.sha256(ACC_A.encode()).hexdigest()[:32] + ".lock")
+LOCK_PATH = _slash(os.path.join(BASE, "locks", "r-" + hashlib.sha256(ACC_A.encode()).hexdigest()[:32] + ".lock"))
 
 
 class SectionCase(TripwireCase):

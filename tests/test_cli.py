@@ -47,9 +47,15 @@ CFG = "/Users/user/Library/Application Support/claude-account-rotator-test/confi
 
 
 def _slash(path):
-    # Every fixture path here is written with forward slashes; os.path.abspath/join on Windows produce
-    # backslashes even from a "/"-only input, so lookups normalize both sides to "/" first.
-    return path.replace("\\", "/")
+    # Every fixture path here is written with forward slashes. os.path.join on Windows produces
+    # backslashes even from a "/"-only input, and os.path.abspath there goes through the real
+    # GetFullPathName API, which also resolves a leading "/" against the current drive (e.g.
+    # "D:\Users\...", not "\Users\..."); strip a drive prefix too so both sides compare equal
+    # regardless of which drive the real filesystem happens to use.
+    path = path.replace("\\", "/")
+    if len(path) >= 2 and path[1] == ":":
+        path = path[2:]
+    return path
 
 
 def reader(files):
