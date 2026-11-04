@@ -36,7 +36,7 @@ jobs:
         with:
           node-version: "22"
       - run: python --version
-      - run: python -m unittest discover -s tests -t . -v
+      - run: python -m unittest discover -s tests -t .
       - run: node --test scripts/release.check.mjs
 
   # Cuts a release for every push to main that changes something installable: bumps package.json from
