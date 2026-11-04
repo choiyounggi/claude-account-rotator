@@ -10,6 +10,8 @@ import subprocess
 import sys
 from typing import Any, Callable, List, NamedTuple, Optional, Tuple
 
+from rotator.windows import IS_WINDOWS
+
 ORCA_APP = "/Applications/Orca.app"
 ORCA_INFO_PLIST = os.path.join(ORCA_APP, "Contents", "Info.plist")
 # Orca keeps one folder per Claude account (claude-profiles/<id>/home) and the selected-host pointer from
@@ -61,13 +63,16 @@ def orca_version_windows(cli_path: Optional[str], *, run: Callable[..., Any] = s
 
     Electron intercepts ``--version`` on the app's own ``Orca.exe``, so the bundled CLI (src/cli/index.ts in the
     Orca source: ``argv[0] in ('--version', '-v')`` prints the bare version string) is the only reliable
-    way to read it; there is no Windows equivalent of macOS's Info.plist bundle version.
+    way to read it; there is no Windows equivalent of macOS's Info.plist bundle version. ``creationflags``
+    suppresses the console this would otherwise flash under pythonw.exe (the daemon start calls this via the
+    Orca gate, with no console of its own to flash into).
     """
     if not cli_path:
         return None
     try:
         proc = run([cli_path, "--version"], capture_output=True, text=True,
-                  timeout=ORCA_CLI_VERSION_TIMEOUT_S, check=False)
+                  timeout=ORCA_CLI_VERSION_TIMEOUT_S, check=False,
+                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0)
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0 or not isinstance(proc.stdout, str):

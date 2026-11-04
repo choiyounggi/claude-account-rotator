@@ -40,6 +40,11 @@ Identity = Tuple[int, str, Optional[str]]
 LEASE_MARGIN_S = 30.0
 STATE_FILENAME = "state.json"
 LOCK_FILENAME = "daemon.lock"
+# Windows only (see run_daemon/_watch_stop_request): a graceful-stop signal schtasks.install/uninstall write
+# before falling back to schtasks /End (TerminateProcess), which could otherwise kill a token refresh between
+# the token response and the write.
+STOP_REQUEST_FILENAME = "stop-request"
+STOP_REQUEST_POLL_S = 1.0
 SESSIONS_DIRNAME = "sessions"
 BACKUPS_DIRNAME = "backups"
 LOCKS_DIRNAME = "locks"
@@ -259,6 +264,7 @@ class Deps:
     lock: Callable[[str], Optional["FileLock"]]
     read_text: Callable[[str], str]
     write_text: Callable[[str, str], None]
+    unlink: Callable[[str], None]
     list_dir: Callable[[str], List[str]]
     isdir: Callable[[str], bool]
     pid_alive: Callable[[int], bool]
@@ -1021,6 +1027,8 @@ class Daemon:
 
     def __init__(self, cfg: Config, deps: Deps, logger: logging.Logger) -> None:
         self._cfg = cfg
+        # Live-session switching drives Orca's terminal (rotator.switcher), which is macOS-only this release.
+        self._switch_supported = not IS_WINDOWS
         self._deps = deps
         self._log = logger
         self._lock = threading.Lock()
@@ -1052,10 +1060,12 @@ class Daemon:
         return self._stop.is_set()
 
     def _may_switch(self) -> bool:
-        return self._cfg.auto_switch and not self._cfg.dry_run
+        return self._cfg.auto_switch and not self._cfg.dry_run and self._switch_supported
 
     def _may_write_pointer(self) -> bool:
-        return self._may_switch() and self._cfg.pointer_correction
+        # The user's auto_switch, not this OS's support: on Windows the pointer is still corrected (new sessions
+        # start on the best account) while no live session is switched.
+        return self._cfg.auto_switch and not self._cfg.dry_run and self._cfg.pointer_correction
 
     # -- tick ----------------------------------------------------------------------------------------------
 
@@ -1471,7 +1481,7 @@ class Daemon:
             "schema": SNAPSHOT_SCHEMA,
             "written_at": _iso(self._deps.now()),
             "daemon_pid": os.getpid(),
-            "flags": {"dry_run": cfg.dry_run, "auto_switch": cfg.auto_switch,
+            "flags": {"dry_run": cfg.dry_run, "auto_switch": cfg.auto_switch and self._switch_supported,
                       "pointer_correction": cfg.pointer_correction},
             "accounts": self._usage.summaries(),
             "pointer_account_id": self._pointer[0],
@@ -1533,6 +1543,8 @@ def run_daemon(cfg: Config, deps: Deps) -> int:
     """Run the daemon until SIGTERM/SIGINT; 0 on a clean stop, 1 when another daemon holds the lock,
     2 when profiles_root is missing."""
     log = deps.make_logger()
+    if IS_WINDOWS and cfg.auto_switch:
+        log.info("event=auto_switch_unavailable os=windows")  # see Daemon._switch_supported
     if not deps.isdir(cfg.profiles_root):
         log.error("event=profiles_root_missing path=%s", cfg.profiles_root)
         return 2
@@ -1549,8 +1561,18 @@ def run_daemon(cfg: Config, deps: Deps) -> int:
     held_logged = False
     try:
         lk.write_owner(os.getpid())
+        # Clear a stop-request left by a previous run: without this, a stale file from the last graceful
+        # stop (schtasks.install/uninstall) would make a freshly (re)started daemon stop itself right away.
+        deps.unlink(os.path.join(cfg.state_dir, STOP_REQUEST_FILENAME))
         d = Daemon(cfg, deps, log)
         deps.install_signals(d.request_stop)
+        if IS_WINDOWS:
+            stop_request_path = os.path.join(cfg.state_dir, STOP_REQUEST_FILENAME)
+            try:
+                deps.spawn(lambda: _watch_stop_request(deps, d._stop, stop_request_path, d.request_stop),
+                          "rotator-stop-watch")
+            except Exception as e:
+                log.error("event=stop_watch_spawn_error exc=%s", type(e).__name__)
         d._load_state()
         log.info("event=daemon_start pid=%d dry_run=%s auto_switch=%s pointer_correction=%s",
                  os.getpid(), cfg.dry_run, cfg.auto_switch, cfg.pointer_correction)
@@ -1592,6 +1614,23 @@ def _wait_stop(event: threading.Event, timeout: float) -> bool:
     return event.wait(timeout)
 
 
+def _watch_stop_request(deps: Deps, stop_event: threading.Event, path: str,
+                        request_stop: Callable[[], None]) -> None:
+    """Windows only (see run_daemon): calls ``request_stop`` once ``path`` exists, polling every
+    STOP_REQUEST_POLL_S. schtasks.install/uninstall write that file to ask the daemon to exit on its own --
+    draining in-flight token writes -- before falling back to ``/End`` (TerminateProcess)."""
+    while not stop_event.is_set():
+        try:
+            deps.read_text(path)
+        except Exception:
+            pass
+        else:
+            request_stop()
+            return
+        if deps.wait_stop(stop_event, STOP_REQUEST_POLL_S):
+            return
+
+
 def _pid_alive(pid: object) -> bool:
     # pid 0 or a negative pid would signal a whole process group.
     if type(pid) is not int or pid <= 0:
@@ -1605,7 +1644,8 @@ def _install_signals(handler: Callable[[], None]) -> None:
 
 
 def _make_logger() -> logging.Logger:
-    return setup_logging(LOG_DIR_DEFAULT, sys.stderr.isatty())
+    # Under pythonw.exe (no console) sys.stderr is None.
+    return setup_logging(LOG_DIR_DEFAULT, sys.stderr is not None and sys.stderr.isatty())
 
 
 def _read_limit(s: Session) -> Optional[Tuple[str, datetime]]:
@@ -1614,13 +1654,21 @@ def _read_limit(s: Session) -> Optional[Tuple[str, datetime]]:
 
 def real_deps(cfg: Config) -> Deps:
     """The only constructor of real seams; building it touches nothing."""
-    r = refresh.Refresher(cfg, read_item=accounts.read_keychain_item, item_exists=accounts.keychain_item_exists,
-                          account_name=accounts.claude_code_keychain_account, write_item=accounts.write_keychain_item,
+    if IS_WINDOWS:
+        store_seams: Dict[str, Any] = dict(read_item=accounts.read_credentials_item,
+                                           item_exists=accounts.credentials_item_exists,
+                                           write_item=accounts.write_credentials_item,
+                                           store_key=lambda p: p.home)
+    else:
+        store_seams = dict(read_item=accounts.read_keychain_item, item_exists=accounts.keychain_item_exists,
+                           write_item=accounts.write_keychain_item)
+    r = refresh.Refresher(cfg, account_name=accounts.claude_code_keychain_account,
                           post=refresh._urllib_post, discover=sessions.discover_sessions, list_dir=os.listdir,
                           pid_alive=_pid_alive, exists=os.path.lexists, lock=try_lock, cc_lock=refresh.take_cc_lock,
                           now=_utc_now, monotonic=time.monotonic, sleep=time.sleep,
                           log=logging.getLogger("rotator.refresh"), find_claude=refresh.find_claude_binary,
-                          run_claude=refresh.run_claude_quiet, environ=os.environ.copy)
+                          run_claude=refresh.run_claude_quiet, environ=os.environ.copy, is_windows=IS_WINDOWS,
+                          **store_seams)
     return Deps(discover_profiles=accounts.discover_profiles, fetch_usage=usage.fetch_usage,
                 refresh_token=r.refresh, refresh_held=r.held_accounts,
                 discover_sessions=sessions.discover_sessions_with_model, read_limit=_read_limit,
@@ -1628,6 +1676,6 @@ def real_deps(cfg: Config) -> Deps:
                 make_driver=switcher.OrcaCliDriver, procs=switcher.OsProcessProbe(),
                 read_pointer=pointer.read_selected_host, write_pointer=pointer.set_selected_host,
                 now=_utc_now, monotonic=time.monotonic, spawn=_spawn, wait_stop=_wait_stop, lock=try_lock,
-                read_text=_read_text_utf8, write_text=atomic_write_text, list_dir=os.listdir,
+                read_text=_read_text_utf8, write_text=atomic_write_text, unlink=_unlink_quiet, list_dir=os.listdir,
                 isdir=os.path.isdir, pid_alive=_pid_alive, install_signals=_install_signals,
                 make_logger=_make_logger)

@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from rotator import accounts, sessions, usage
 from rotator.config import Config
 from rotator.models import Profile
+from rotator.windows import IS_WINDOWS
 
 log = logging.getLogger("rotator.refresh")
 log.addHandler(logging.NullHandler())
@@ -211,18 +212,32 @@ def dump_document(doc: Mapping[str, Any]) -> str:
     return json.dumps(doc, separators=(",", ":"), ensure_ascii=False)
 
 
-def _dir_id(path: str) -> Optional[Tuple[int, float]]:
-    """(inode, birth time) of a dir, or None when it cannot be read."""
+Stat = Callable[[str], Any]
+
+
+def _dir_id(path: str, *, stat: Stat = os.stat, is_windows: bool = IS_WINDOWS) -> Optional[Tuple[int, float]]:
+    """(inode, creation time) of a dir, or None when it cannot be read.
+
+    Creation time is ``st_birthtime`` where the platform has it. Before Python 3.12, Windows stat
+    results have no ``st_birthtime`` at all; there, ``st_ctime`` is the creation time instead (it is
+    the inode-change time on POSIX, which is why it is only trusted when ``is_windows``).
+    """
     try:
-        st = os.stat(path)
-        return st.st_ino, st.st_birthtime
-    except (OSError, AttributeError):
+        st = stat(path)
+    except OSError:
         return None
+    bt = getattr(st, "st_birthtime", None)
+    if isinstance(bt, (int, float)) and not isinstance(bt, bool):
+        return st.st_ino, bt
+    if is_windows:
+        return st.st_ino, st.st_ctime
+    return None
 
 
-def _remove_if_ours(path: str, ident: Optional[Tuple[int, float]]) -> None:
+def _remove_if_ours(path: str, ident: Optional[Tuple[int, float]], *, stat: Stat = os.stat,
+                    is_windows: bool = IS_WINDOWS) -> None:
     # A dir that Claude Code judged stale and recreated is someone else's lock now: never remove it.
-    if ident is None or _dir_id(path) != ident:
+    if ident is None or _dir_id(path, stat=stat, is_windows=is_windows) != ident:
         log.warning("event=cc_lock_release_skipped reason=not_ours")
         return
     try:
@@ -234,10 +249,13 @@ def _remove_if_ours(path: str, ident: Optional[Tuple[int, float]]) -> None:
 class CcLock:
     """Claude Code's refresh lock dirs this process created, in creation order, with their identities."""
 
-    __slots__ = ("_dirs",)
+    __slots__ = ("_dirs", "_stat", "_is_windows")
 
-    def __init__(self, dirs: Sequence[Tuple[str, Optional[Tuple[int, float]]]]) -> None:
+    def __init__(self, dirs: Sequence[Tuple[str, Optional[Tuple[int, float]]]], *, stat: Stat = os.stat,
+                is_windows: bool = IS_WINDOWS) -> None:
         self._dirs = list(dirs)
+        self._stat = stat
+        self._is_windows = is_windows
 
     def touch(self) -> None:
         # Claude Code treats a dir whose mtime is older than CC_LOCK_STALE_S as stale.
@@ -248,13 +266,14 @@ class CcLock:
                 pass
 
     def release(self) -> None:
-        """Remove each dir still ours (same inode and birth time), legacy first; leave any other in place."""
+        """Remove each dir still ours (same inode and creation time), legacy first; leave any other in place."""
         for d, ident in reversed(self._dirs):
-            _remove_if_ours(d, ident)
+            _remove_if_ours(d, ident, stat=self._stat, is_windows=self._is_windows)
         self._dirs = []
 
 
-def take_cc_lock(home: str, *, now_s: Callable[[], float] = time.time) -> Tuple[Optional[CcLock], Optional[str]]:
+def take_cc_lock(home: str, *, now_s: Callable[[], float] = time.time, stat: Stat = os.stat,
+                 is_windows: bool = IS_WINDOWS) -> Tuple[Optional[CcLock], Optional[str]]:
     """One non-blocking attempt at Claude Code's new then legacy lock dir; (lock, None) or (None, reason).
 
     Never waits, never takes over a stale dir and never touches the ``.owner`` record.
@@ -271,12 +290,12 @@ def take_cc_lock(home: str, *, now_s: Callable[[], float] = time.time) -> Tuple[
             reason = "cc_lock_busy"
         if reason is not None:
             break
-        made.append((d, _dir_id(d)))
+        made.append((d, _dir_id(d, stat=stat, is_windows=is_windows)))
     if reason is not None:
         for d, ident in reversed(made):
-            _remove_if_ours(d, ident)
+            _remove_if_ours(d, ident, stat=stat, is_windows=is_windows)
         return None, reason
-    return CcLock(made), None
+    return CcLock(made, stat=stat, is_windows=is_windows), None
 
 
 def _busy_or_stale(path: str, now_s: Callable[[], float]) -> str:
@@ -391,7 +410,9 @@ class Refresher:
                  monotonic: Callable[[], float], sleep: Callable[[float], None], log: logging.Logger,
                  find_claude: Callable[[Sequence[str]], Optional[str]],
                  run_claude: Callable[[Sequence[str], Mapping[str, str], str, float], str],
-                 environ: Callable[[], Mapping[str, str]]) -> None:
+                 environ: Callable[[], Mapping[str, str]],
+                 store_key: Callable[[Profile], str] = lambda p: p.keychain_service,
+                 is_windows: bool = IS_WINDOWS) -> None:
         self._cfg = cfg
         self._read_item = read_item
         self._item_exists = item_exists
@@ -411,6 +432,8 @@ class Refresher:
         self._find_claude = find_claude
         self._run_claude = run_claude
         self._environ = environ
+        self._store_key = store_key
+        self._is_windows = is_windows
         self._states: Dict[str, _State] = {}
 
     def __repr__(self) -> str:
@@ -497,7 +520,7 @@ class Refresher:
 
     def _refresh(self, profile: Profile, profiles: Sequence[Profile], st: _State, network: bool,
                  warm: bool = False) -> dict:
-        aid, svc = profile.account_id, profile.keychain_service
+        aid, svc = profile.account_id, self._store_key(profile)
         # A held set is a restore of tokens the server already issued, so it ignores
         # the switch, dry-run and live-session checks below.
         if st.held is not None:
@@ -530,19 +553,21 @@ class Refresher:
             return self._record(aid, st, "not_needed", "fresh")
         if rt == "" or not accounts._TOKEN_RE.fullmatch(rt):
             return self._record(aid, st, "skipped", "no_refresh_token")
-        if self._exists(os.path.join(profile.home, ".credentials.json")):
+        if not self._is_windows and self._exists(os.path.join(profile.home, ".credentials.json")):
             return self._record(aid, st, "skipped", "plaintext_store")
         argv0s: List[str] = []
         why = self._live(profile, profiles, argv0s)
         if why is not None:
-            if why == "live_session" and self._cfg.session_token_warmup:
+            if why == "live_session" and self._cfg.session_token_warmup and not self._is_windows:
                 if self._monotonic() < st.warm_until:
                     if st.record is not None and st.record["reason"] == "warmup_failed":
                         return self._previous(st)
                 elif warm and network:
                     return self._warm_up(profile, st, svc, acct, oauth["expiresAt"], argv0s)
             return self._record(aid, st, "skipped", why)
-        if len(accounts.security_add_line(svc, acct, raw)) + PAYLOAD_MARGIN_CHARS > accounts.SECURITY_STDIN_MAX:
+        # The stdin-line length limit is a macOS `security` constraint; the Windows plaintext store has none.
+        if not self._is_windows and (len(accounts.security_add_line(svc, acct, raw)) + PAYLOAD_MARGIN_CHARS
+                                      > accounts.SECURITY_STDIN_MAX):
             return self._record(aid, st, "skipped", "payload_too_large")
         if not network:
             return self._record(aid, st, "skipped", "deferred")
@@ -618,7 +643,7 @@ class Refresher:
 
     def _locked(self, profile: Profile, profiles: Sequence[Profile], st: _State, acct: str, oauth: dict,
                 rlock: Any, cc: Any, t_lock: float) -> dict:
-        aid, svc = profile.account_id, profile.keychain_service
+        aid, svc = profile.account_id, self._store_key(profile)
         cc.touch()
         raw2 = self._read_item(svc, acct)
         parsed = _parse_item(raw2) if raw2 is not None else None
@@ -746,7 +771,9 @@ class Refresher:
 
     def _try_write(self, svc: str, acct: str, doc: dict, tokens: _Tokens, cc: Any) -> bool:
         text = dump_document(build_document(doc, tokens))
-        if len(accounts.security_add_line(svc, acct, text)) > accounts.SECURITY_STDIN_MAX:
+        # The stdin-line length limit is a macOS `security` constraint, and `svc` is not a Keychain
+        # service name on Windows (it is whatever store_key returns, e.g. profile.home).
+        if not self._is_windows and len(accounts.security_add_line(svc, acct, text)) > accounts.SECURITY_STDIN_MAX:
             return False
         cc.touch()
         ok = self._write_item(svc, acct, text)
@@ -762,7 +789,7 @@ class Refresher:
     def _write_window(self, profile: Profile, st: _State, acct: str, tokens: _Tokens, posted_fp: bytes,
                       rlock: Any, cc: Any) -> dict:
         """Store a 200's token set; on total failure hold it (and ``rlock``) in memory. Never releases a lock."""
-        aid, svc = profile.account_id, profile.keychain_service
+        aid, svc = profile.account_id, self._store_key(profile)
         outcome = None
         try:
             for n in range(1, WRITE_ATTEMPTS + 1):
@@ -796,7 +823,7 @@ class Refresher:
 
     def _flush(self, profile: Profile, st: _State) -> dict:
         """One attempt to store a held set; never posts."""
-        aid, svc, held = profile.account_id, profile.keychain_service, st.held
+        aid, svc, held = profile.account_id, self._store_key(profile), st.held
         outcome = "failed"
         try:
             acct = self._account_name()
