@@ -119,8 +119,9 @@ rotator status --watch
   starts a second copy, and `RestartOnFailure` (every 1 minute, up to 999 times).
 - `uninstall` ends and deletes that task, then removes the app copy; running it when nothing is installed
   prints "not installed" and is not an error.
-- **Not yet supported**: `rotator switch`, and automatic switching of a session that is already running. Each
-  refuses with one clear line and exit code 2 instead of running.
+- **Not yet supported**: `rotator switch` refuses with one clear line and exit code 2. The daemon never switches
+  a session that is already running; it logs `event=auto_switch_unavailable os=windows` once at start and keeps
+  correcting `selected-host` (both still follow `auto_switch`, `pointer_correction` and `dry_run` as on macOS).
 
 This has been verified in CI only (GitHub Actions `windows-latest`, Python 3.9 and 3.12) — it has not yet been
 run on a real Windows machine.

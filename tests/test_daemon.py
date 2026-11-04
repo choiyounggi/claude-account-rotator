@@ -1763,20 +1763,15 @@ class TestTickPointer(TickBase):
         self.assertEqual(len(self.env.logs("pointer_write")), 1)
 
     def test_pointer_gates(self):
-        for kw in ({"dry_run": True}, {"pointer_correction": False}):
+        # README: `auto_switch: false` never switches and never writes selected-host.
+        for kw in ({"dry_run": True}, {"auto_switch": False, "pointer_correction": True},
+                   {"pointer_correction": False}):
             with self.subTest(kw=kw):
                 self.env.calls.clear()
                 self.make(make_cfg(usage_poll_s=60.0, **kw))
                 self.d.tick()
                 self.assertEqual(self.pointer_writes(), [])
                 self.assertEqual(self.snap()["pointer_target_account_id"], ACC_B)
-
-    def test_pointer_correction_independent_of_auto_switch(self):
-        # auto_switch only gates live-session switching; pointer correction (which new sessions start on) is a
-        # separate feature and stays on so it still works on Windows, where auto_switch is always forced off.
-        self.make(make_cfg(usage_poll_s=60.0, auto_switch=False, pointer_correction=True))
-        self.d.tick()
-        self.assertEqual(self.pointer_writes(), [("write_pointer", ACC_B)])
 
     def test_pointer_none_or_unknown(self):
         for text in (None, "/Users/user/elsewhere"):
@@ -2734,8 +2729,8 @@ class TestRunDaemon(RunDaemonBase):
 
 
 class TestRunDaemonWindowsAutoSwitch(RunDaemonBase):
-    """Windows forces auto_switch off at daemon start (switcher.* must stay macOS-only); pointer correction
-    stays on, since it is a separate feature from live-session switching (see TestTickPointer)."""
+    """Windows cannot switch live sessions yet (switcher.* is macOS-only), so the daemon never dispatches one
+    there; everything else `auto_switch` allows, pointer correction included, still runs."""
 
     def setUp(self):
         super().setUp()
@@ -2766,6 +2761,8 @@ class TestRunDaemonWindowsAutoSwitch(RunDaemonBase):
         with unittest.mock.patch.object(daemon, "IS_WINDOWS", True):
             self.assertEqual(self.run_d(), 0)
         self.assertEqual(self.env.logs("auto_switch_unavailable"), [])
+        # auto_switch: false keeps its documented meaning on Windows too: no selected-host writes either.
+        self.assertEqual([c for c in self.env.calls if c[0] == "write_pointer"], [])
 
 
 class TestDaemonStartNoConsole(RunDaemonBase):

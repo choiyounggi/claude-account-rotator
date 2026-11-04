@@ -1021,6 +1021,8 @@ class Daemon:
 
     def __init__(self, cfg: Config, deps: Deps, logger: logging.Logger) -> None:
         self._cfg = cfg
+        # Live-session switching drives Orca's terminal (rotator.switcher), which is macOS-only this release.
+        self._switch_supported = not IS_WINDOWS
         self._deps = deps
         self._log = logger
         self._lock = threading.Lock()
@@ -1052,12 +1054,12 @@ class Daemon:
         return self._stop.is_set()
 
     def _may_switch(self) -> bool:
-        return self._cfg.auto_switch and not self._cfg.dry_run
+        return self._cfg.auto_switch and not self._cfg.dry_run and self._switch_supported
 
     def _may_write_pointer(self) -> bool:
-        # Independent of auto_switch: pointer correction only points new sessions, never touches a running one,
-        # so it stays on even where auto_switch is forced off (Windows; see run_daemon).
-        return self._cfg.pointer_correction and not self._cfg.dry_run
+        # The user's auto_switch, not this OS's support: on Windows the pointer is still corrected (new sessions
+        # start on the best account) while no live session is switched.
+        return self._cfg.auto_switch and not self._cfg.dry_run and self._cfg.pointer_correction
 
     # -- tick ----------------------------------------------------------------------------------------------
 
@@ -1473,7 +1475,7 @@ class Daemon:
             "schema": SNAPSHOT_SCHEMA,
             "written_at": _iso(self._deps.now()),
             "daemon_pid": os.getpid(),
-            "flags": {"dry_run": cfg.dry_run, "auto_switch": cfg.auto_switch,
+            "flags": {"dry_run": cfg.dry_run, "auto_switch": cfg.auto_switch and self._switch_supported,
                       "pointer_correction": cfg.pointer_correction},
             "accounts": self._usage.summaries(),
             "pointer_account_id": self._pointer[0],
@@ -1536,9 +1538,7 @@ def run_daemon(cfg: Config, deps: Deps) -> int:
     2 when profiles_root is missing."""
     log = deps.make_logger()
     if IS_WINDOWS and cfg.auto_switch:
-        # Live-session switching drives Orca's terminal (rotator.switcher), which is macOS-only this release.
-        log.info("event=auto_switch_unavailable os=windows")
-        cfg = dataclasses.replace(cfg, auto_switch=False)
+        log.info("event=auto_switch_unavailable os=windows")  # see Daemon._switch_supported
     if not deps.isdir(cfg.profiles_root):
         log.error("event=profiles_root_missing path=%s", cfg.profiles_root)
         return 2
