@@ -1,5 +1,8 @@
 """rotator.windows: Windows-only primitives, exercised on any OS through their injectable probes."""
 import os
+import struct
+import subprocess
+import sys
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
@@ -47,6 +50,20 @@ class FakeKernel32:
     def SetConsoleMode(self, handle, mode):
         self.set_calls.append(mode)
         return 1 if self._set_ok else 0
+
+
+class FakeProcessMemory:
+    """A stand-in for ReadProcessMemory: maps address -> bytes. Slicing a block shorter than the
+    requested size (or missing entirely) simulates a short/failed read, without raising itself --
+    that lets a test prove read_proc's own length check is what turns it into an OSError."""
+
+    def __init__(self, blocks):
+        self.blocks = blocks
+        self.calls = []
+
+    def read(self, handle, address, size):
+        self.calls.append((handle, address, size))
+        return self.blocks.get(address, b"")[:size]
 
 
 def _counter(start=0.0, step=0.01):
@@ -107,12 +124,140 @@ class ProcStartTests(unittest.TestCase):
         self.assertEqual(windows.proc_start(123, probe=lambda pid: (low, high)), target)
 
 
-class ReadProcTests(unittest.TestCase):
-    def test_probe_path_becomes_exec_path_with_empty_argv_env(self):
-        self.assertEqual(windows.read_proc(123, probe=lambda pid: "claude.exe"), ("claude.exe", (), {}))
+class ParseEnvBlockTests(unittest.TestCase):
+    def test_normal_block(self):
+        data = "A=1\x00BB=two\x00\x00".encode("utf-16-le")
+        self.assertEqual(windows.parse_env_block(data), {"A": "1", "BB": "two"})
 
-    def test_missing_image_path_is_empty_string(self):
-        self.assertEqual(windows.read_proc(123, probe=lambda pid: None), ("", (), {}))
+    def test_empty_block(self):
+        self.assertEqual(windows.parse_env_block(b""), {})
+
+    def test_missing_final_terminator_still_parses(self):
+        data = "A=1\x00B=2".encode("utf-16-le")  # no trailing double NUL
+        self.assertEqual(windows.parse_env_block(data), {"A": "1", "B": "2"})
+
+    def test_drive_relative_cwd_entries_are_skipped(self):
+        data = "=C:=C:\\x\x00PATH=C:\\bin\x00\x00".encode("utf-16-le")
+        self.assertEqual(windows.parse_env_block(data), {"PATH": "C:\\bin"})
+
+    def test_non_ascii_values_round_trip(self):
+        data = "GREETING=caf\u00e9 \u00e8\x00\x00".encode("utf-16-le")
+        self.assertEqual(windows.parse_env_block(data), {"GREETING": "caf\u00e9 \u00e8"})
+
+
+class ReadProcTests(unittest.TestCase):
+    def test_missing_image_path_raises(self):
+        with self.assertRaises(OSError):
+            windows.read_proc(123, probe=lambda pid: None)
+
+    def test_32bit_python_raises_without_opening_a_handle(self):
+        def boom(pid):
+            raise AssertionError("open_vm_handle must not be called for a 32-bit Python")
+
+        with self.assertRaises(OSError):
+            windows.read_proc(123, probe=lambda pid: "x.exe", pointer_size=lambda: 4,
+                              open_vm_handle=boom)
+
+    def test_open_vm_handle_failure_raises(self):
+        def boom(pid):
+            raise OSError("OpenProcess failed")
+
+        with self.assertRaises(OSError):
+            windows.read_proc(123, probe=lambda pid: "x.exe", open_vm_handle=boom)
+
+    def test_wow64_target_raises_and_still_closes_handle(self):
+        closed = []
+        with self.assertRaises(OSError):
+            windows.read_proc(123, probe=lambda pid: "x.exe", open_vm_handle=lambda pid: 7,
+                              close_handle=closed.append, is_wow64=lambda h: True)
+        self.assertEqual(closed, [7])
+
+    def test_short_read_raises(self):
+        peb, params = 0x1000, 0x2000
+        mem = FakeProcessMemory({peb + 0x20: struct.pack("<Q", params), params + 0x70: b"short"})
+        with self.assertRaises(OSError):
+            windows.read_proc(123, probe=lambda pid: "x.exe", open_vm_handle=lambda pid: 7,
+                              close_handle=lambda h: None, is_wow64=lambda h: False,
+                              peb_address=lambda h: peb, read_memory=mem.read)
+
+    def test_fills_argv_and_env_via_the_peb(self):
+        peb, params, cmdline_buf, env_buf = 0x7FF000000000, 0x1230000, 0x1230100, 0x1240000
+        command_line = 'node.exe "ARG ONE" x'
+        cmdline_utf16 = command_line.encode("utf-16-le")
+        env_block = "CLAUDE_CONFIG_DIR=C:\\fake\\home\x00ORCA_TERMINAL_HANDLE=term_fake123\x00\x00"
+        env_bytes = env_block.encode("utf-16-le")
+        mem = FakeProcessMemory({
+            peb + 0x20: struct.pack("<Q", params),
+            params + 0x70: struct.pack("<HH4xQ", len(cmdline_utf16), len(cmdline_utf16), cmdline_buf),
+            params + 0x80: struct.pack("<Q", env_buf),
+            params + 0x3F0: struct.pack("<Q", len(env_bytes)),
+            cmdline_buf: cmdline_utf16,
+            env_buf: env_bytes,
+        })
+        split_calls = []
+
+        def split_command_line(cl):
+            split_calls.append(cl)
+            return ("node.exe", "ARG ONE", "x")
+
+        exec_path, argv, env = windows.read_proc(
+            123, probe=lambda pid: "node.exe", open_vm_handle=lambda pid: 99,
+            close_handle=lambda h: None, is_wow64=lambda h: False, peb_address=lambda h: peb,
+            read_memory=mem.read, split_command_line=split_command_line)
+
+        self.assertEqual(exec_path, "node.exe")
+        self.assertEqual(argv, ("node.exe", "ARG ONE", "x"))
+        self.assertEqual(env, {"CLAUDE_CONFIG_DIR": "C:\\fake\\home", "ORCA_TERMINAL_HANDLE": "term_fake123"})
+        self.assertEqual(split_calls, [command_line])
+
+
+class ProcessTableTests(unittest.TestCase):
+    def test_builds_pid_to_parent_and_name_map(self):
+        rows = [(100, 1, "explorer.exe"), (200, 100, "cmd.exe")]
+        self.assertEqual(windows.process_table(snapshot_probe=lambda: rows),
+                         {100: (1, "explorer.exe"), 200: (100, "cmd.exe")})
+
+    def test_empty_snapshot_raises(self):
+        with self.assertRaises(OSError):
+            windows.process_table(snapshot_probe=lambda: [])
+
+    def test_probe_failure_propagates(self):
+        def boom():
+            raise OSError("CreateToolhelp32Snapshot failed")
+
+        with self.assertRaises(OSError):
+            windows.process_table(snapshot_probe=boom)
+
+
+@unittest.skipUnless(sys.platform == "win32", "exercises real Windows process introspection")
+class RealWindowsReadProcTests(unittest.TestCase):
+    """Only these run for real -- on CI's windows-latest runners. Everything above exercises the same
+    code through injected probes, on any OS."""
+
+    def setUp(self):
+        self.child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)", "ARG ONE", "x"],
+            env=dict(os.environ, ORCA_TERMINAL_HANDLE="term_fake123", CLAUDE_CONFIG_DIR=r"C:\fake\home"),
+        )
+        self.addCleanup(self.child.kill)
+        self.addCleanup(self.child.wait)
+
+    def test_read_proc_reads_real_argv_and_env(self):
+        exec_path, argv, env = windows.read_proc(self.child.pid)
+        self.assertEqual(argv[-2:], ("ARG ONE", "x"))
+        self.assertEqual(env.get("ORCA_TERMINAL_HANDLE"), "term_fake123")
+        self.assertEqual(env.get("CLAUDE_CONFIG_DIR"), r"C:\fake\home")
+
+    def test_process_table_includes_child_with_parent_and_image_name(self):
+        table = windows.process_table()
+        self.assertEqual(table[self.child.pid], (os.getpid(), os.path.basename(sys.executable).lower()))
+
+    def test_read_proc_on_exited_pid_raises(self):
+        pid = self.child.pid
+        self.child.kill()
+        self.child.wait()
+        with self.assertRaises(OSError):
+            windows.read_proc(pid)
 
 
 class EnableVtModeTests(unittest.TestCase):

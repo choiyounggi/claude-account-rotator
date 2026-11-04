@@ -145,6 +145,13 @@ class WindowsDispatchTest(unittest.TestCase):
             self.assertIs(rotator.sessions._pid_alive(123), True)
         self.assertEqual(calls, [123])
 
+    def test_is_claude_accepts_a_windows_node_script_with_backslash_separators(self):
+        argv = ("node", r"C:\Users\x\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js")
+        self.assertTrue(rotator.sessions._is_claude(r"C:\Program Files\nodejs\node.exe", argv))
+
+    def test_is_claude_rejects_unrelated_windows_exe(self):
+        self.assertFalse(rotator.sessions._is_claude(r"C:\Windows\notepad.exe", ("notepad.exe",)))
+
 
 def _slash(path):
     # Every fixture path in this file is written with forward slashes; os.path.join on Windows joins
@@ -587,6 +594,12 @@ class DiscoverTest(unittest.TestCase):
     def test_empty_terminal_handle_is_none(self):
         result = self.discover_with_env({"CLAUDE_CONFIG_DIR": "/h/acc1", "ORCA_TERMINAL_HANDLE": ""})
         self.assertEqual([s.terminal_handle for s in result], [None])
+
+    def test_config_dir_and_terminal_handle_lookups_are_case_insensitive(self):
+        # Windows env names are case-insensitive; rotator.windows.parse_env_block keeps whatever
+        # casing the process actually used, so sessions.py must match these two keys regardless of it.
+        result = self.discover_with_env({"claude_config_dir": "/h/acc1", "Orca_Terminal_Handle": HANDLE})
+        self.assertEqual([(s.config_dir, s.terminal_handle) for s in result], [("/h/acc1", HANDLE)])
 
     def test_status_mapping(self):
         cases = [(entry(4242, status="busy"), "busy"), (entry(4242, status="compacting"), "unknown"),
