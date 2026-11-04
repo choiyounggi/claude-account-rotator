@@ -10,6 +10,7 @@ import functools
 import json
 import logging
 import math
+import ntpath
 import os
 import platform
 import re
@@ -1192,6 +1193,9 @@ class WindowsTerm:
 
 
 def _on_sigterm(signum: int, frame: Any) -> None:
+    # Only the first SIGTERM stops the dashboard: started through bin/rotator.cjs, a signal to the whole process
+    # group arrives twice, and a second KeyboardInterrupt would cut the terminal cleanup short.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     raise KeyboardInterrupt
 
 
@@ -1249,11 +1253,23 @@ def _real_stale_check(cfg: Config) -> Callable[[], bool]:
     return lambda: launchd.install_stale(launchd.plist_path_default(), cfg.state_dir, launchd.repo_root())
 
 
-WINDOWS_ORCA_CLI_WHERE = "orca.exe on PATH"
+WINDOWS_ORCA_CLI_WHERE = "orca.cmd on PATH"
 
 
-def _windows_orca_cli_path() -> Optional[str]:
-    return shutil.which("orca.exe") or shutil.which("orca")
+def _windows_orca_cli_path(which: Optional[Callable[[str], Optional[str]]] = None) -> Optional[str]:
+    """Orca's CLI on Windows: ``orca.cmd`` (Orca's command name there), else an ``orca`` launcher in a ``bin``
+    folder (Orca ships both under ``resources\\bin``). The app's own ``Orca.exe`` also matches ``orca.exe``
+    because Windows names ignore case, but it is Electron and ``--version`` would open the app, so any hit
+    outside a ``bin`` folder is skipped."""
+    which = which or shutil.which
+    found = which("orca.cmd")
+    if found:
+        return found
+    for name in ("orca.exe", "orca"):
+        found = which(name)
+        if found and ntpath.basename(ntpath.dirname(found)).lower() == "bin":
+            return found
+    return None
 
 
 def _real_orca_gate() -> Optional[str]:
@@ -1277,7 +1293,7 @@ def _doctor(cfg: Config, deps: Deps, out: TextIO, stale: bool, config_error: Opt
         checks = [doctor.check_system(system), doctor.check_python(sys.version_info[:3]),
                   doctor.check_config(config_error),
                   doctor.check_orca(version, where=WINDOWS_ORCA_CLI_WHERE),
-                  doctor.check_orca_cli(cli_path or "orca.exe", cli_path is not None),
+                  doctor.check_orca_cli(cli_path or "orca.cmd", cli_path is not None),
                   doctor.check_accounts(count, cfg.profiles_root),
                   doctor.check_agent(False, False, supported=False)]
     else:
@@ -1395,7 +1411,7 @@ def _status(args: argparse.Namespace, cfg: Config, deps: Deps, out: TextIO, err:
             width = shutil.get_terminal_size((100, 40)).columns
             out.write("\n".join(render(build_status(cfg, deps, now), now, tz, width, **opts)) + "\n")
             return 0
-        if read_key is None and isinstance(term, RealTerm) and _isatty(inp):
+        if read_key is None and isinstance(term, (RealTerm, WindowsTerm)) and _isatty(inp):
             read_key = term.read_key
         prev_sigterm: Any = False
         try:
@@ -1408,10 +1424,14 @@ def _status(args: argparse.Namespace, cfg: Config, deps: Deps, out: TextIO, err:
             _watch(cfg, deps, out, tz, opts, term is not None, read_key, interval)
         finally:
             if prev_sigterm is not False:
-                signal.signal(signal.SIGTERM, signal.SIG_DFL if prev_sigterm is None else prev_sigterm)
-            if term is not None:
-                term.show_cursor()
-                term.leave_alt()
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)  # a late copy of the signal must not stop the cleanup
+            try:
+                if term is not None:
+                    term.show_cursor()
+                    term.leave_alt()
+            finally:
+                if prev_sigterm is not False:
+                    signal.signal(signal.SIGTERM, signal.SIG_DFL if prev_sigterm is None else prev_sigterm)
         return 0
     except KeyboardInterrupt:
         return 0

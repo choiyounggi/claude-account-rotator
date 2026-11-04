@@ -89,12 +89,12 @@ has a default. From a checkout, run `bin/rotator` instead of `rotator`
 
 Windows support starts with `doctor` and the dashboard; automatic switching is still macOS-only.
 
-**Works today**: `rotator doctor` (OS-aware checks: Orca's version via `orca.exe --version`, the orca CLI on
+**Works today**: `rotator doctor` (OS-aware checks: Orca's version via `orca.cmd --version`, the orca CLI on
 PATH, Claude accounts under `%APPDATA%\orca\claude-profiles`) and the dashboard (`rotator status`,
 `rotator status --watch`, `rotator status --json`).
 
 **Requirements**: Windows 10 or 11; Python 3.9 or newer from [python.org](https://www.python.org/) or the
-Microsoft Store (`python` or `py -3` on PATH); Orca **1.4.224 or newer** with its CLI (`orca.exe`) on PATH.
+Microsoft Store (`python` or `py -3` on PATH); Orca **1.4.224 or newer** with its CLI (`orca.cmd`, under `resources\bin`) on PATH.
 
 **Install**:
 

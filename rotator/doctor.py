@@ -59,7 +59,7 @@ def orca_version(read_plist: Callable[[str], dict] = _read_plist) -> Optional[st
 def orca_version_windows(cli_path: Optional[str], *, run: Callable[..., Any] = subprocess.run) -> Optional[str]:
     """Orca's version on Windows via ``<cli_path> --version``; None when ``cli_path`` is unset or it fails.
 
-    Electron intercepts a direct ``orca.exe --version``, so the bundled CLI (src/cli/index.ts in the
+    Electron intercepts ``--version`` on the app's own ``Orca.exe``, so the bundled CLI (src/cli/index.ts in the
     Orca source: ``argv[0] in ('--version', '-v')`` prints the bare version string) is the only reliable
     way to read it; there is no Windows equivalent of macOS's Info.plist bundle version.
     """

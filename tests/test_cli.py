@@ -3043,6 +3043,32 @@ class TestWatchTerminal(MainBase):
     def term_frames(self):
         return [f for f in self.out.getvalue().split("\x1b[H\x1b[2J") if f]
 
+    @unittest.skipIf(sys.platform == "win32", "os.kill(SIGTERM) on Windows terminates without running handlers")
+    def test_a_second_sigterm_does_not_cut_the_cleanup_short(self):
+        # A signal to the whole process group reaches the dashboard twice when started through bin/rotator.cjs
+        # (once directly, once passed on by the launcher). Both may land while the first is being handled.
+        seen = []
+        def outer(*_):
+            seen.append("outer")
+        prev = signal.signal(signal.SIGTERM, outer)
+        self.addCleanup(signal.signal, signal.SIGTERM, prev)
+
+        class SignalledTerm(FakeTerm):
+            def show_cursor(self):  # the cleanup itself: a late copy of the signal lands here
+                os.kill(os.getpid(), signal.SIGTERM)
+                super().show_cursor()
+
+        def hook(k):
+            self.env.advance(1.0)
+            os.kill(os.getpid(), signal.SIGTERM)
+            os.kill(os.getpid(), signal.SIGTERM)
+        self.env.wait_hook = hook
+        term = SignalledTerm()
+        self.assertEqual(self.run_main("status", "--watch", term=term), 0)
+        self.assertEqual(term.calls, ["hide_cursor", "enter_alt", "probe", "show_cursor", "leave_alt"])
+        self.assertEqual(seen, [])  # neither copy leaked to the handler that was there before
+        self.assertIs(signal.getsignal(signal.SIGTERM), outer)  # and it is back in place afterwards
+
     def test_q_quits_and_restores(self):
         term, keys = FakeTerm(), Keys(self.env, [None, None, "q"])
         self.assertEqual(self.run_main("status", "--watch", term=term, keys=keys), 0)
@@ -3106,7 +3132,8 @@ class TestWatchTerminal(MainBase):
 
         with mock.patch.object(cli.signal, "signal", side_effect=fake):
             self.assertEqual(self.run_main("status", "--watch", term=FakeTerm(), keys=Keys(self.env, ["q"])), 0)
-        self.assertEqual(len(seen), 2)
+        # install ours, ignore SIGTERM during the cleanup, then restore the default
+        self.assertEqual([h for _, h in seen[1:]], [signal.SIG_IGN, signal.SIG_DFL])
         self.assertEqual(seen[-1], (signal.SIGTERM, signal.SIG_DFL))
         self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
 
@@ -3221,6 +3248,17 @@ class TestWatchTerminal(MainBase):
         self.assertEqual(rc, 0)
         self.assertEqual([c.args[1] for c in rk.call_args_list], [2.0, 2.0])
         self.assertIs(rk.call_args.args[0].inp, stdin)
+        self.assertEqual(self.env.waits, [])  # keys, not wait_stop, pace the frames
+
+    def test_windows_console_wires_the_msvcrt_key_reader(self):
+        # On Windows main() builds a WindowsTerm; its read_key must pace the frames so `q` quits.
+        self.stop_after(3)  # if wait_stop paced the frames instead, stop there and fail the waits assertion
+        with mock.patch.object(cli._win, "IS_WINDOWS", True), \
+                mock.patch.object(cli._win, "read_key_msvcrt", side_effect=[None, "q"]) as rk:
+            rc = main(["--config", self.cfg_path, "status", "--watch", "--interval", "2"], make_deps=self.make_deps,
+                      stdout=TtyIO(), stderr=io.StringIO(), tz=timezone.utc, stdin=TtyIO())
+        self.assertEqual(rc, 0)
+        self.assertEqual([c.args[0] for c in rk.call_args_list], [2.0, 2.0])
         self.assertEqual(self.env.waits, [])  # keys, not wait_stop, pace the frames
 
     @unittest.skipIf(sys.platform == "win32", "pty is POSIX-only; the Windows key reader uses msvcrt")
@@ -3557,6 +3595,77 @@ class TestRotatorCjsLauncher(unittest.TestCase):
         p = self.run_cjs("status", "--bogus")
         self.assertEqual(p.returncode, 2)
 
+    # A stand-in for bin/rotator: says "ready", then waits for a signal like `status --watch` does.
+    ENTRY = (
+        "import os, signal, sys, time\n"
+        "marker = sys.argv[1]\n"
+        "def done(name, code):\n"
+        "    def handler(*_):\n"
+        "        with open(marker, 'w') as f:\n"
+        "            f.write(name)\n"
+        "        sys.exit(code)\n"
+        "    return handler\n"
+        "signal.signal(signal.SIGINT, done('int', 0))\n"
+        "signal.signal(signal.SIGTERM, done('term', 7))\n"
+        "if len(sys.argv) > 2:\n"
+        "    os.kill(os.getpid(), getattr(signal, sys.argv[2]))\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(30)\n"
+        "sys.exit(9)\n"
+    )
+
+    def start_cjs(self, name, *argv):
+        d = scratch("cjs-" + name)
+        entry = os.path.join(d, "entry.py")
+        with open(entry, "w", encoding="utf-8") as f:
+            f.write(self.ENTRY)
+        marker = os.path.join(d, "marker")
+        p = subprocess.Popen(["node", os.path.join(REPO, "bin", "rotator.cjs"), marker] + list(argv),
+                             env=dict(os.environ, ROTATOR_LAUNCHER_ENTRY=entry), stdout=subprocess.PIPE,
+                             text=True, start_new_session=True)
+        self.addCleanup(self._reap, p)
+        return p, marker
+
+    @staticmethod
+    def _reap(p):
+        if p.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(p.pid, signal.SIGKILL)
+            p.wait(5)
+        p.stdout.close()
+
+    def wait_ready(self, p):
+        self.assertEqual(p.stdout.readline().strip(), "ready")
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX signals and process groups")
+    def test_ctrl_c_goes_to_the_child_which_finishes_and_sets_the_exit_code(self):
+        p, marker = self.start_cjs("sigint")
+        self.wait_ready(p)
+        os.killpg(p.pid, signal.SIGINT)  # what a terminal does: the whole foreground group
+        self.assertEqual(p.wait(10), 0)
+        with open(marker, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "int")
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX signals and process groups")
+    def test_sigterm_to_the_launcher_reaches_the_child(self):
+        p, marker = self.start_cjs("sigterm")
+        self.wait_ready(p)
+        p.send_signal(signal.SIGTERM)  # the launcher only, as `kill <pid>` or `timeout` would
+        self.assertEqual(p.wait(10), 7)
+        with open(marker, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "term")
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX signals and process groups")
+    def test_a_child_killed_by_a_signal_ends_the_launcher_by_the_same_signal(self):
+        p, _ = self.start_cjs("sigkill", "SIGKILL")
+        self.assertEqual(p.wait(10), -signal.SIGKILL)
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX signals and process groups")
+    def test_a_child_killed_by_sigusr1_ends_the_launcher_with_128_plus_the_signal(self):
+        # Node answers SIGUSR1 by opening its debugger instead of ending, so it is not raised again.
+        p, _ = self.start_cjs("sigusr1", "SIGUSR1")
+        self.assertEqual(p.wait(10), 128 + signal.SIGUSR1)
+
 
 class TestPackage(unittest.TestCase):
     def setUp(self):
@@ -3704,12 +3813,14 @@ class TestOrcaGate(MainBase):
             self.assertIsNone(cli._real_orca_gate())
 
     def test_real_gate_on_windows_uses_the_cli_version_flag(self):
+        which = {"orca.cmd": WIN_ORCA_CMD}.get
         with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
-                mock.patch("rotator.cli.shutil.which", return_value=r"C:\orca\orca.exe"), \
-                mock.patch("rotator.cli.doctor.orca_version_windows", return_value="1.4.223"):
+                mock.patch("rotator.cli.shutil.which", side_effect=which), \
+                mock.patch("rotator.cli.doctor.orca_version_windows", return_value="1.4.223") as ver:
             self.assertIn("too old", cli._real_orca_gate())
+        ver.assert_called_once_with(WIN_ORCA_CMD)
         with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
-                mock.patch("rotator.cli.shutil.which", return_value=r"C:\orca\orca.exe"), \
+                mock.patch("rotator.cli.shutil.which", side_effect=which), \
                 mock.patch("rotator.cli.doctor.orca_version_windows", return_value="1.4.241"):
             self.assertIsNone(cli._real_orca_gate())
 
@@ -3719,6 +3830,44 @@ class TestOrcaGate(MainBase):
             reason = cli._real_orca_gate()
         self.assertIn("not found", reason)
         self.assertIn(cli.WINDOWS_ORCA_CLI_WHERE, reason)
+
+
+# Where Orca's Windows installer puts its CLI (fake user name).
+WIN_ORCA_CMD = r"C:\Users\someone\AppData\Local\Programs\Orca\resources\bin\orca.cmd"
+
+
+class TestWindowsOrcaCliPath(unittest.TestCase):
+    """Which binary counts as Orca's CLI on Windows. Orca ships resources\\bin\\orca.cmd and a native
+    resources\\bin\\orca.exe launcher; the app itself is Orca.exe in the install folder, which also matches
+    `orca.exe` (Windows names ignore case) but is Electron: `--version` would open the app."""
+
+    APP = r"C:\Users\someone\AppData\Local\Programs\Orca\Orca.exe"
+    BIN = r"C:\Users\someone\AppData\Local\Programs\Orca\resources\bin"
+
+    def path(self, found):
+        return cli._windows_orca_cli_path(which=lambda name: found.get(name))
+
+    def test_prefers_orca_cmd(self):
+        cmd = self.BIN + r"\orca.cmd"
+        self.assertEqual(self.path({"orca.cmd": cmd, "orca.exe": self.APP, "orca": self.APP}), cmd)
+
+    def test_accepts_the_native_launcher_in_a_bin_folder(self):
+        exe = self.BIN + r"\orca.exe"
+        self.assertEqual(self.path({"orca.exe": exe}), exe)
+
+    def test_skips_the_electron_app_exe(self):
+        self.assertIsNone(self.path({"orca.exe": self.APP, "orca": self.APP}))
+
+    def test_nothing_on_path(self):
+        self.assertIsNone(self.path({}))
+
+    def test_gate_never_runs_the_app_exe(self):
+        with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
+                mock.patch("rotator.cli.shutil.which", side_effect=lambda n: self.APP if n != "orca.cmd" else None), \
+                mock.patch("rotator.cli.doctor.orca_version_windows") as ver:
+            reason = cli._real_orca_gate()
+        ver.assert_not_called()
+        self.assertIn("not found", reason)
 
 
 class TestWindowsUnsupportedCommands(MainBase):
@@ -3744,10 +3893,16 @@ class TestWindowsUnsupportedCommands(MainBase):
     def test_uninstall_refuses_before_touching_os_getuid(self):
         # uninstall skips the Orca gate entirely, so the Windows refusal must come before os.getuid().
         # create=True: real Windows has no os.getuid attribute at all to patch.
-        with mock.patch("os.getuid", create=True,
-                       side_effect=AssertionError("os.getuid is not available on Windows")):
-            rc = self.windows("uninstall")
+        # uid=None so main() would fall back to the real os.getuid; the injected uid of self.windows() never would.
+        self.out, self.err = io.StringIO(), io.StringIO()
+        with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
+                mock.patch("os.getuid", create=True,
+                           side_effect=AssertionError("os.getuid is not available on Windows")) as getuid:
+            rc = main(["--config", self.cfg_path, "uninstall"], make_deps=self.make_deps, launchctl=FakeRunner(),
+                      uid=None, stdout=self.out, stderr=self.err, tz=timezone.utc)
         self.assertEqual(rc, 2)
+        getuid.assert_not_called()
+        self.assertIn("not available on Windows yet", self.err.getvalue())
 
     def test_status_is_not_refused_on_windows(self):
         rc = self.windows("status", "--json")
@@ -3800,10 +3955,10 @@ class TestDoctorCommand(MainBase):
         self.assertEqual(self.doctor(stale=True), 0)
         self.assertTrue(self.line("Claude accounts").startswith("[warn]"))
 
-    def windows_doctor(self, cli_path=r"C:\orca\orca.exe", version="1.4.241"):
+    def windows_doctor(self, cli_path=WIN_ORCA_CMD, version="1.4.241"):
         self.out, self.err = io.StringIO(), io.StringIO()
         with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
-                mock.patch("rotator.cli.shutil.which", return_value=cli_path), \
+                mock.patch("rotator.cli.shutil.which", side_effect={"orca.cmd": cli_path}.get), \
                 mock.patch("rotator.cli.doctor.orca_version_windows", return_value=version):
             return main(["--config", self.cfg_path, "doctor"], make_deps=self.make_deps, launchctl=FakeRunner(),
                         uid=lambda: 501, stdout=self.out, stderr=self.err)
