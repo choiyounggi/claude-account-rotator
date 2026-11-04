@@ -6,13 +6,18 @@ import hashlib
 import json
 import logging
 import os
-import pwd
 import re
 import subprocess
 import uuid
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+try:
+    import pwd  # Windows has no pwd module; _passwd_name guards every use
+except ImportError:
+    pwd = None
+
 from rotator.models import KEYCHAIN_SERVICE_PREFIX, PROFILES_ROOT_DEFAULT, Keychain, Profile, ReadText
+from rotator.windows import IS_WINDOWS
 
 KEYCHAIN_TIMEOUT_S: float = 10.0
 SECURITY_BIN = "/usr/bin/security"
@@ -192,20 +197,35 @@ def _security_find_password(service: str) -> Optional[str]:
     return proc.stdout.strip()
 
 
-def read_credential(profile: Profile, *, keychain: Optional[Keychain] = None) -> Optional[Credential]:
-    """Read accessToken/expiresAt from the profile's Keychain item; None when unavailable. Never raises for expected failures."""
-    kc = keychain if keychain is not None else _security_find_password
-    svc = profile.keychain_service
+def read_credential(profile: Profile, *, keychain: Optional[Keychain] = None,
+                    read_text: Optional[ReadText] = None, is_windows: bool = IS_WINDOWS) -> Optional[Credential]:
+    """accessToken/expiresAt for ``profile``; None when unavailable. Never raises for expected failures.
+
+    macOS reads the profile's Keychain item (unchanged). Windows has no Keychain: Claude Code keeps
+    each account's OAuth credentials in ``<profile.home>/.credentials.json`` instead, in the same
+    ``claudeAiOauth`` JSON shape (see claude-oauth-credentials.ts in the Orca source). ``is_windows`` is
+    injectable so the Windows branch runs in tests on any OS.
+    """
     kind = None
     raw = None
     token = None
     exp_ms = 0
-    try:
-        raw = kc(svc)
-    except (subprocess.SubprocessError, OSError):
-        # Only assign here: work done inside the except block would chain the
-        # seam's exception (which may hold the secret) as __context__.
-        kind = "keychain_error"
+    if is_windows:
+        ident = os.path.join(profile.home, ".credentials.json")
+        rt = read_text if read_text is not None else _read_text_utf8
+        try:
+            raw = rt(ident)
+        except OSError:
+            kind = "credentials_file_error"
+    else:
+        kc = keychain if keychain is not None else _security_find_password
+        ident = svc = profile.keychain_service
+        try:
+            raw = kc(svc)
+        except (subprocess.SubprocessError, OSError):
+            # Only assign here: work done inside the except block would chain the
+            # seam's exception (which may hold the secret) as __context__.
+            kind = "keychain_error"
     if kind is None and (not isinstance(raw, str) or raw == ""):
         kind = "not_found"
     data = None
@@ -231,13 +251,15 @@ def read_credential(profile: Profile, *, keychain: Optional[Keychain] = None) ->
             except (OverflowError, ValueError):
                 kind = "bad_shape"
     if kind is not None:
-        log.debug("credential unavailable for %s: %s", svc, kind)
+        log.debug("credential unavailable for %s: %s", ident, kind)
         return None
-    log.debug("credential loaded for %s (expires_at_ms=%d)", svc, exp_ms)
+    log.debug("credential loaded for %s (expires_at_ms=%d)", ident, exp_ms)
     return Credential(token, exp_ms)
 
 
 def _passwd_name() -> str:
+    if pwd is None:  # Windows: no pwd/getuid, no passwd fallback
+        return ""
     try:
         return pwd.getpwuid(os.getuid()).pw_name
     except (KeyError, OSError):

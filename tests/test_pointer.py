@@ -1,5 +1,6 @@
 import os
 import stat
+import sys
 import tempfile
 import unittest
 
@@ -88,12 +89,13 @@ class TestSetSelectedHost(_PointerCase):
         target = self._make_profile(ACC1)
         previous = set_selected_host(target, self.root)
         self.assertEqual(previous, "/old")
-        expected = self.root.encode() + b"/" + ACC1.encode() + b"/home"
+        expected = os.path.join(self.root, ACC1, "home").encode()
         self.assertEqual(self._pointer_bytes(), expected)
         self.assertEqual(self._pointer_bytes(), target.home.encode("utf-8"))
         self.assertFalse(self._pointer_bytes().endswith(b"\n"))
-        mode = stat.S_IMODE(os.stat(os.path.join(self.root, POINTER_FILENAME)).st_mode)
-        self.assertEqual(mode, 0o600)
+        if sys.platform != "win32":  # Windows has no Unix permission bits to check
+            mode = stat.S_IMODE(os.stat(os.path.join(self.root, POINTER_FILENAME)).st_mode)
+            self.assertEqual(mode, 0o600)
         self._assert_no_temp()
 
     def test_no_previous_returns_none(self):
@@ -115,7 +117,7 @@ class TestSetSelectedHost(_PointerCase):
         target = Profile(account_id=ACC1, home=os.path.join(self.root, ".", ACC1, "home"), keychain_service=KC)
         set_selected_host(target, self.root)
         self.assertEqual(self._pointer_bytes(), target.home.encode("utf-8"))
-        self.assertIn(b"/./", self._pointer_bytes())
+        self.assertIn((os.sep + "." + os.sep).encode(), self._pointer_bytes())
 
     def test_root_with_space(self):
         sub = os.path.join(self.root, "Profile Root")
@@ -123,8 +125,9 @@ class TestSetSelectedHost(_PointerCase):
         target = self._make_profile(ACC1, root=sub)
         set_selected_host(target, sub)
         self.assertEqual(self._pointer_bytes(sub), target.home.encode("utf-8"))
-        mode = stat.S_IMODE(os.stat(os.path.join(sub, POINTER_FILENAME)).st_mode)
-        self.assertEqual(mode, 0o600)
+        if sys.platform != "win32":  # Windows has no Unix permission bits to check
+            mode = stat.S_IMODE(os.stat(os.path.join(sub, POINTER_FILENAME)).st_mode)
+            self.assertEqual(mode, 0o600)
         self._assert_no_temp(sub)
 
     def test_replace_failure_keeps_old_and_no_temp(self):
@@ -182,7 +185,9 @@ class TestSetSelectedHost(_PointerCase):
                 raise OSError("dir fsync unsupported")
 
         set_selected_host(target, self.root, fsync=file_ok_dir_fails)
-        self.assertEqual(len(calls), 2)
+        # Windows cannot os.open() a directory at all (fsyncing one for durability is a POSIX technique);
+        # set_selected_host already swallows that OSError, so only the file fsync call happens there.
+        self.assertEqual(len(calls), 1 if sys.platform == "win32" else 2)
         self.assertEqual(self._pointer_bytes(), target.home.encode("utf-8"))
 
     # --- validation: ValueError and nothing created ---
@@ -240,6 +245,8 @@ class TestSetSelectedHost(_PointerCase):
         target = self._make_profile(ACC1, profile_json=False)
         self._assert_rejected(target)
 
+    @unittest.skipIf(sys.platform == "win32",
+                     "os.symlink needs elevated/Developer Mode privileges on Windows and is unreliable in CI")
     def test_home_symlinked_outside_root_rejected(self):
         os.makedirs(os.path.join(self.root, ACC1))
         with open(os.path.join(self.root, ACC1, "profile.json"), "w", encoding="utf-8") as f:

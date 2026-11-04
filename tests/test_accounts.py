@@ -4,6 +4,7 @@ import json
 import os
 import pickle
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -380,27 +381,27 @@ def fake_run(returncode=0, stdout=""):
 class CredentialTest(unittest.TestCase):
     def test_read_credential_ok(self):
         kc = FakeKeychain(value=cred_json())
-        cred = read_credential(CRED_PROFILE, keychain=kc)
+        cred = read_credential(CRED_PROFILE, keychain=kc, is_windows=False)
         self.assertIsInstance(cred, Credential)
         self.assertEqual(cred.access_token, TOKEN)
         self.assertEqual(cred.expires_at_ms, EXP)
         self.assertEqual(kc.services, [CRED_PROFILE.keychain_service])
 
     def test_read_credential_float_expiry(self):
-        cred = read_credential(CRED_PROFILE, keychain=FakeKeychain(value=cred_json(exp=4102444800000.0)))
+        cred = read_credential(CRED_PROFILE, keychain=FakeKeychain(value=cred_json(exp=4102444800000.0)), is_windows=False)
         self.assertEqual(cred.expires_at_ms, EXP)
         self.assertIs(type(cred.expires_at_ms), int)
 
     def test_read_credential_failures(self):
         for label, make in FAILURE_SEAMS:
             with self.subTest(label):
-                self.assertIsNone(read_credential(CRED_PROFILE, keychain=make()))
+                self.assertIsNone(read_credential(CRED_PROFILE, keychain=make(), is_windows=False))
 
     def test_read_credential_rejects_unsafe_token(self):
         for token in UNSAFE_TOKENS:
             with self.subTest(length=len(token)):
-                self.assertIsNone(read_credential(CRED_PROFILE, keychain=FakeKeychain(value=cred_json(token=token))))
-        longest = read_credential(CRED_PROFILE, keychain=FakeKeychain(value=cred_json(token="a" * 4096)))
+                self.assertIsNone(read_credential(CRED_PROFILE, keychain=FakeKeychain(value=cred_json(token=token)), is_windows=False))
+        longest = read_credential(CRED_PROFILE, keychain=FakeKeychain(value=cred_json(token="a" * 4096)), is_windows=False)
         self.assertIsNotNone(longest)
         self.assertEqual(longest.access_token, "a" * 4096)
 
@@ -416,10 +417,57 @@ class CredentialTest(unittest.TestCase):
         self.assertEqual(cred.access_token, TOKEN)
 
 
+class CredentialWindowsTest(unittest.TestCase):
+    """Windows has no Keychain: read_credential reads <home>/.credentials.json instead (is_windows is
+    injectable so this runs on any OS)."""
+
+    def _read_text(self, mapping):
+        def rt(path):
+            try:
+                return mapping[path]
+            except KeyError:
+                raise FileNotFoundError(path) from None
+        return rt
+
+    def test_reads_the_credentials_file_under_home(self):
+        expected_path = os.path.join(CRED_HOME, ".credentials.json")
+        cred = read_credential(CRED_PROFILE, is_windows=True,
+                               read_text=self._read_text({expected_path: cred_json()}))
+        self.assertIsInstance(cred, Credential)
+        self.assertEqual(cred.access_token, TOKEN)
+        self.assertEqual(cred.expires_at_ms, EXP)
+
+    def test_missing_file_is_none(self):
+        self.assertIsNone(read_credential(CRED_PROFILE, is_windows=True, read_text=self._read_text({})))
+
+    def test_bad_json_is_none(self):
+        expected_path = os.path.join(CRED_HOME, ".credentials.json")
+        rt = self._read_text({expected_path: "not json"})
+        self.assertIsNone(read_credential(CRED_PROFILE, is_windows=True, read_text=rt))
+
+    def test_never_touches_the_keychain_seam(self):
+        kc = FakeKeychain(value=cred_json())
+        expected_path = os.path.join(CRED_HOME, ".credentials.json")
+        cred = read_credential(CRED_PROFILE, is_windows=True, keychain=kc,
+                               read_text=self._read_text({expected_path: cred_json()}))
+        self.assertIsNotNone(cred)
+        self.assertEqual(kc.services, [])  # the macOS seam is never called on the Windows branch
+
+    def test_default_read_text_seam(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = os.path.join(d, "home")
+            os.makedirs(home)
+            with open(os.path.join(home, ".credentials.json"), "w", encoding="utf-8") as f:
+                f.write(cred_json())
+            profile = Profile(account_id=ACC1, home=home, keychain_service=keychain_service_for(home))
+            cred = read_credential(profile, is_windows=True)
+        self.assertEqual(cred.access_token, TOKEN)
+
+
 class DefaultKeychainSeamTest(unittest.TestCase):
     def test_default_keychain_seam_argv(self):
         with unittest.mock.patch("rotator.accounts.subprocess.run", return_value=fake_run(0, cred_json() + "\n")) as run:
-            cred = read_credential(CRED_PROFILE)
+            cred = read_credential(CRED_PROFILE, is_windows=False)
         self.assertEqual(cred.access_token, TOKEN)
         self.assertEqual(cred.expires_at_ms, EXP)
         run.assert_called_once_with(
@@ -433,28 +481,28 @@ class DefaultKeychainSeamTest(unittest.TestCase):
 
     def test_default_keychain_seam_nonzero_rc(self):
         with unittest.mock.patch("rotator.accounts.subprocess.run", return_value=fake_run(44, cred_json())):
-            self.assertIsNone(read_credential(CRED_PROFILE))
+            self.assertIsNone(read_credential(CRED_PROFILE, is_windows=False))
 
     def test_default_keychain_seam_timeout(self):
         exc = subprocess.TimeoutExpired("security", 10, output=TOKEN)
         with unittest.mock.patch("rotator.accounts.subprocess.run", side_effect=exc):
-            self.assertIsNone(read_credential(CRED_PROFILE))
+            self.assertIsNone(read_credential(CRED_PROFILE, is_windows=False))
 
 
 class SecretAbsenceTest(unittest.TestCase):
     def scenarios(self):
-        yield "success", lambda: read_credential(CRED_PROFILE, keychain=FakeKeychain(value=cred_json()))
+        yield "success", lambda: read_credential(CRED_PROFILE, keychain=FakeKeychain(value=cred_json()), is_windows=False)
         for label, make in FAILURE_SEAMS:
-            yield label, (lambda make=make: read_credential(CRED_PROFILE, keychain=make()))
+            yield label, (lambda make=make: read_credential(CRED_PROFILE, keychain=make(), is_windows=False))
         for token in UNSAFE_TOKENS:
             yield "unsafe token len %d" % len(token), (
-                lambda token=token: read_credential(CRED_PROFILE, keychain=FakeKeychain(value=cred_json(token=token)))
+                lambda token=token: read_credential(CRED_PROFILE, keychain=FakeKeychain(value=cred_json(token=token)), is_windows=False)
             )
 
         def default_seam_timeout():
             exc = subprocess.TimeoutExpired("security", 10, output=TOKEN)
             with unittest.mock.patch("rotator.accounts.subprocess.run", side_effect=exc):
-                return read_credential(CRED_PROFILE)
+                return read_credential(CRED_PROFILE, is_windows=False)
 
         yield "default seam timeout", default_seam_timeout
 
@@ -474,7 +522,7 @@ class SecretAbsenceTest(unittest.TestCase):
 
     def test_success_repr_positive_controls(self):
         with self.assertLogs("rotator", level="DEBUG"):
-            cred = read_credential(CRED_PROFILE, keychain=FakeKeychain(value=cred_json()))
+            cred = read_credential(CRED_PROFILE, keychain=FakeKeychain(value=cred_json()), is_windows=False)
         self.assertIn("<redacted>", repr(cred))
         self.assertIn(str(EXP), repr(cred))
         self.assertIn("<redacted>", str(cred))
@@ -623,8 +671,14 @@ class TestKeychainAccount(unittest.TestCase):
     def test_invalid_passwd_gives_fallback(self):
         self.assertEqual(claude_code_keychain_account(environ={}, passwd_name=lambda: "a b"), "claude-code-user")
 
+    @unittest.skipIf(sys.platform == "win32", "there is no pwd module on Windows to patch")
     def test_passwd_name_lookup_failure_is_empty(self):
         with unittest.mock.patch("rotator.accounts.pwd.getpwuid", side_effect=KeyError("uid")):
+            self.assertEqual(accounts_mod._passwd_name(), "")
+
+    def test_passwd_name_without_a_pwd_module_is_empty(self):
+        # Windows has no pwd module at all (accounts.pwd is None there); exercised on any OS.
+        with unittest.mock.patch.object(accounts_mod, "pwd", None):
             self.assertEqual(accounts_mod._passwd_name(), "")
 
 

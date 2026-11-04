@@ -4,6 +4,7 @@ import io
 import json
 import os
 import stat
+import sys
 import tempfile
 import tokenize
 import unittest
@@ -727,6 +728,22 @@ class TestOsProcessProbe(unittest.TestCase):
         self.assertIs(p._kill, os.kill)
         self.assertIs(p._run, sw._run_subprocess)
 
+    def test_default_kill_never_calls_os_kill_directly(self):
+        # The untouched default routes through the cross-platform check instead: on Windows, signal 0
+        # is CTRL_C_EVENT, not a liveness probe.
+        calls = []
+        with mock.patch.object(sw, "_cross_platform_pid_alive", lambda pid: calls.append(pid) or True), \
+                mock.patch("os.kill", side_effect=AssertionError("os.kill must not be called")):
+            self.assertIs(OsProcessProbe().is_alive(42), True)
+        self.assertEqual(calls, [42])
+
+    def test_injected_kill_keeps_the_signal_0_behaviour(self):
+        kill, calls = self._kill()
+        with mock.patch.object(sw, "_cross_platform_pid_alive",
+                               side_effect=AssertionError("must not be used with an injected kill")):
+            self.assertIs(OsProcessProbe(kill=kill).is_alive(42), True)
+        self.assertEqual(calls, [(42, 0)])
+
 
 # ---------------------------------------------------------------- Task 06
 
@@ -975,6 +992,12 @@ class Seq:
         return v
 
 
+def _slash(path):
+    # Every fixture path in this file is written with forward slashes; os.path.join on Windows joins
+    # with a backslash even when its inputs already use "/", so lookups normalize to "/" first.
+    return path.replace("\\", "/")
+
+
 class FakeFs:
     def __init__(self, files, dirs):
         self.files = dict(files)
@@ -982,7 +1005,14 @@ class FakeFs:
         self.reads = []
 
     def _get(self, path, advance):
-        v = self.files.get(path)
+        # Compare normalized on both sides: a key set directly (bypassing this class) via a real
+        # os.path.join call is not itself normalized, so an exact dict lookup cannot be trusted here.
+        norm = _slash(path)
+        v = None
+        for k, candidate in self.files.items():
+            if _slash(k) == norm:
+                v = candidate
+                break
         if isinstance(v, Seq):
             return v.take() if advance else v.peek()
         if callable(v):
@@ -997,10 +1027,12 @@ class FakeFs:
         return v
 
     def glob_paths(self, pattern):
-        return sorted(k for k in self.files if self._get(k, False) is not None and fnmatch.fnmatchcase(k, pattern))
+        pattern = _slash(pattern)
+        return sorted(k for k in self.files
+                     if self._get(k, False) is not None and fnmatch.fnmatchcase(_slash(k), pattern))
 
     def isdir(self, path):
-        return path in self.dirs
+        return _slash(path) in self.dirs
 
 
 def _raise_or_return(value):
@@ -2112,6 +2144,7 @@ class TestMirrorTrust(unittest.TestCase):
         self.assertIs(self.mirror(), True)
         self.assertFalse(self.read().endswith("\n"))
 
+    @unittest.skipIf(sys.platform == "win32", "Windows has no Unix permission bits to preserve")
     def test_mode_preserved(self):
         for i, mode in enumerate((0o600, 0o644)):
             with self.subTest(mode=mode):
@@ -2126,8 +2159,9 @@ class TestMirrorTrust(unittest.TestCase):
         self.assertEqual(self.backup_names(), [name])
         with open(os.path.join(self.backups, name), encoding="utf-8") as f:
             self.assertEqual(f.read(), original)
-        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.backups, name)).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(self.backups).st_mode), 0o700)
+        if sys.platform != "win32":  # Windows has no Unix permission bits to check
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.backups, name)).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(self.backups).st_mode), 0o700)
 
     def test_backups_pruned_to_newest_20(self):
         os.makedirs(self.backups)
@@ -2170,6 +2204,8 @@ class TestMirrorTrust(unittest.TestCase):
         self.assertIs(self.mirror(), False)
         self.assertFalse(os.path.exists(self.cfg))
 
+    @unittest.skipIf(sys.platform == "win32",
+                     "os.symlink needs elevated/Developer Mode privileges on Windows and is unreliable in CI")
     def test_symlink_refused(self):
         real = os.path.join(self.root, "real.json")
         with open(real, "w") as f:
@@ -2199,6 +2235,7 @@ class TestMirrorTrust(unittest.TestCase):
         self.assertNotEqual(self.read(), original)
         self.assertEqual(self.leftovers(), [])
 
+    @unittest.skipIf(sys.platform == "win32", "os.chmod does not restrict directory writes on Windows")
     def test_unwritable_folder_leaves_file_unchanged(self):
         text = self.write({"projects": {}})
         os.chmod(self.home, 0o500)
@@ -2256,7 +2293,8 @@ class TestTrustCopyPreflight(unittest.TestCase):
         with self.assertLogs("rotator.switcher", "INFO") as cm:
             res = self.run_world(w)
         self.assertEqual(res, HAPPY)
-        self.assertEqual(self.calls, [(TRUST_FILE, CWD, BACKUP_DIR, ACC_NEW)])
+        got_calls = [(_slash(p), cwd, backup_dir, account_id) for p, cwd, backup_dir, account_id in self.calls]
+        self.assertEqual(got_calls, [(_slash(TRUST_FILE), CWD, BACKUP_DIR, ACC_NEW)])
         self.assertIn("event=trust_copied account=%s path=%s" % (ACC_NEW, CWD), [r.getMessage() for r in cm.records])
 
     def test_source_trust_of_the_folder_itself(self):
@@ -2600,7 +2638,7 @@ def _read_text_raising_for(w, path, exc):
     orig = w.fs.read_text
 
     def read_text(p):
-        if p == path:
+        if _slash(p) == _slash(path):
             w.fs.reads.append(p)
             raise exc
         return orig(p)
@@ -2697,7 +2735,7 @@ class TestSeamFailures(unittest.TestCase):
         orig = w.fs.read_text
 
         def read_text(p):
-            if p == OLD_REG:
+            if _slash(p) == _slash(OLD_REG):
                 calls.append(p)
                 if len(calls) > 1:
                     raise RuntimeError("x")
@@ -2709,7 +2747,7 @@ class TestSeamFailures(unittest.TestCase):
     def test_read_text_returns_non_str(self):
         w = World()
         orig = w.fs.read_text
-        res = w.run(read_text=lambda p: 5 if p == TRUST_FILE else orig(p))
+        res = w.run(read_text=lambda p: 5 if _slash(p) == _slash(TRUST_FILE) else orig(p))
         assert_untouched(self, res, "target_untrusted", w)
 
     def test_registry_nested_too_deep(self):
@@ -3012,7 +3050,9 @@ class TestAdoptForeignResume(unittest.TestCase):
         self.assertIs(w.driver.sent("prompt"), False)
 
     def test_default_home_is_left_alone(self):
-        home = os.path.expanduser("~/.claude")
+        # Matches switcher.py's own os.path.normpath(_default_home()): expanduser alone can mix
+        # separators on Windows ("C:\Users\you" + "/.claude"), which would never compare equal there.
+        home = os.path.normpath(os.path.expanduser("~/.claude"))
         w = self._already_running(["idle"], home=home)
         self.assertEqual(w.run().reason, "session_already_running")
         self.assertIs(w.driver.sent("prompt"), False)

@@ -6,6 +6,7 @@ import logging.handlers
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import stat
@@ -464,8 +465,9 @@ class TestAtomicWrite(unittest.TestCase):
         atomic_write_text(p, "x")
         with open(p, encoding="utf-8") as f:
             self.assertEqual(f.read(), "x")
-        self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+        if sys.platform != "win32":  # Windows has no Unix permission bits to check
+            self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
 
     def test_replaces_existing(self):
         p = os.path.join(self.base, "state.json")
@@ -486,6 +488,50 @@ class TestAtomicWrite(unittest.TestCase):
         p = os.path.join(self.base, "empty.json")
         atomic_write_text(p, "")
         self.assertEqual(os.path.getsize(p), 0)
+
+    def test_without_os_fchmod_still_writes(self):
+        # Windows had no os.fchmod before Python 3.13; atomic_write_text must not crash without it.
+        p = os.path.join(self.base, "no-fchmod.json")
+        with unittest.mock.patch.object(daemon.os, "fchmod", None, create=True):
+            atomic_write_text(p, "x")
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "x")
+
+
+class TestFileLockWindows(unittest.TestCase):
+    """try_lock/FileLock route through rotator.windows's byte-range lock on Windows; exercised here
+    through fakes since there is no msvcrt/real Windows kernel on the machine running this test."""
+
+    def setUp(self):
+        self.base = scratch("locks-windows-test")
+        self.path = os.path.join(self.base, "a.lock")
+
+    def test_lock_cycle_uses_the_windows_byte_lock(self):
+        calls = []
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", True), \
+                unittest.mock.patch.object(daemon, "_win_try_lock_bytes",
+                                           lambda fd: calls.append(("lock", fd)) or True), \
+                unittest.mock.patch.object(daemon, "_win_unlock_bytes",
+                                           lambda fd: calls.append(("unlock", fd))):
+            lk = try_lock(self.path)
+            self.assertIsInstance(lk, FileLock)
+            lk.write_owner(123)
+            lk.release()
+        self.assertEqual([c[0] for c in calls], ["lock", "unlock"])
+        with open(self.path) as f:
+            self.assertEqual(f.read(), "123")
+
+    def test_already_locked_is_none(self):
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", True), \
+                unittest.mock.patch.object(daemon, "_win_try_lock_bytes", lambda fd: False):
+            self.assertIsNone(try_lock(self.path))
+
+    def test_release_never_calls_fcntl_on_windows(self):
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", True), \
+                unittest.mock.patch.object(daemon, "_win_try_lock_bytes", lambda fd: True), \
+                unittest.mock.patch.object(daemon, "_win_unlock_bytes", lambda fd: None), \
+                unittest.mock.patch.object(daemon, "fcntl", None):
+            try_lock(self.path).release()  # would raise AttributeError on fcntl.flock if not guarded
 
 
 class TestFileLock(unittest.TestCase):
@@ -643,7 +689,8 @@ class TestSetupLogging(unittest.TestCase):
         self.assertEqual(hs[0].backupCount, 3)
         self.assertEqual(lg.level, logging.INFO)
         self.assertEqual(lg.name, "rotator")
-        self.assertEqual(stat.S_IMODE(os.stat(self.log_dir).st_mode), 0o700)
+        if sys.platform != "win32":  # Windows has no Unix permission bits to check
+            self.assertEqual(stat.S_IMODE(os.stat(self.log_dir).st_mode), 0o700)
 
     def test_debug_handle_line_absent_info_present(self):
         lg = setup_logging(self.log_dir, False)

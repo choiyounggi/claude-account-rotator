@@ -14,7 +14,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, FrozenSet, Mapping, Optional, Pattern, Sequence, Tuple
 
-PROFILES_ROOT_DEFAULT: str = os.path.expanduser("~/Library/Application Support/orca/claude-profiles")
+from rotator.windows import IS_WINDOWS, orca_user_data_root
+
+PROFILES_ROOT_DEFAULT: str = (
+    os.path.join(orca_user_data_root(), "claude-profiles") if IS_WINDOWS
+    else os.path.expanduser("~/Library/Application Support/orca/claude-profiles")
+)
 KEYCHAIN_SERVICE_PREFIX: str = "Claude Code-credentials-"
 USAGE_URL: str = "https://api.anthropic.com/api/oauth/usage"
 USAGE_BETA_HEADER: str = "oauth-2025-04-20"

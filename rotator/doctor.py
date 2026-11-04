@@ -6,8 +6,9 @@ import os
 import platform
 import plistlib
 import re
+import subprocess
 import sys
-from typing import Callable, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, List, NamedTuple, Optional, Tuple
 
 ORCA_APP = "/Applications/Orca.app"
 ORCA_INFO_PLIST = os.path.join(ORCA_APP, "Contents", "Info.plist")
@@ -16,6 +17,7 @@ ORCA_INFO_PLIST = os.path.join(ORCA_APP, "Contents", "Info.plist")
 # cannot switch between.
 ORCA_MIN_VERSION: Tuple[int, int, int] = (1, 4, 224)
 PYTHON_MIN_VERSION: Tuple[int, int] = (3, 9)
+ORCA_CLI_VERSION_TIMEOUT_S = 10.0
 # A suffix after the third number ("1.4.250-beta.1") is ignored; a leading "v" or a missing number is not.
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?![\d.])")
 
@@ -54,10 +56,32 @@ def orca_version(read_plist: Callable[[str], dict] = _read_plist) -> Optional[st
     return v if isinstance(v, str) else None
 
 
+def orca_version_windows(cli_path: Optional[str], *, run: Callable[..., Any] = subprocess.run) -> Optional[str]:
+    """Orca's version on Windows via ``<cli_path> --version``; None when ``cli_path`` is unset or it fails.
+
+    Electron intercepts ``--version`` on the app's own ``Orca.exe``, so the bundled CLI (src/cli/index.ts in the
+    Orca source: ``argv[0] in ('--version', '-v')`` prints the bare version string) is the only reliable
+    way to read it; there is no Windows equivalent of macOS's Info.plist bundle version.
+    """
+    if not cli_path:
+        return None
+    try:
+        proc = run([cli_path, "--version"], capture_output=True, text=True,
+                  timeout=ORCA_CLI_VERSION_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not isinstance(proc.stdout, str):
+        return None
+    out = proc.stdout.strip()
+    return out or None
+
+
 def check_system(system: str) -> Check:
     if system == "Darwin":
         return Check("macOS", OK, platform.mac_ver()[0] or system)
-    return Check("macOS", FAIL, "%s: the rotator runs only on macOS" % (system or "unknown OS"))
+    if system == "Windows":
+        return Check("macOS", OK, "Windows %s" % (platform.win32_ver()[0] or system))
+    return Check("macOS", FAIL, "%s: the rotator runs only on macOS or Windows" % (system or "unknown OS"))
 
 
 def check_python(version: Tuple[int, ...]) -> Check:
@@ -67,10 +91,10 @@ def check_python(version: Tuple[int, ...]) -> Check:
     return Check("Python", FAIL, "%s: %s or newer is required" % (shown, _dotted(PYTHON_MIN_VERSION)))
 
 
-def check_orca(version: Optional[str]) -> Check:
+def check_orca(version: Optional[str], *, where: str = ORCA_APP) -> Check:
     need = "%s or newer" % _dotted(ORCA_MIN_VERSION)
     if version is None:
-        return Check("Orca", FAIL, "not found at %s: install Orca (%s)" % (ORCA_APP, need))
+        return Check("Orca", FAIL, "not found at %s: install Orca (%s)" % (where, need))
     parsed = parse_version(version)
     if parsed is None:
         return Check("Orca", FAIL, "version %r is not readable; %s is required" % (version, need))
@@ -100,7 +124,9 @@ def check_config(error: Optional[str]) -> Check:
     return Check("config", FAIL, "%s (the other checks use the defaults)" % error)
 
 
-def check_agent(installed: bool, stale: bool) -> Check:
+def check_agent(installed: bool, stale: bool, *, supported: bool = True) -> Check:
+    if not supported:
+        return Check("background agent", WARN, "not available on Windows yet")
     if not installed:
         return Check("background agent", WARN, "not installed: run `rotator install` to switch automatically")
     if stale:
@@ -108,9 +134,9 @@ def check_agent(installed: bool, stale: bool) -> Check:
     return Check("background agent", OK, "installed")
 
 
-def gate(system: str, version: Optional[str]) -> Optional[str]:
-    """Why this Mac cannot run the rotator (macOS and the Orca version), or None when it can."""
-    for c in (check_system(system), check_orca(version)):
+def gate(system: str, version: Optional[str], *, where: str = ORCA_APP) -> Optional[str]:
+    """Why this machine cannot run the rotator (its OS and the Orca version), or None when it can."""
+    for c in (check_system(system), check_orca(version, where=where)):
         if c.level == FAIL:
             return "%s: %s" % (c.name, c.detail)
     return None

@@ -10,6 +10,7 @@ import os
 import pickle
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -301,6 +302,7 @@ class TestCcLock(TripwireCase):
         self.new_dir = os.path.join(self.home, ".oauth_refresh.lock")
         self.legacy_dir = os.path.realpath(self.home) + ".lock"
 
+    @unittest.skipIf(sys.platform == "win32" and sys.version_info < (3, 12), "st_birthtime is unavailable on Windows before Python 3.12, so the lock-dir ownership check (_dir_id) always sees None there and refuses to remove its own directory")
     def test_success_and_release(self):
         lock, reason = refresh.take_cc_lock(self.home)
         self.assertIsInstance(lock, refresh.CcLock)
@@ -318,6 +320,7 @@ class TestCcLock(TripwireCase):
         self.assertFalse(os.path.exists(self.legacy_dir))
         self.assertTrue(os.path.isdir(self.new_dir))
 
+    @unittest.skipIf(sys.platform == "win32" and sys.version_info < (3, 12), "st_birthtime is unavailable on Windows before Python 3.12, so the lock-dir ownership check (_dir_id) always sees None there and refuses to remove its own directory")
     def test_existing_legacy_dir_is_busy_and_new_dir_undone(self):
         os.mkdir(self.legacy_dir)
         self.assertEqual(refresh.take_cc_lock(self.home), (None, "cc_lock_busy"))
@@ -348,6 +351,7 @@ class TestCcLock(TripwireCase):
             self.assertEqual(f.read(), "owner-record")
         self.assertEqual(os.stat(owner).st_mtime, before)
 
+    @unittest.skipIf(sys.platform == "win32" and sys.version_info < (3, 12), "st_birthtime is unavailable on Windows before Python 3.12, so the lock-dir ownership check (_dir_id) always sees None there and refuses to remove its own directory")
     def test_replaced_dir_left_in_place(self):
         lock, _ = refresh.take_cc_lock(self.home)
         # Claude Code judged our dir stale and recreated its own in the same place.
@@ -370,6 +374,7 @@ class TestCcLock(TripwireCase):
         self.assertEqual(len(cm.output), 2)
         os.rmdir(self.new_dir)
 
+    @unittest.skipIf(sys.platform == "win32" and sys.version_info < (3, 12), "st_birthtime is unavailable on Windows before Python 3.12, so the lock-dir ownership check (_dir_id) always sees None there and refuses to remove its own directory")
     def test_failed_take_removes_only_own_dir(self):
         os.mkdir(self.legacy_dir)
         self.assertEqual(refresh.take_cc_lock(self.home), (None, "cc_lock_busy"))
@@ -434,6 +439,12 @@ class _FakeCcLock:
 
     def release(self):
         self.world.calls.append(("cc_release",))
+
+
+def _slash(path):
+    # Every fixture path in this file is written with forward slashes; os.path.join on Windows joins
+    # with a backslash even when its inputs already use "/", so lookups normalize to "/" first.
+    return path.replace("\\", "/")
 
 
 class FakeWorld:
@@ -533,19 +544,26 @@ class FakeWorld:
 
     def list_dir(self, path):
         self.calls.append(("list_dir", path))
-        if path in self.list_dir_raises:
-            raise self.list_dir_raises[path]
-        if path not in self.registry:
-            raise FileNotFoundError(path)
-        return list(self.registry[path])
+        path = _slash(path)
+        # Compare normalized on both sides: self.registry/list_dir_raises keys may have been set
+        # directly (bypassing this method) via a real os.path.join call, which is not itself
+        # normalized.
+        for k, exc in self.list_dir_raises.items():
+            if _slash(k) == path:
+                raise exc
+        for k, names in self.registry.items():
+            if _slash(k) == path:
+                return list(names)
+        raise FileNotFoundError(path)
 
     def pid_alive(self, pid):
         return pid in self.alive
 
     def exists(self, path):
-        return path in self.paths
+        return _slash(path) in {_slash(p) for p in self.paths}
 
     def lock(self, path):
+        path = _slash(path)
         self.calls.append(("lock", path))
         if path in self.lock_table:
             return None
@@ -1068,7 +1086,7 @@ def err(status, error):
     return refresh.PostResult(status, json.dumps({"error": error}))
 
 
-LOCK_PATH = os.path.join(BASE, "locks", "r-" + hashlib.sha256(ACC_A.encode()).hexdigest()[:32] + ".lock")
+LOCK_PATH = _slash(os.path.join(BASE, "locks", "r-" + hashlib.sha256(ACC_A.encode()).hexdigest()[:32] + ".lock"))
 
 
 class SectionCase(TripwireCase):
@@ -2062,12 +2080,13 @@ class TestWarmUpReal(TripwireCase):
         seen = []
         refresh.find_claude_binary([], is_exec=lambda p: False, glob=lambda pat: seen.append(pat) or [],
                                    home="/Users/u")
-        self.assertEqual(seen, ["/Users/u/.nvm/versions/node/*/bin/claude"])
+        self.assertEqual(seen, [os.path.join("/Users/u", ".nvm", "versions", "node", "*", "bin", "claude")])
 
     def test_find_none(self):
         self.assertIsNone(self.find([], set()))
         self.assertIsNone(self.find(["/x/claude"], set(), ["/Users/u/.nvm/versions/node/v1.0.0/bin/claude"]))
 
+    @unittest.skipIf(sys.platform == "win32", "Windows has no execute permission bit to toggle")
     def test_is_exec_file(self):
         os.makedirs(BASE, exist_ok=True)
         path = os.path.join(BASE, "fake-claude")
@@ -2129,7 +2148,9 @@ class TestWarmUpReal(TripwireCase):
         out = refresh.run_claude_quiet(["/c"], {}, "/s", 60.0, popen=P, killpg=lambda *a: kills.append(a))
         self.assertEqual(out, "timeout")
         import signal
-        self.assertEqual(kills, [(4242, signal.SIGKILL)])
+        # Windows' signal module has no SIGKILL; run_claude_quiet falls back to SIGTERM there.
+        expected_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+        self.assertEqual(kills, [(4242, expected_sig)])
 
     def test_run_timeout_kill_failure_still_reaps(self):
         P, _ = self.popen([subprocess.TimeoutExpired("/c", 60), -9])
@@ -2143,6 +2164,7 @@ class TestWarmUpReal(TripwireCase):
         self.assertEqual(refresh.run_claude_quiet(["/c"], {}, "/s", 60.0, popen=P, killpg=lambda *a: None),
                          "error")
 
+    @unittest.skipIf(sys.platform == "win32", "spawns a #!/bin/sh script; Windows has no shebang execution")
     def test_run_real_process_output_discarded(self):
         # A real child that writes to stdout/stderr: nothing reaches this process's streams.
         script = os.path.join(BASE, "noisy.sh")
@@ -2175,6 +2197,7 @@ class TestWarmUpReal(TripwireCase):
         with open(cap) as f:
             self.assertIn("SECRET-OUT", f.read())
 
+    @unittest.skipIf(sys.platform == "win32", "spawns a #!/bin/sh script; Windows has no shebang execution")
     def test_run_real_timeout(self):
         script = os.path.join(BASE, "sleepy.sh")
         os.makedirs(BASE, exist_ok=True)
@@ -2185,6 +2208,30 @@ class TestWarmUpReal(TripwireCase):
         t = time.monotonic()
         self.assertEqual(refresh.run_claude_quiet([script], {"PATH": "/usr/bin:/bin"}, BASE, 0.5), "timeout")
         self.assertLess(time.monotonic() - t, 10)
+
+
+class TestDefaultKillpg(TripwireCase):
+    """run_claude_quiet's killpg default must not crash evaluating os.killpg at import time on
+    Windows (it has no process groups); it is unreachable there this release (refresh/daemon stay
+    macOS-only, the CLI refuses those commands first), but it must still resolve safely."""
+
+    def test_uses_os_killpg_when_present(self):
+        calls = []
+        with mock.patch.object(refresh.os, "killpg", lambda pid, sig: calls.append((pid, sig)), create=True):
+            refresh._default_killpg(123, 9)
+        self.assertEqual(calls, [(123, 9)])
+
+    def test_falls_back_to_os_kill_without_os_killpg(self):
+        calls = []
+        with mock.patch.object(refresh.os, "killpg", None, create=True), \
+                mock.patch.object(refresh.os, "kill", lambda pid, sig: calls.append((pid, sig))):
+            refresh._default_killpg(123, 9)
+        self.assertEqual(calls, [(123, 9)])
+
+    def test_is_the_real_default_of_run_claude_quiet(self):
+        import inspect
+        sig = inspect.signature(refresh.run_claude_quiet)
+        self.assertIs(sig.parameters["killpg"].default, refresh._default_killpg)
 
 
 if __name__ == "__main__":

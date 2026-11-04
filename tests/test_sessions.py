@@ -5,6 +5,7 @@ import builtins
 import os
 import re
 import struct
+import sys
 import tempfile
 import threading
 import unittest
@@ -122,6 +123,36 @@ class ImportTimeTest(unittest.TestCase):
         self.assertIsNone(rotator.sessions._LIBC)
 
 
+class WindowsDispatchTest(unittest.TestCase):
+    """_read_proc/_proc_start/_pid_alive route to rotator.windows when IS_WINDOWS is true."""
+
+    def test_read_proc_dispatches_to_windows(self):
+        with unittest.mock.patch.object(rotator.sessions._win, "IS_WINDOWS", True), \
+                unittest.mock.patch.object(rotator.sessions._win, "read_proc",
+                                           lambda pid: ("claude.exe", (), {})):
+            self.assertEqual(rotator.sessions._read_proc(123), ("claude.exe", (), {}))
+
+    def test_proc_start_dispatches_to_windows(self):
+        target = datetime(2026, 10, 28, 4, 21, 59, tzinfo=timezone.utc)
+        with unittest.mock.patch.object(rotator.sessions._win, "IS_WINDOWS", True), \
+                unittest.mock.patch.object(rotator.sessions._win, "proc_start", lambda pid: target):
+            self.assertEqual(rotator.sessions._proc_start(123), target)
+
+    def test_pid_alive_never_calls_os_kill_on_windows(self):
+        calls = []
+        with unittest.mock.patch.object(rotator.sessions, "_cross_platform_pid_alive",
+                                        lambda pid: calls.append(pid) or True):
+            self.assertIs(rotator.sessions._pid_alive(123), True)
+        self.assertEqual(calls, [123])
+
+
+def _slash(path):
+    # Every fixture path in this file is written with forward slashes; os.path.join on Windows joins
+    # with a backslash even when its inputs already use "/", so lookups (and recorded reads) normalize
+    # to "/" first.
+    return path.replace("\\", "/")
+
+
 class FakeFS:
     def __init__(self, dirs, files):
         self.dirs = dirs
@@ -129,7 +160,7 @@ class FakeFS:
         self.reads = []
 
     def list_dir(self, path):
-        value = self.dirs.get(path)
+        value = self.dirs.get(_slash(path))
         if isinstance(value, Exception):
             raise value
         if value is None:
@@ -137,6 +168,7 @@ class FakeFS:
         return list(value)
 
     def read_text(self, path):
+        path = _slash(path)
         self.reads.append(path)
         value = self.files.get(path)
         if isinstance(value, Exception):
@@ -184,7 +216,7 @@ class RegistryScanTest(unittest.TestCase):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             cands, _ = self.scan_one_dir({name: text, "9.json": json.dumps(entry(9))})
         self.assertEqual([c.pid for c in cands], [9])
-        self.assertIn("skip session %s/%s: %s" % (ACC1, name, reason), "\n".join(cm.output))
+        self.assertIn("skip session %s/%s: %s" % (ACC1, name, reason), _slash("\n".join(cm.output)))
 
     def test_normal(self):
         cands, _ = self.scan_one_dir({"4242.json": json.dumps(entry(4242))})
@@ -197,7 +229,7 @@ class RegistryScanTest(unittest.TestCase):
         self.assertEqual(c.proc_start_raw, "Wed Oct 28 04:21:59 2026")
         self.assertEqual(c.started_at_raw, 1793161321336)
         self.assertEqual(c.status_updated_at, 1793161321400)
-        self.assertEqual(c.path, "/h/acc1/sessions/4242.json")
+        self.assertEqual(_slash(c.path), "/h/acc1/sessions/4242.json")
         self.assertEqual(c.order, 0)
 
     def test_file_name_filter_reads_only_pid_json_sorted(self):
@@ -254,7 +286,7 @@ class RegistryScanTest(unittest.TestCase):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             cands, _ = self.scan_one_dir(files)
         self.assertEqual([c.pid for c in cands], [2147483647])
-        out = "\n".join(cm.output)
+        out = _slash("\n".join(cm.output))
         self.assertIn("skip session %s/2147483648.json: bad_shape" % ACC1, out)
         self.assertIn("skip session %s/0.json: bad_shape" % ACC1, out)
 
@@ -419,13 +451,13 @@ class DiscoverTest(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertEqual(proc.calls, [])
         self.assertEqual(start.calls, [])
-        self.assertIn("skip session %s: dead" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: dead" % P4242, _slash("\n".join(cm.output)))
 
     def test_unreadable_process_skipped(self):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             result, _, _, _ = run({P4242: entry(4242)}, proc=FakeProc({4242: OSError(22, "Invalid argument")}))
         self.assertEqual(result, [])
-        self.assertIn("skip session %s: unreadable" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: unreadable" % P4242, _slash("\n".join(cm.output)))
 
     def test_malformed_procargs_skipped(self):
         result, _, _, _ = run({P4242: entry(4242)}, proc=lambda pid: parse_procargs(b"\x01"))
@@ -436,7 +468,7 @@ class DiscoverTest(unittest.TestCase):
             result, _, proc, _ = run({P4242: entry(4242)}, start=FakeStart({4242: LATER}))
         self.assertEqual(result, [])
         self.assertEqual(proc.calls, [])
-        self.assertIn("skip session %s: pid_reused" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: pid_reused" % P4242, _slash("\n".join(cm.output)))
 
     def test_start_within_one_second_kept(self):
         result, _, _, _ = run({P4242: entry(4242)}, start=FakeStart({4242: T0.replace(microsecond=900000)}))
@@ -452,14 +484,14 @@ class DiscoverTest(unittest.TestCase):
                 result, _, proc, _ = run({P4242: entry(4242)}, start=FakeStart({4242: live}))
             self.assertEqual(result, [])
             self.assertEqual(proc.calls, [])
-            self.assertIn("skip session %s: unreadable" % P4242, "\n".join(cm.output))
+            self.assertIn("skip session %s: unreadable" % P4242, _slash("\n".join(cm.output)))
 
     def test_pid_reused_during_read_race(self):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             result, _, proc, _ = run({P4242: entry(4242)}, start=FakeStart({4242: [T0, LATER]}))
         self.assertEqual(result, [])
         self.assertEqual(proc.calls, [4242])
-        self.assertIn("skip session %s: pid_reused" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: pid_reused" % P4242, _slash("\n".join(cm.output)))
 
     def test_live_start_vanishes_after_read(self):
         result, _, proc, _ = run({P4242: entry(4242)}, start=FakeStart({4242: [T0, None]}))
@@ -488,7 +520,7 @@ class DiscoverTest(unittest.TestCase):
                         self.assertEqual([s.argv for s in result], [argv])
                     else:
                         self.assertEqual(result, [])
-                        self.assertIn("skip session %s: not_claude" % P4242, "\n".join(cm.output))
+                        self.assertIn("skip session %s: not_claude" % P4242, _slash("\n".join(cm.output)))
 
     def test_duplicate_pid_newest_status_wins(self):
         files = {
@@ -515,7 +547,7 @@ class DiscoverTest(unittest.TestCase):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             result, _, _, _ = run(files)
         self.assertEqual([s.status for s in result], ["idle"])
-        self.assertIn("skip session %s: pid_reused" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: pid_reused" % P4242, _slash("\n".join(cm.output)))
 
     def test_winner_without_proc_start_uses_sibling_anchor(self):
         files = {
@@ -530,7 +562,7 @@ class DiscoverTest(unittest.TestCase):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             result, _, _, _ = run(files, proc=python, start=FakeStart({4242: [T0, LATER]}))
         self.assertEqual(result, [])
-        self.assertIn("skip session %s: pid_reused" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: pid_reused" % P4242, _slash("\n".join(cm.output)))
 
     def discover_with_env(self, env):
         proc = FakeProc({4242: ("/usr/local/bin/claude", ("claude",), env)})
@@ -550,7 +582,7 @@ class DiscoverTest(unittest.TestCase):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             result = self.discover_with_env({"CLAUDE_CONFIG_DIR": "rel/home"})
         self.assertEqual(result, [])
-        self.assertIn("skip session %s: config_dir_relative" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: config_dir_relative" % P4242, _slash("\n".join(cm.output)))
 
     def test_empty_terminal_handle_is_none(self):
         result = self.discover_with_env({"CLAUDE_CONFIG_DIR": "/h/acc1", "ORCA_TERMINAL_HANDLE": ""})
@@ -573,7 +605,7 @@ class DiscoverTest(unittest.TestCase):
         with self.assertLogs("rotator.sessions", "DEBUG") as cm:
             result, _, _, _ = run(files)
         self.assertEqual([s.pid for s in result], [9])
-        self.assertIn("skip session %s: invalid" % P4242, "\n".join(cm.output))
+        self.assertIn("skip session %s: invalid" % P4242, _slash("\n".join(cm.output)))
 
     def test_argv_preserved(self):
         argv = ("claude", "--resume", "00000000-0000-4000-8000-000000000042")
@@ -592,6 +624,46 @@ class DiscoverTest(unittest.TestCase):
         proc = FakeProc({4: OSError(1, "Operation not permitted"), 4242: CLAUDE})
         result, _, _, _ = run(files, alive={4, 4242}, proc=proc)
         self.assertEqual([s.pid for s in result], [4242])
+
+
+class DiscoverSessionsWindowsIntegrationTest(unittest.TestCase):
+    """discover_sessions through its real default wiring with IS_WINDOWS patched true: Windows cannot
+    read another process's argv/env, so the session still shows up (recognized by exe name alone),
+    with no CLAUDE_CONFIG_DIR/ORCA_TERMINAL_HANDLE -- the default config dir and no pane binding."""
+
+    def test_session_without_procstart_is_shown_via_exe_name_only(self):
+        files = {P4242: entry(4242, procStart=None)}
+        dirs = {}
+        texts = {}
+        for path, value in files.items():
+            dirs.setdefault(os.path.dirname(path), []).append(os.path.basename(path))
+            texts[path] = json.dumps(value)
+        fs = FakeFS(dirs, texts)
+        with unittest.mock.patch.object(rotator.sessions._win, "IS_WINDOWS", True), \
+                unittest.mock.patch.object(rotator.sessions._win, "read_proc",
+                                           lambda pid: ("claude.exe", (), {})):
+            result = discover_sessions(["/h/root", "/h/acc1"], list_dir=fs.list_dir, read_text=fs.read_text,
+                                       pid_alive=lambda p: True)
+        self.assertEqual(len(result), 1)
+        s = result[0]
+        self.assertEqual(s.pid, 4242)
+        self.assertEqual(s.config_dir, DEFAULT_HOME)  # no CLAUDE_CONFIG_DIR: Windows read_proc has no env
+        self.assertIsNone(s.terminal_handle)  # no pane binding available: switching stays unavailable
+        self.assertEqual(s.argv, ())
+
+    def test_not_claude_exe_is_skipped(self):
+        files = {P4242: entry(4242, procStart=None)}
+        dirs, texts = {}, {}
+        for path, value in files.items():
+            dirs.setdefault(os.path.dirname(path), []).append(os.path.basename(path))
+            texts[path] = json.dumps(value)
+        fs = FakeFS(dirs, texts)
+        with unittest.mock.patch.object(rotator.sessions._win, "IS_WINDOWS", True), \
+                unittest.mock.patch.object(rotator.sessions._win, "read_proc",
+                                           lambda pid: (r"C:\Windows\notepad.exe", (), {})):
+            result = discover_sessions(["/h/root", "/h/acc1"], list_dir=fs.list_dir, read_text=fs.read_text,
+                                       pid_alive=lambda p: True)
+        self.assertEqual(result, [])
 
 
 class SecretAbsenceTest(unittest.TestCase):
@@ -771,6 +843,7 @@ class ReadSessionModelTest(unittest.TestCase):
         t.join(5)
         return t.is_alive(), out
 
+    @unittest.skipIf(sys.platform == "win32", "FIFOs (os.mkfifo) are POSIX-only")
     def test_fifo_is_not_read(self):
         for sub in (re.sub("[^A-Za-z0-9]", "-", self.cwd), "-other-dir"):
             with self.subTest(sub=sub):

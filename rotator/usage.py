@@ -19,6 +19,7 @@ from typing import Callable, Mapping, Optional, Tuple
 
 from rotator.accounts import _read_text_utf8, read_credential
 from rotator.models import USAGE_BETA_HEADER, USAGE_URL, AccountUsage, Http, Keychain, Now, Profile, ReadText, UsageWindow
+from rotator.windows import IS_WINDOWS
 
 log = logging.getLogger("rotator.usage")
 
@@ -304,6 +305,7 @@ def fetch_usage(
     now: Optional[Now] = None,
     timeout: float = USAGE_TIMEOUT_S,
     http_ex: Optional[HttpEx] = None,
+    is_windows: bool = IS_WINDOWS,
 ) -> AccountUsage:
     """Live usage for ``profile``, else its cached usage, else ``source="unavailable"``.
 
@@ -314,7 +316,10 @@ def fetch_usage(
 
     ``http`` and ``http_ex`` are alternative seams (passing both raises
     ValueError before any I/O). ``retry_after_s`` is set only for a live 429
-    answered through ``http_ex`` or the default seam.
+    answered through ``http_ex`` or the default seam. On Windows, the token
+    comes from ``<profile.home>/.credentials.json`` (read via ``read_text``)
+    instead of the Keychain; ``is_windows`` is injectable so tests can force
+    either path on any OS.
     """
     if not isinstance(profile, Profile):
         raise TypeError("fetch_usage expects a Profile")
@@ -327,7 +332,7 @@ def fetch_usage(
     result = None
     raw_retry: Optional[str] = None
 
-    cred = read_credential(profile, keychain=keychain)
+    cred = read_credential(profile, keychain=keychain, read_text=read_text, is_windows=is_windows)
     if cred is None:
         live_kind = "token_missing"
     elif cred.expires_at_ms <= now_ms:

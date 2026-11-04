@@ -31,7 +31,10 @@ def read_selected_host(root: Optional[str] = None, *, read_text: Optional[ReadTe
 def _validate(target: Profile, root: str) -> None:
     if not (os.path.isabs(root) and os.path.isdir(root)):
         raise ValueError("pointer root must be an existing absolute directory")
-    if target.account_id in ("", ".", "..") or os.sep in target.account_id:
+    # Both slash kinds, not just os.sep: an account_id must be one path component on every OS, not only
+    # the one running right now (ntpath also accepts "/" as a separator; posixpath never treats "\" as one,
+    # but it must not be allowed to blend into the written pointer text either).
+    if target.account_id in ("", ".", "..") or "/" in target.account_id or "\\" in target.account_id:
         raise ValueError("account_id must be one path component")
     if not os.path.isabs(target.home):
         raise ValueError("target home must be absolute")
@@ -69,7 +72,9 @@ def set_selected_host(
     fd, tmp = tempfile.mkstemp(prefix=".selected-host.", dir=root)
     handed = False
     try:
-        os.fchmod(fd, 0o600)
+        fchmod = getattr(os, "fchmod", None)  # Windows had no os.fchmod before Python 3.13
+        if fchmod is not None:
+            fchmod(fd, 0o600)
         f = os.fdopen(fd, "wb")
         handed = True
         with f:

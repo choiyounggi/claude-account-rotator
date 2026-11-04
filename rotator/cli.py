@@ -10,6 +10,7 @@ import functools
 import json
 import logging
 import math
+import ntpath
 import os
 import platform
 import re
@@ -17,15 +18,21 @@ import select
 import shutil
 import signal
 import sys
-import termios
 import threading
 import time
-import tty
 import unicodedata
 from datetime import datetime, timezone, tzinfo
 from typing import Any, Callable, Dict, List, Optional, Sequence, TextIO, Tuple
 
+try:
+    import termios
+    import tty
+except ImportError:  # Windows has neither; status --watch uses rotator.windows (msvcrt) instead
+    termios = None
+    tty = None
+
 from rotator import doctor, launchd, refresh
+from rotator import windows as _win
 from rotator.accounts import profile_for_config_dir
 from rotator.config import CONFIG_DIR_DEFAULT, CONFIG_PATH_DEFAULT, LOG_DIR_DEFAULT, Config, ConfigError, load_config
 from rotator.daemon import (
@@ -35,6 +42,12 @@ from rotator.daemon import (
 from rotator.policy import decide
 from rotator.sessions import session_homes
 from rotator.switcher import ORCA_BINARY_DEFAULT, build_relaunch_command, result_hint
+
+WINDOWS_UNSUPPORTED_COMMANDS: Tuple[str, ...] = ("daemon", "switch", "install", "uninstall")
+WINDOWS_UNSUPPORTED_MESSAGE = (
+    "rotator %s is not available on Windows yet: automatic switching and the background agent "
+    "come in a later release"
+)
 
 STATUS_SCHEMA = 1
 STATUS_KEYS = ("schema", "generated_at", "daemon", "accounts", "pointer_account_id", "sessions",
@@ -1134,7 +1147,55 @@ class RealTerm:
                 pass
 
 
+class WindowsTerm:
+    """The TermCtl of a Windows console: msvcrt keys, VT-mode ANSI (falls back to plain output)."""
+
+    def __init__(self, out: TextIO, inp: Optional[Any]):
+        self.out = out
+        self.inp = inp
+        self._vt_enabled = False
+
+    def _write(self, text: str) -> None:
+        self.out.write(text)
+        self.out.flush()
+
+    def enter_alt(self) -> None:
+        try:
+            fd = self.out.fileno()
+        except (AttributeError, ValueError, OSError):
+            fd = None
+        self._vt_enabled = fd is not None and _win.enable_vt_mode(fd)
+        if self._vt_enabled:
+            self._write("\x1b[?1049h")
+
+    def leave_alt(self) -> None:
+        if self._vt_enabled:
+            self._write("\x1b[?1049l")
+        self._vt_enabled = False
+
+    def hide_cursor(self) -> None:
+        if self._vt_enabled:
+            self._write("\x1b[?25l")
+
+    def show_cursor(self) -> None:
+        if self._vt_enabled:
+            self._write("\x1b[?25h")
+
+    def read_key(self, timeout: float) -> Optional[str]:
+        if not _isatty(self.inp):
+            time.sleep(timeout)
+            return None
+        return _win.read_key_msvcrt(timeout)
+
+    def probe_ambiguous_wide(self, timeout: float = 0.2) -> bool:
+        # msvcrt consoles do not answer ESC[6n reliably; assume narrow (the --ascii-safe default).
+        return False
+
+
 def _on_sigterm(signum: int, frame: Any) -> None:
+    # Only the first SIGTERM stops the dashboard: started through bin/rotator.cjs, a signal to the whole process
+    # group arrives twice, and a second KeyboardInterrupt would cut the terminal cleanup short.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     raise KeyboardInterrupt
 
 
@@ -1192,8 +1253,32 @@ def _real_stale_check(cfg: Config) -> Callable[[], bool]:
     return lambda: launchd.install_stale(launchd.plist_path_default(), cfg.state_dir, launchd.repo_root())
 
 
+WINDOWS_ORCA_CLI_WHERE = "orca.cmd on PATH"
+
+
+def _windows_orca_cli_path(which: Optional[Callable[[str], Optional[str]]] = None) -> Optional[str]:
+    """Orca's CLI on Windows: ``orca.cmd`` (Orca's command name there), else an ``orca`` launcher in a ``bin``
+    folder (Orca ships both under ``resources\\bin``). The app's own ``Orca.exe`` also matches ``orca.exe``
+    because Windows names ignore case, but it is Electron and ``--version`` would open the app, so any hit
+    outside a ``bin`` folder is skipped."""
+    which = which or shutil.which
+    found = which("orca.cmd")
+    if found:
+        return found
+    for name in ("orca.exe", "orca"):
+        found = which(name)
+        if found and ntpath.basename(ntpath.dirname(found)).lower() == "bin":
+            return found
+    return None
+
+
 def _real_orca_gate() -> Optional[str]:
-    return doctor.gate(platform.system(), doctor.orca_version())
+    system = platform.system()
+    if system == "Windows":
+        cli_path = _windows_orca_cli_path()
+        version = doctor.orca_version_windows(cli_path) if cli_path else None
+        return doctor.gate(system, version, where=WINDOWS_ORCA_CLI_WHERE)
+    return doctor.gate(system, doctor.orca_version())
 
 
 def _doctor(cfg: Config, deps: Deps, out: TextIO, stale: bool, config_error: Optional[str]) -> int:
@@ -1201,12 +1286,23 @@ def _doctor(cfg: Config, deps: Deps, out: TextIO, stale: bool, config_error: Opt
         count = len(deps.discover_profiles(cfg.profiles_root))
     except Exception:
         count = 0
-    checks = [doctor.check_system(platform.system()), doctor.check_python(sys.version_info[:3]),
-              doctor.check_config(config_error),
-              doctor.check_orca(doctor.orca_version()),
-              doctor.check_orca_cli(ORCA_BINARY_DEFAULT, os.access(ORCA_BINARY_DEFAULT, os.X_OK)),
-              doctor.check_accounts(count, cfg.profiles_root),
-              doctor.check_agent(os.path.isfile(launchd.plist_path_default()), stale)]
+    system = platform.system()
+    if system == "Windows":
+        cli_path = _windows_orca_cli_path()
+        version = doctor.orca_version_windows(cli_path) if cli_path else None
+        checks = [doctor.check_system(system), doctor.check_python(sys.version_info[:3]),
+                  doctor.check_config(config_error),
+                  doctor.check_orca(version, where=WINDOWS_ORCA_CLI_WHERE),
+                  doctor.check_orca_cli(cli_path or "orca.cmd", cli_path is not None),
+                  doctor.check_accounts(count, cfg.profiles_root),
+                  doctor.check_agent(False, False, supported=False)]
+    else:
+        checks = [doctor.check_system(system), doctor.check_python(sys.version_info[:3]),
+                  doctor.check_config(config_error),
+                  doctor.check_orca(doctor.orca_version()),
+                  doctor.check_orca_cli(ORCA_BINARY_DEFAULT, os.access(ORCA_BINARY_DEFAULT, os.X_OK)),
+                  doctor.check_accounts(count, cfg.profiles_root),
+                  doctor.check_agent(os.path.isfile(launchd.plist_path_default()), stale)]
     print("\n".join(doctor.render(checks)), file=out)
     return doctor.exit_code(checks)
 
@@ -1256,6 +1352,9 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
             return 2
         config_error = str(e)
         cfg = Config(state_dir=CONFIG_DIR_DEFAULT)
+    if args.command in WINDOWS_UNSUPPORTED_COMMANDS and platform.system() == "Windows":
+        print(WINDOWS_UNSUPPORTED_MESSAGE % args.command, file=err)
+        return 2
     if orca_gate is None and make_deps is None and launchctl is None:
         orca_gate = _real_orca_gate
     if args.command not in ("doctor", "uninstall") and orca_gate is not None:
@@ -1301,7 +1400,8 @@ def _status(args: argparse.Namespace, cfg: Config, deps: Deps, out: TextIO, err:
         if args.json:
             out.write(json.dumps(build_status(cfg, deps, deps.now()), sort_keys=True, indent=2) + "\n")
             return 0
-        term = term_ctl if term_ctl is not None else (RealTerm(out, inp) if _isatty(out) else None)
+        _term_cls = WindowsTerm if _win.IS_WINDOWS else RealTerm
+        term = term_ctl if term_ctl is not None else (_term_cls(out, inp) if _isatty(out) else None)
         opts: Dict[str, Any] = {"color": _isatty(out) and not os.environ.get("NO_COLOR"),  # no-color.org
                                 "soft_pct": cfg.soft_pct, "hard_pct": cfg.hard_pct, "ascii": args.ascii,
                                 "details": args.details, "stale_install": _stale_install(stale_check)}
@@ -1311,7 +1411,7 @@ def _status(args: argparse.Namespace, cfg: Config, deps: Deps, out: TextIO, err:
             width = shutil.get_terminal_size((100, 40)).columns
             out.write("\n".join(render(build_status(cfg, deps, now), now, tz, width, **opts)) + "\n")
             return 0
-        if read_key is None and isinstance(term, RealTerm) and _isatty(inp):
+        if read_key is None and isinstance(term, (RealTerm, WindowsTerm)) and _isatty(inp):
             read_key = term.read_key
         prev_sigterm: Any = False
         try:
@@ -1324,10 +1424,14 @@ def _status(args: argparse.Namespace, cfg: Config, deps: Deps, out: TextIO, err:
             _watch(cfg, deps, out, tz, opts, term is not None, read_key, interval)
         finally:
             if prev_sigterm is not False:
-                signal.signal(signal.SIGTERM, signal.SIG_DFL if prev_sigterm is None else prev_sigterm)
-            if term is not None:
-                term.show_cursor()
-                term.leave_alt()
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)  # a late copy of the signal must not stop the cleanup
+            try:
+                if term is not None:
+                    term.show_cursor()
+                    term.leave_alt()
+            finally:
+                if prev_sigterm is not False:
+                    signal.signal(signal.SIGTERM, signal.SIG_DFL if prev_sigterm is None else prev_sigterm)
         return 0
     except KeyboardInterrupt:
         return 0

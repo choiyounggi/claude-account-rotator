@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Tuple
 
 from rotator.models import PROFILES_ROOT_DEFAULT, Profile, ReadText, Session
+from rotator.procutil import pid_alive as _cross_platform_pid_alive
 
 logger = logging.getLogger("rotator.switcher")
 
@@ -459,6 +460,11 @@ class OsProcessProbe:
         self._run = _run_subprocess if run is None else run
 
     def is_alive(self, pid: int) -> bool:
+        # The untouched default (os.kill) is routed through the cross-platform check instead of
+        # called directly: on Windows, signal 0 is CTRL_C_EVENT, not a liveness probe. An injected
+        # ``kill`` (tests) keeps the original signal-0 try/except behaviour unchanged.
+        if self._kill is os.kill:
+            return _cross_platform_pid_alive(pid)
         try:
             self._kill(pid, 0)
         except ProcessLookupError:
@@ -806,7 +812,9 @@ def _trusted_doc(raw: bytes, cwd: str) -> Optional[Tuple[dict, bool]]:
 def _backup(raw: bytes, backup_dir: str, account_id: str, now: datetime) -> None:
     os.makedirs(backup_dir, 0o700, exist_ok=True)
     name = "%s%s.%s" % (TRUST_BACKUP_PREFIX, account_id[:8], now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
-    fd = os.open(os.path.join(backup_dir, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    # os.O_NOFOLLOW (refuse a symlink) does not exist on Windows; getattr(..., 0) ORs in nothing there.
+    fd = os.open(os.path.join(backup_dir, name),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "wb") as f:
         f.write(raw)
     olds = sorted((n for n in os.listdir(backup_dir) if n.startswith(TRUST_BACKUP_PREFIX)),
@@ -847,7 +855,9 @@ def mirror_trust(config_path: str, cwd: str, backup_dir: str, account_id: str, *
         d = os.path.dirname(config_path)
         fd, tmp = tempfile.mkstemp(prefix=".claude.json.rotator-", dir=d)
         with os.fdopen(fd, "wb") as f:
-            os.fchmod(f.fileno(), stat.S_IMODE(st.st_mode))
+            fchmod = getattr(os, "fchmod", None)  # Windows had no os.fchmod before Python 3.13
+            if fchmod is not None:
+                fchmod(f.fileno(), stat.S_IMODE(st.st_mode))
             f.write(text.encode("utf-8"))
             f.flush()
             os.fsync(f.fileno())

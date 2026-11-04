@@ -876,9 +876,23 @@ def find_claude_binary(argv0s: Sequence[Any], *, is_exec: Callable[[str], bool] 
     return None
 
 
+def _default_killpg(pid: int, sig: int) -> None:
+    """os.killpg where it exists; Windows has no process groups, so this kills just the process.
+
+    Unreachable there in this release (the daemon/refresh flow this feeds stays macOS-only -- the CLI
+    refuses those commands before this runs), but it must not crash evaluating a missing-attribute
+    default at import time.
+    """
+    killpg = getattr(os, "killpg", None)
+    if killpg is not None:
+        killpg(pid, sig)
+    else:
+        os.kill(pid, sig)
+
+
 def run_claude_quiet(argv: Sequence[str], env: Mapping[str, str], cwd: str, timeout: float, *,
                      popen: Callable[..., Any] = subprocess.Popen,
-                     killpg: Callable[[int, int], None] = os.killpg) -> str:
+                     killpg: Callable[[int, int], None] = _default_killpg) -> str:
     """Run ``argv`` with empty stdin and its output discarded (it can name the account's e-mail); kill its
     whole process group on timeout. Returns "exited" (any exit code), "timeout" or "error" (could not start)."""
     try:
@@ -892,7 +906,9 @@ def run_claude_quiet(argv: Sequence[str], env: Mapping[str, str], cwd: str, time
     except subprocess.TimeoutExpired:
         pass
     try:
-        killpg(proc.pid, signal.SIGKILL)
+        # Windows' signal module has no SIGKILL; this path is unreachable there this release anyway
+        # (refresh/daemon stay macOS-only), but the reference must not crash evaluating it.
+        killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
     except OSError:
         pass
     try:

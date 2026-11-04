@@ -4,6 +4,7 @@ import io
 import json
 import os
 import socket
+import sys
 import tempfile
 import unittest
 import unittest.mock
@@ -305,6 +306,7 @@ def run(**kw):
         keychain=kw.get("keychain", FakeKeychain(cred_json())),
         read_text=kw.get("read_text", FakeFiles({})),
         now=lambda: NOW,
+        is_windows=False,
     )
 
 
@@ -320,7 +322,9 @@ EXCEPTION_KINDS = [
     ("IncompleteRead", http.client.IncompleteRead(b"part"), "network"),
     ("BadStatusLine", http.client.BadStatusLine("x"), "network"),
     ("ConnectionResetError", ConnectionResetError(), "network"),
-    ("TimeoutError", TimeoutError(), "network"),
+    # socket.timeout became an alias of the builtin TimeoutError in Python 3.10 (bpo-29017): a bare
+    # TimeoutError is indistinguishable from socket.timeout there, so it classifies as "timeout" too.
+    ("TimeoutError", TimeoutError(), "timeout" if sys.version_info >= (3, 10) else "network"),
     ("HTTPError 401", http_error(401), "http_401"),
     ("header ValueError", ValueError("Invalid header value b'Bearer " + TOKEN + "'"), "request_error"),
     ("UnicodeEncodeError", UnicodeEncodeError("latin-1", "x", 0, 1, "bad"), "request_error"),
@@ -498,6 +502,7 @@ class DefaultHttpSeamTest(unittest.TestCase):
                 PROFILE,
                 keychain=FakeKeychain(cred_json()),
                 read_text=FakeFiles({}),
+                is_windows=False,
                 now=lambda: NOW,
             )
         self.assertEqual(result.error, "network;cache_missing")
@@ -661,7 +666,7 @@ class FakeHttpEx:
 
 def run_ex(fake, read_text=None):
     return fetch_usage(PROFILE, http_ex=fake, keychain=FakeKeychain(cred_json()),
-                       read_text=read_text or FakeFiles({}), now=lambda: NOW)
+                       read_text=read_text or FakeFiles({}), now=lambda: NOW, is_windows=False)
 
 
 def http_date(dt):

@@ -19,11 +19,31 @@ jobs:
       - run: /usr/bin/python3 -m unittest discover -s tests -t .
       - run: node --test scripts/release.check.mjs
 
+  # Windows: Orca ships for Windows with the same claude-profiles layout under %APPDATA%\orca. The oldest
+  # and a current Python the rotator supports.
+  test-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: python --version
+      - run: python -m unittest discover -s tests -t .
+      - run: node --test scripts/release.check.mjs
+
   # Cuts a release for every push to main that changes something installable: bumps package.json from
   # the conventional commits since the last tag, tags it, publishes a GitHub release and the npm
   # package. Commits pushed here with GITHUB_TOKEN do not trigger another run.
   release:
-    needs: test
+    needs: [test, test-windows]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # Publishing runs no package scripts (postinstall runs on the user's Mac), so Linux is enough.
     runs-on: ubuntu-latest

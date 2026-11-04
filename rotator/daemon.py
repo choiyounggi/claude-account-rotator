@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import functools
 import hashlib
 import json
@@ -20,13 +19,21 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Sequence, Set, Tuple
 
-from rotator import accounts, pointer, refresh, sessions, switcher, usage
+try:
+    import fcntl  # Windows has no fcntl; FileLock/try_lock use rotator.windows there instead
+except ImportError:
+    fcntl = None
+
+from rotator import accounts, pointer, procutil, refresh, sessions, switcher, usage
 from rotator.accounts import profile_for_config_dir
 from rotator.config import LOG_DIR_DEFAULT, Config
 from rotator.models import AccountUsage, Profile, Session, UsageWindow
 from rotator.policy import PolicyConfig, decide, decide_pointer
 from rotator.sessions import session_homes
 from rotator.switcher import ProcessProbe, SwitchResult, TerminalDriver, switch_budget_s
+from rotator.windows import IS_WINDOWS
+from rotator.windows import try_lock_bytes as _win_try_lock_bytes
+from rotator.windows import unlock_bytes as _win_unlock_bytes
 
 Identity = Tuple[int, str, Optional[str]]
 
@@ -275,7 +282,9 @@ def atomic_write_text(path: str, text: str) -> None:
     os.makedirs(d, 0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", dir=d)
     try:
-        os.fchmod(fd, 0o600)
+        fchmod = getattr(os, "fchmod", None)  # Windows had no os.fchmod before Python 3.13
+        if fchmod is not None:
+            fchmod(fd, 0o600)
         f = os.fdopen(fd, "w", encoding="utf-8")
     except BaseException:
         os.close(fd)
@@ -293,7 +302,12 @@ def atomic_write_text(path: str, text: str) -> None:
 
 
 class FileLock:
-    """An exclusive flock held on an open fd; the lock file itself is never deleted."""
+    """An exclusive lock held on an open fd; the lock file itself is never deleted.
+
+    POSIX: ``flock(LOCK_EX)``. Windows has no flock: it takes a mandatory byte-range lock instead
+    (rotator.windows.try_lock_bytes/unlock_bytes), on one byte far past any real content so the file's
+    actual bytes (a pid or small JSON) stay readable by anyone not also trying to lock that same byte.
+    """
 
     def __init__(self, fd: int) -> None:
         self._fd: Optional[int] = fd
@@ -309,21 +323,30 @@ class FileLock:
         if self._fd is None:
             return
         try:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            if IS_WINDOWS:
+                _win_unlock_bytes(self._fd)
+            else:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
         finally:
             os.close(self._fd)
             self._fd = None
 
 
 def try_lock(path: str) -> Optional[FileLock]:
-    """Take ``flock(LOCK_EX | LOCK_NB)`` on ``path``; None when another holder has it."""
+    """Take a non-blocking exclusive lock on ``path``; None when another holder has it."""
     os.makedirs(os.path.dirname(path), 0o700, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(fd)
-        return None
+        if IS_WINDOWS:
+            if not _win_try_lock_bytes(fd):
+                os.close(fd)
+                return None
+        else:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                return None
     except BaseException:
         os.close(fd)
         raise
@@ -1573,13 +1596,7 @@ def _pid_alive(pid: object) -> bool:
     # pid 0 or a negative pid would signal a whole process group.
     if type(pid) is not int or pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return procutil.pid_alive(pid)
 
 
 def _install_signals(handler: Callable[[], None]) -> None:

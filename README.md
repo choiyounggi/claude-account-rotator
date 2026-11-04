@@ -85,6 +85,31 @@ has a default. From a checkout, run `bin/rotator` instead of `rotator`
 - `/usr/bin/python3` 3.9 or newer (it comes with the Xcode Command Line Tools: `xcode-select --install`).
 - Standard library only; nothing to install with pip. Node is needed only for the npm install.
 
+## Windows
+
+Windows support starts with `doctor` and the dashboard; automatic switching is still macOS-only.
+
+**Works today**: `rotator doctor` (OS-aware checks: Orca's version via `orca.cmd --version`, the orca CLI on
+PATH, Claude accounts under `%APPDATA%\orca\claude-profiles`) and the dashboard (`rotator status`,
+`rotator status --watch`, `rotator status --json`).
+
+**Requirements**: Windows 10 or 11; Python 3.9 or newer from [python.org](https://www.python.org/) or the
+Microsoft Store (`python` or `py -3` on PATH); Orca **1.4.224 or newer** with its CLI (`orca.cmd`, under `resources\bin`) on PATH.
+
+**Install**:
+
+```sh
+npm install -g claude-account-rotator
+rotator doctor
+rotator status --watch
+```
+
+**Not yet supported**: `rotator install`/`uninstall` (the background agent), `rotator daemon`, automatic
+switching, and `rotator switch`. Each refuses with one clear line and exit code 2 instead of running.
+
+This has been verified in CI only (GitHub Actions `windows-latest`, Python 3.9 and 3.12) — it has not yet been
+run on a real Windows machine.
+
 ## Doctor
 
 ```sh
