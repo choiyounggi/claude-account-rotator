@@ -28,6 +28,9 @@ from rotator.accounts import (
 )
 from rotator.models import MODEL_RE, AccountUsage, Profile, Session, UsageWindow, is_fable_model
 
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE = os.path.join(REPO, ".claude", "tmp", "test-accounts")
+
 ACC1 = "00000000-0000-4000-8000-000000000001"
 ACC2 = "00000000-0000-4000-8000-000000000002"
 ACC3 = "00000000-0000-4000-8000-000000000003"
@@ -773,3 +776,138 @@ class TestKeychainItemSeams(unittest.TestCase):
                     with self.assertRaises(ValueError) as cm:
                         call()
                     self.assertEqual(str(cm.exception), "bad keychain item name")
+
+
+def _scratch_home(case, name):
+    """A fresh, empty directory under .claude/tmp for one test; removed by the suite's own cleanup."""
+    base = os.path.join(BASE, name)
+    os.makedirs(base, exist_ok=True)
+    td = tempfile.TemporaryDirectory(dir=base)
+    case.addCleanup(td.cleanup)
+    return td.name
+
+
+class ReadCredentialsFileTest(unittest.TestCase):
+    """Windows plaintext store: rotator.accounts.read_credentials_file(home)."""
+
+    def setUp(self):
+        self.home = _scratch_home(self, "read-creds")
+        self.path = os.path.join(self.home, ".credentials.json")
+
+    def test_reads_existing_file(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write('{"claudeAiOauth":{"accessToken":"tok-fake-1"}}')
+        self.assertEqual(accounts_mod.read_credentials_file(self.home), '{"claudeAiOauth":{"accessToken":"tok-fake-1"}}')
+
+    def test_missing_file_is_none(self):
+        self.assertIsNone(accounts_mod.read_credentials_file(self.home))
+
+    def test_empty_file_is_empty_string_not_none(self):
+        with open(self.path, "w", encoding="utf-8"):
+            pass
+        self.assertEqual(accounts_mod.read_credentials_file(self.home), "")
+
+    def test_unreadable_file_is_none(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("x")
+        with unittest.mock.patch("rotator.accounts.open", side_effect=PermissionError("denied"), create=True):
+            self.assertIsNone(accounts_mod.read_credentials_file(self.home))
+
+
+class CredentialsFileExistsTest(unittest.TestCase):
+    """rotator.accounts.credentials_file_exists(home)."""
+
+    def setUp(self):
+        self.home = _scratch_home(self, "exists-creds")
+        self.path = os.path.join(self.home, ".credentials.json")
+
+    def test_true_when_present(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("{}")
+        self.assertIs(accounts_mod.credentials_file_exists(self.home), True)
+
+    def test_false_when_missing(self):
+        self.assertIs(accounts_mod.credentials_file_exists(self.home), False)
+
+    def test_none_on_other_oserror(self):
+        with unittest.mock.patch("rotator.accounts.os.stat", side_effect=PermissionError("denied")):
+            self.assertIsNone(accounts_mod.credentials_file_exists(self.home))
+
+
+class WriteCredentialsFileTest(unittest.TestCase):
+    """rotator.accounts.write_credentials_file(home, secret_json): atomic, never raises."""
+
+    def setUp(self):
+        self.home = _scratch_home(self, "write-creds")
+        self.path = os.path.join(self.home, ".credentials.json")
+
+    def test_write_then_read_round_trip(self):
+        self.assertIs(accounts_mod.write_credentials_file(self.home, '{"a":1}'), True)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"a":1}')
+        self.assertEqual(os.listdir(self.home), [".credentials.json"])
+
+    def test_empty_document_round_trips(self):
+        self.assertIs(accounts_mod.write_credentials_file(self.home, ""), True)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "")
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX permission bits do not map onto NTFS ACLs")
+    def test_mode_0600_where_honoured(self):
+        accounts_mod.write_credentials_file(self.home, "{}")
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_overwrite_replaces_old_content(self):
+        accounts_mod.write_credentials_file(self.home, "OLD")
+        self.assertIs(accounts_mod.write_credentials_file(self.home, "NEW"), True)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "NEW")
+
+    def test_replace_failure_leaves_old_file_and_no_temp_behind(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("ORIGINAL")
+        with unittest.mock.patch("rotator.accounts.os.replace", side_effect=PermissionError("locked")):
+            self.assertIs(accounts_mod.write_credentials_file(self.home, "NEW"), False)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "ORIGINAL")
+        self.assertEqual(os.listdir(self.home), [".credentials.json"])
+
+    def test_fsync_failure_leaves_old_file_and_no_temp_behind(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("ORIGINAL")
+        with unittest.mock.patch("rotator.accounts.os.fsync", side_effect=OSError("disk full")):
+            self.assertIs(accounts_mod.write_credentials_file(self.home, "NEW"), False)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "ORIGINAL")
+        self.assertEqual(os.listdir(self.home), [".credentials.json"])
+
+    def test_missing_home_dir_returns_false_without_raising(self):
+        missing = os.path.join(self.home, "does-not-exist")
+        self.assertIs(accounts_mod.write_credentials_file(missing, "{}"), False)
+        self.assertFalse(os.path.exists(missing))
+
+
+class WindowsStoreSeamAdapterTest(unittest.TestCase):
+    """The (key, account[, secret_json]) seam shape rotator.daemon.real_deps wires on Windows; the
+    account argument is always ignored since the file, not the account name, identifies the store."""
+
+    def setUp(self):
+        self.home = _scratch_home(self, "adapter-creds")
+        self.path = os.path.join(self.home, ".credentials.json")
+
+    def test_read_adapter_ignores_account(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write('{"a":1}')
+        self.assertEqual(accounts_mod.read_credentials_item(self.home, "alice"), '{"a":1}')
+        self.assertEqual(accounts_mod.read_credentials_item(self.home, ""), '{"a":1}')
+
+    def test_exists_adapter_ignores_account(self):
+        self.assertIs(accounts_mod.credentials_item_exists(self.home, "alice"), False)
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("{}")
+        self.assertIs(accounts_mod.credentials_item_exists(self.home, "bob"), True)
+
+    def test_write_adapter_ignores_account_and_persists(self):
+        self.assertIs(accounts_mod.write_credentials_item(self.home, "alice", '{"b":2}'), True)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"b":2}')

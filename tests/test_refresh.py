@@ -302,7 +302,6 @@ class TestCcLock(TripwireCase):
         self.new_dir = os.path.join(self.home, ".oauth_refresh.lock")
         self.legacy_dir = os.path.realpath(self.home) + ".lock"
 
-    @unittest.skipIf(sys.platform == "win32" and sys.version_info < (3, 12), "st_birthtime is unavailable on Windows before Python 3.12, so the lock-dir ownership check (_dir_id) always sees None there and refuses to remove its own directory")
     def test_success_and_release(self):
         lock, reason = refresh.take_cc_lock(self.home)
         self.assertIsInstance(lock, refresh.CcLock)
@@ -320,7 +319,6 @@ class TestCcLock(TripwireCase):
         self.assertFalse(os.path.exists(self.legacy_dir))
         self.assertTrue(os.path.isdir(self.new_dir))
 
-    @unittest.skipIf(sys.platform == "win32" and sys.version_info < (3, 12), "st_birthtime is unavailable on Windows before Python 3.12, so the lock-dir ownership check (_dir_id) always sees None there and refuses to remove its own directory")
     def test_existing_legacy_dir_is_busy_and_new_dir_undone(self):
         os.mkdir(self.legacy_dir)
         self.assertEqual(refresh.take_cc_lock(self.home), (None, "cc_lock_busy"))
@@ -351,7 +349,6 @@ class TestCcLock(TripwireCase):
             self.assertEqual(f.read(), "owner-record")
         self.assertEqual(os.stat(owner).st_mtime, before)
 
-    @unittest.skipIf(sys.platform == "win32" and sys.version_info < (3, 12), "st_birthtime is unavailable on Windows before Python 3.12, so the lock-dir ownership check (_dir_id) always sees None there and refuses to remove its own directory")
     def test_replaced_dir_left_in_place(self):
         lock, _ = refresh.take_cc_lock(self.home)
         # Claude Code judged our dir stale and recreated its own in the same place.
@@ -374,7 +371,6 @@ class TestCcLock(TripwireCase):
         self.assertEqual(len(cm.output), 2)
         os.rmdir(self.new_dir)
 
-    @unittest.skipIf(sys.platform == "win32" and sys.version_info < (3, 12), "st_birthtime is unavailable on Windows before Python 3.12, so the lock-dir ownership check (_dir_id) always sees None there and refuses to remove its own directory")
     def test_failed_take_removes_only_own_dir(self):
         os.mkdir(self.legacy_dir)
         self.assertEqual(refresh.take_cc_lock(self.home), (None, "cc_lock_busy"))
@@ -391,6 +387,76 @@ class TestCcLock(TripwireCase):
         lock.touch()
         for d in (self.new_dir, self.legacy_dir):
             self.assertGreaterEqual(os.stat(d).st_mtime, before - 1)
+
+
+class _NoBirthStat:
+    """A stat result shaped like pre-3.12 Windows: no st_birthtime at all."""
+
+    def __init__(self, ino, ctime):
+        self.st_ino = ino
+        self.st_ctime = ctime
+
+
+class TestDirId(TripwireCase):
+    def test_uses_birthtime_when_present(self):
+        class St:
+            st_ino = 7
+            st_birthtime = 123.5
+            st_ctime = 999.0
+        self.assertEqual(refresh._dir_id("/x", stat=lambda p: St()), (7, 123.5))
+        # Even on the Windows branch, a present birthtime (Python 3.12+) wins over ctime.
+        self.assertEqual(refresh._dir_id("/x", stat=lambda p: St(), is_windows=True), (7, 123.5))
+
+    def test_windows_without_birthtime_falls_back_to_ctime(self):
+        self.assertEqual(refresh._dir_id("/x", stat=lambda p: _NoBirthStat(7, 42.0), is_windows=True), (7, 42.0))
+
+    def test_non_windows_without_birthtime_is_none(self):
+        self.assertIsNone(refresh._dir_id("/x", stat=lambda p: _NoBirthStat(7, 42.0), is_windows=False))
+
+    def test_stat_oserror_is_none(self):
+        def boom(_p):
+            raise OSError("no such path")
+        self.assertIsNone(refresh._dir_id("/x", stat=boom))
+        self.assertIsNone(refresh._dir_id("/x", stat=boom, is_windows=True))
+
+
+class TestCcLockWindowsIdentity(TripwireCase):
+    """take_cc_lock/CcLock on a stat seam shaped like real pre-3.12 Windows (no st_birthtime)."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(BASE, exist_ok=True)
+        td = tempfile.TemporaryDirectory(dir=BASE)
+        self.addCleanup(td.cleanup)
+        self.home = os.path.join(td.name, "p1", "home")
+        os.makedirs(self.home)
+        self.new_dir = os.path.join(self.home, ".oauth_refresh.lock")
+        self.legacy_dir = os.path.realpath(self.home) + ".lock"
+
+    def _no_birth_stat(self, path):
+        st = os.stat(path)
+        return _NoBirthStat(st.st_ino, st.st_ctime)
+
+    def test_is_windows_lets_it_remove_its_own_dirs(self):
+        lock, reason = refresh.take_cc_lock(self.home, stat=self._no_birth_stat, is_windows=True)
+        self.assertIsNone(reason)
+        self.assertTrue(os.path.isdir(self.new_dir))
+        self.assertTrue(os.path.isdir(self.legacy_dir))
+        lock.release()
+        self.assertFalse(os.path.exists(self.new_dir))
+        self.assertFalse(os.path.exists(self.legacy_dir))
+
+    def test_without_is_windows_the_bug_reproduces(self):
+        # Same stat shape, but treated as non-Windows: _dir_id sees no identity, so release leaves
+        # the dirs in place forever -- this is the bug item 5 fixes, pinned down as a boundary case.
+        lock, reason = refresh.take_cc_lock(self.home, stat=self._no_birth_stat, is_windows=False)
+        self.assertIsNone(reason)
+        with self.assertLogs("rotator.refresh", "WARNING"):
+            lock.release()
+        self.assertTrue(os.path.isdir(self.new_dir))
+        self.assertTrue(os.path.isdir(self.legacy_dir))
+        os.rmdir(self.new_dir)
+        os.rmdir(self.legacy_dir)
 
 
 T0 = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
@@ -586,14 +652,19 @@ class FakeWorld:
         self.calls.append(("sleep", s))
         self.mono_v += s
 
-    def refresher(self, cfg=None):
-        return refresh.Refresher(
-            cfg or dataclasses.replace(Config(), state_dir=BASE), read_item=self.read_item,
-            item_exists=self.item_exists, account_name=self.account_name, write_item=self.write_item,
-            post=self.post, discover=self.discover, list_dir=self.list_dir, pid_alive=self.pid_alive,
-            exists=self.exists, lock=self.lock, cc_lock=self.cc_lock, now=self.now, monotonic=self.monotonic,
-            sleep=self.sleep, log=logging.getLogger("rotator.refresh"), find_claude=self.find_claude,
-            run_claude=self.run_claude, environ=self.environ)
+    def refresher(self, cfg=None, store_key=None, is_windows=False):
+        # is_windows is pinned to False by default (never the real sys.platform) so every existing
+        # macOS-flow test here behaves the same on any CI platform; Windows-specific tests pass
+        # is_windows=True explicitly, per the task's "no Windows machine, inject the seam" model.
+        kwargs = dict(
+            read_item=self.read_item, item_exists=self.item_exists, account_name=self.account_name,
+            write_item=self.write_item, post=self.post, discover=self.discover, list_dir=self.list_dir,
+            pid_alive=self.pid_alive, exists=self.exists, lock=self.lock, cc_lock=self.cc_lock, now=self.now,
+            monotonic=self.monotonic, sleep=self.sleep, log=logging.getLogger("rotator.refresh"),
+            find_claude=self.find_claude, run_claude=self.run_claude, environ=self.environ, is_windows=is_windows)
+        if store_key is not None:
+            kwargs["store_key"] = store_key
+        return refresh.Refresher(cfg or dataclasses.replace(Config(), state_dir=BASE), **kwargs)
 
     def kinds(self):
         return [c[0] for c in self.calls]
@@ -817,6 +888,86 @@ class TestGate(GateCase):
         self.assertEqual(w.calls, [])
         self.assertEqual(repr(r), "Refresher(<redacted>)")
         self.assertEqual(str(r), "Refresher(<redacted>)")
+
+
+class TestWindowsGateSkips(GateCase):
+    """plaintext_store and payload_too_large exist only for the macOS Keychain path (items 3, 4)."""
+
+    def test_plaintext_store_check_is_mac_only(self):
+        self.put(item())
+        self.w.paths.add("/p/%s/home/.credentials.json" % ACC_A)
+        mac = self.w.refresher(is_windows=False).refresh(self.p, [self.p], network=False)
+        self.assertEqual((mac["state"], mac["reason"]), ("skipped", "plaintext_store"))
+        self.w = FakeWorld()
+        self.put(item())
+        self.w.paths.add("/p/%s/home/.credentials.json" % ACC_A)
+        win = self.w.refresher(is_windows=True).refresh(self.p, [self.p], network=False)
+        self.assertEqual((win["state"], win["reason"]), ("skipped", "deferred"))
+
+    def test_payload_too_large_check_is_mac_only(self):
+        self.put(item(pad="x" * 3000))
+        mac = self.run_gate(network=False)
+        self.assertEqual((mac["state"], mac["reason"]), ("skipped", "payload_too_large"))
+        self.w = FakeWorld()
+        self.put(item(pad="x" * 3000))
+        win = self.w.refresher(is_windows=True).refresh(self.p, [self.p], network=False)
+        self.assertEqual((win["state"], win["reason"]), ("skipped", "deferred"))
+
+
+class TestStoreKey(GateCase):
+    """Every seam call keys off store_key(profile), not profile.keychain_service directly (item 2)."""
+
+    def test_default_store_key_is_keychain_service(self):
+        self.put(item())
+        self.run_gate(network=False)
+        used = {c[1] for c in self.w.calls if c[0] in ("read", "exists")}
+        self.assertEqual(used, {self.svc})
+
+    def test_custom_store_key_reroutes_read_and_exists(self):
+        self.w.items.clear()
+        self.w.items[(self.p.home, ACCT)] = item()
+        r = self.w.refresher(store_key=lambda p: p.home, is_windows=True)
+        rec = r.refresh(self.p, [self.p], network=False)
+        self.assertEqual(rec["reason"], "deferred")
+        used = {c[1] for c in self.w.calls if c[0] in ("read", "exists")}
+        self.assertEqual(used, {self.p.home})
+        self.assertNotIn(self.svc, used)
+
+
+class TestStoreKeyWiring(TripwireCase):
+    """store_key threaded through the write-back path (_locked/_write_window/_classify/_flush, item 9),
+    and that the macOS stdin-length guard in _try_write (item 4) does not fire on a non-Keychain key --
+    without that guard, profile.home is not a valid Keychain service name and _try_write raises."""
+
+    def setUp(self):
+        super().setUp()
+        self.w = FakeWorld()
+        self.p = prof(ACC_A)
+        self.key = self.p.home
+        self.w.items[(self.key, ACCT)] = item()
+        self.r = self.w.refresher(store_key=lambda p: p.home, is_windows=True)
+
+    def test_write_window_uses_store_key(self):
+        st = self.r._state(ACC_A)
+        tokens = refresh._Tokens("NEW-ACCESS-fake1", "NEW-REFRESH-fake1", T0_MS + 28_800_000, None, None)
+        rl = self.w.lock("/l/r")
+        cc = self.w.cc_lock(self.p.home)[0]
+        rec = self.r._write_window(self.p, st, ACCT, tokens, refresh._fp("R1"), rl, cc)
+        self.assertEqual((rec["state"], rec["reason"]), ("refreshed", "ok"))
+        writes = [c for c in self.w.calls if c[0] == "write"]
+        self.assertEqual(writes[0][1], self.key)
+        reads = [c for c in self.w.calls if c[0] == "read"]
+        self.assertTrue(reads and all(c[1] == self.key for c in reads))
+
+    def test_flush_uses_store_key(self):
+        st = self.r._state(ACC_A)
+        tokens = refresh._Tokens("NEW-ACCESS-fake2", "NEW-REFRESH-fake2", T0_MS + 28_800_000, None, None)
+        held_lock = self.w.lock("/l/r2")
+        st.held = refresh._Held(tokens, refresh._fp("R1"), held_lock, 0.0)
+        rec = self.r._flush(self.p, st)
+        self.assertEqual((rec["state"], rec["reason"]), ("refreshed", "write_recovered"))
+        reads = [c for c in self.w.calls if c[0] == "read"]
+        self.assertTrue(reads and all(c[1] == self.key for c in reads))
 
 
 class TestLive(TripwireCase):
@@ -1800,6 +1951,14 @@ class WarmCase(TripwireCase):
 
 
 class TestWarmUp(WarmCase):
+    def test_skipped_on_windows_even_with_warmup_enabled(self):
+        # Item 6: the session warm-up spawns `claude`, unverified on Windows this stage -- a
+        # live_session stays a plain skipped/live_session there and never calls find_claude/run_claude.
+        self.r = self.w.refresher(self.cfg, is_windows=True)
+        self.assertEqual(self.state(self.warm()), ("skipped", "live_session"))
+        self.assertEqual(self.w.runs, [])
+        self.assertNotIn("find_claude", self.w.kinds())
+
     def test_pre_call_never_runs(self):
         rec = self.pre()
         self.assertEqual(self.state(rec), ("skipped", "live_session"))
@@ -2232,6 +2391,85 @@ class TestDefaultKillpg(TripwireCase):
         import inspect
         sig = inspect.signature(refresh.run_claude_quiet)
         self.assertIs(sig.parameters["killpg"].default, refresh._default_killpg)
+
+
+class _OnceLock:
+    def __init__(self):
+        self.released = False
+
+    def release(self):
+        self.released = True
+
+
+class TestWindowsEndToEnd(TripwireCase):
+    """A real Refresher wired the way rotator.daemon.real_deps wires it on Windows: the item-1 file
+    seams over a real <home>/.credentials.json in a scratch dir, store_key=home, is_windows=True.
+    Exercises an expired token through a fake 200 POST and checks the file on disk afterwards."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(BASE, exist_ok=True)
+        self.td = tempfile.TemporaryDirectory(dir=BASE)
+        self.addCleanup(self.td.cleanup)
+        self.home = os.path.join(self.td.name, "home")
+        os.makedirs(self.home)
+        self.path = os.path.join(self.home, ".credentials.json")
+        self.doc = {
+            "claudeAiOauth": {"accessToken": "OLD-ACCESS-fakeA", "refreshToken": "OLD-REFRESH-fakeA",
+                              "expiresAt": T0_MS - 3_600_000, "scopes": ["user:inference"]},
+            "mcpOAuth": {"server-x": {"token": "OLD-MCP-TOKEN-fake"}},
+        }
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(self.doc, separators=(",", ":")))
+        self.p = Profile(account_id=ACC_A, home=self.home, keychain_service=accounts.keychain_service_for(self.home))
+        self.posts = []
+
+    def _post_200(self, url, headers, data, timeout):
+        self.posts.append(json.loads(data))
+        return refresh.PostResult(200, json.dumps({"access_token": "NEW-ACCESS-fakeB",
+                                                    "refresh_token": "NEW-REFRESH-fakeB", "expires_in": 28800,
+                                                    "scope": "user:inference user:profile"}))
+
+    def _no_sessions(self, _path):
+        raise FileNotFoundError(_path)
+
+    def _refresher(self, post):
+        cfg = dataclasses.replace(Config(), state_dir=BASE)
+        return refresh.Refresher(
+            cfg, read_item=accounts.read_credentials_item, item_exists=accounts.credentials_item_exists,
+            account_name=lambda: ACCT, write_item=accounts.write_credentials_item, post=post,
+            discover=lambda homes: [], list_dir=self._no_sessions, pid_alive=lambda pid: False,
+            exists=lambda path: False, lock=lambda path: _OnceLock(), cc_lock=refresh.take_cc_lock,
+            now=lambda: datetime.now(timezone.utc), monotonic=time.monotonic, sleep=time.sleep,
+            log=logging.getLogger("rotator.refresh"), find_claude=lambda argv0s: None,
+            run_claude=lambda *a, **k: "exited", environ=dict, store_key=lambda p: p.home, is_windows=True)
+
+    def test_refreshes_expired_token_in_place(self):
+        r = self._refresher(self._post_200)
+        rec = r.refresh(self.p, [self.p])
+        self.assertEqual((rec["state"], rec["reason"]), ("refreshed", "ok"))
+        with open(self.path, encoding="utf-8") as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk["claudeAiOauth"]["accessToken"], "NEW-ACCESS-fakeB")
+        self.assertEqual(on_disk["claudeAiOauth"]["refreshToken"], "NEW-REFRESH-fakeB")
+        self.assertGreater(on_disk["claudeAiOauth"]["expiresAt"], self.doc["claudeAiOauth"]["expiresAt"])
+        # Extra top-level keys outside claudeAiOauth survive the refresh untouched.
+        self.assertEqual(on_disk["mcpOAuth"], {"server-x": {"token": "OLD-MCP-TOKEN-fake"}})
+        self.assertEqual(self.posts[0]["refresh_token"], "OLD-REFRESH-fakeA")
+        # No lock dir left behind.
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".oauth_refresh.lock")))
+        self.assertFalse(os.path.exists(os.path.realpath(self.home) + ".lock"))
+
+    def test_fresh_token_is_left_alone(self):
+        fresh = dict(self.doc)
+        fresh["claudeAiOauth"] = dict(self.doc["claudeAiOauth"], expiresAt=T0_MS + 3_600_000_000)
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(fresh, separators=(",", ":")))
+        rec = self._refresher(self._post_200).refresh(self.p, [self.p])
+        self.assertEqual((rec["state"], rec["reason"]), ("not_needed", "fresh"))
+        self.assertEqual(self.posts, [])
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), fresh)
 
 
 if __name__ == "__main__":

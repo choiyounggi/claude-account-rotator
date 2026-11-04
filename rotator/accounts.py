@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import uuid
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -337,3 +338,74 @@ def write_keychain_item(service: str, account: str, secret_json: str, *,
     except (subprocess.SubprocessError, OSError):
         proc = None
     return proc is not None and proc.returncode == 0
+
+
+# --- Windows plaintext credential store (rotator.refresh.Refresher seams) ----------------------------------
+# Claude Code keeps the same claudeAiOauth JSON document, there in plaintext, at
+# <home>\.credentials.json instead of a Keychain item (see read_credential above).
+
+
+def read_credentials_file(home: str) -> Optional[str]:
+    """Raw text of ``<home>/.credentials.json``, or None when it is missing or unreadable."""
+    try:
+        return _read_text_utf8(os.path.join(home, ".credentials.json"))
+    except OSError:
+        return None
+
+
+def credentials_file_exists(home: str) -> Optional[bool]:
+    """True/False for ``<home>/.credentials.json``, or None on an OS error other than "not found"."""
+    try:
+        os.stat(os.path.join(home, ".credentials.json"))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    return True
+
+
+def write_credentials_file(home: str, secret_json: str) -> bool:
+    """Atomic upsert of ``<home>/.credentials.json``; True only once the replace lands.
+
+    A temp file is written in ``home`` itself (so the final ``os.replace`` is a same-filesystem
+    rename), flushed and fsync'd, then renamed onto the target. Never raises: any OSError along the
+    way (for example PermissionError while Claude Code still has the file open) leaves the old file
+    untouched, removes the temp file, and returns False.
+    """
+    path = os.path.join(home, ".credentials.json")
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".credentials.json.", dir=home)
+    except OSError:
+        return False
+    try:
+        try:
+            os.chmod(tmp, 0o600)  # a no-op on platforms where mkstemp already restricted it
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(secret_json)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def read_credentials_item(home: str, account: str) -> Optional[str]:
+    """``read_item`` seam shape (service/key, account) over the plaintext store; ``account`` is unused."""
+    return read_credentials_file(home)
+
+
+def credentials_item_exists(home: str, account: str) -> Optional[bool]:
+    """``item_exists`` seam shape over the plaintext store; ``account`` is unused."""
+    return credentials_file_exists(home)
+
+
+def write_credentials_item(home: str, account: str, secret_json: str) -> bool:
+    """``write_item`` seam shape over the plaintext store; ``account`` is unused."""
+    return write_credentials_file(home, secret_json)
