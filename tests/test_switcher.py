@@ -1005,7 +1005,14 @@ class FakeFs:
         self.reads = []
 
     def _get(self, path, advance):
-        v = self.files.get(path)
+        # Compare normalized on both sides: a key set directly (bypassing this class) via a real
+        # os.path.join call is not itself normalized, so an exact dict lookup cannot be trusted here.
+        norm = _slash(path)
+        v = None
+        for k, candidate in self.files.items():
+            if _slash(k) == norm:
+                v = candidate
+                break
         if isinstance(v, Seq):
             return v.take() if advance else v.peek()
         if callable(v):
@@ -1014,7 +1021,7 @@ class FakeFs:
 
     def read_text(self, path):
         self.reads.append(path)
-        v = self._get(_slash(path), True)
+        v = self._get(path, True)
         if v is None:
             raise OSError("absent")
         return v

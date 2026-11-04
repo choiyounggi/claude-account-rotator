@@ -545,11 +545,16 @@ class FakeWorld:
     def list_dir(self, path):
         self.calls.append(("list_dir", path))
         path = _slash(path)
-        if path in self.list_dir_raises:
-            raise self.list_dir_raises[path]
-        if path not in self.registry:
-            raise FileNotFoundError(path)
-        return list(self.registry[path])
+        # Compare normalized on both sides: self.registry/list_dir_raises keys may have been set
+        # directly (bypassing this method) via a real os.path.join call, which is not itself
+        # normalized.
+        for k, exc in self.list_dir_raises.items():
+            if _slash(k) == path:
+                raise exc
+        for k, names in self.registry.items():
+            if _slash(k) == path:
+                return list(names)
+        raise FileNotFoundError(path)
 
     def pid_alive(self, pid):
         return pid in self.alive

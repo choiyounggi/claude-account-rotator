@@ -105,7 +105,9 @@ class TestConfigDefaults(unittest.TestCase):
     def test_profiles_root_tilde_expanded(self):
         cfg = load('{"profiles_root": "~/x"}')
         self.assertTrue(os.path.isabs(cfg.profiles_root))
-        self.assertTrue(cfg.profiles_root.endswith(os.sep + "x"))
+        # os.path.basename: expanduser leaves the "/x" suffix exactly as given (no normpath call in
+        # parse_config), which on Windows can trail a backslash-based home with a literal "/x".
+        self.assertEqual(os.path.basename(cfg.profiles_root), "x")
 
     def test_relative_path_made_absolute(self):
         seen = []
@@ -212,18 +214,18 @@ class TestConfigValidation(unittest.TestCase):
     def test_non_object_names_file(self):
         with self.assertRaises(ConfigError) as cm:
             load("[]")
-        self.assertTrue(str(cm.exception).startswith(CFG))
+        self.assertTrue(str(cm.exception).startswith(os.path.abspath(CFG)))
 
     def test_unparsable_names_file(self):
         with self.assertRaises(ConfigError) as cm:
             load("{")
-        self.assertTrue(str(cm.exception).startswith(CFG))
+        self.assertTrue(str(cm.exception).startswith(os.path.abspath(CFG)))
         self.assertIn("not valid JSON", str(cm.exception))
 
     def test_unreadable_names_file_and_class(self):
         with self.assertRaises(ConfigError) as cm:
             load_config(CFG, read_text=raising_reader(PermissionError("denied")))
-        self.assertTrue(str(cm.exception).startswith(CFG))
+        self.assertTrue(str(cm.exception).startswith(os.path.abspath(CFG)))
         self.assertIn("PermissionError", str(cm.exception))
 
     def test_parse_config_rejects_non_dict(self):
