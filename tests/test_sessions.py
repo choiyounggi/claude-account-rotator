@@ -145,8 +145,12 @@ class WindowsDispatchTest(unittest.TestCase):
             self.assertIs(rotator.sessions._pid_alive(123), True)
         self.assertEqual(calls, [123])
 
-    def test_this_suite_runs_on_a_non_windows_default(self):
-        self.assertIs(rotator.sessions._win.IS_WINDOWS, False)
+
+def _slash(path):
+    # Every fixture path in this file is written with forward slashes; os.path.join on Windows joins
+    # with a backslash even when its inputs already use "/", so lookups (and recorded reads) normalize
+    # to "/" first.
+    return path.replace("\\", "/")
 
 
 class FakeFS:
@@ -156,7 +160,7 @@ class FakeFS:
         self.reads = []
 
     def list_dir(self, path):
-        value = self.dirs.get(path)
+        value = self.dirs.get(_slash(path))
         if isinstance(value, Exception):
             raise value
         if value is None:
@@ -164,6 +168,7 @@ class FakeFS:
         return list(value)
 
     def read_text(self, path):
+        path = _slash(path)
         self.reads.append(path)
         value = self.files.get(path)
         if isinstance(value, Exception):

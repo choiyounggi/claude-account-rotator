@@ -305,6 +305,7 @@ def run(**kw):
         keychain=kw.get("keychain", FakeKeychain(cred_json())),
         read_text=kw.get("read_text", FakeFiles({})),
         now=lambda: NOW,
+        is_windows=False,
     )
 
 
@@ -498,6 +499,7 @@ class DefaultHttpSeamTest(unittest.TestCase):
                 PROFILE,
                 keychain=FakeKeychain(cred_json()),
                 read_text=FakeFiles({}),
+                is_windows=False,
                 now=lambda: NOW,
             )
         self.assertEqual(result.error, "network;cache_missing")
@@ -661,7 +663,7 @@ class FakeHttpEx:
 
 def run_ex(fake, read_text=None):
     return fetch_usage(PROFILE, http_ex=fake, keychain=FakeKeychain(cred_json()),
-                       read_text=read_text or FakeFiles({}), now=lambda: NOW)
+                       read_text=read_text or FakeFiles({}), now=lambda: NOW, is_windows=False)
 
 
 def http_date(dt):

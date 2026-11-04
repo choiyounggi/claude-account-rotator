@@ -89,7 +89,7 @@ class TestSetSelectedHost(_PointerCase):
         target = self._make_profile(ACC1)
         previous = set_selected_host(target, self.root)
         self.assertEqual(previous, "/old")
-        expected = self.root.encode() + b"/" + ACC1.encode() + b"/home"
+        expected = os.path.join(self.root, ACC1, "home").encode()
         self.assertEqual(self._pointer_bytes(), expected)
         self.assertEqual(self._pointer_bytes(), target.home.encode("utf-8"))
         self.assertFalse(self._pointer_bytes().endswith(b"\n"))
@@ -117,7 +117,7 @@ class TestSetSelectedHost(_PointerCase):
         target = Profile(account_id=ACC1, home=os.path.join(self.root, ".", ACC1, "home"), keychain_service=KC)
         set_selected_host(target, self.root)
         self.assertEqual(self._pointer_bytes(), target.home.encode("utf-8"))
-        self.assertIn(b"/./", self._pointer_bytes())
+        self.assertIn((os.sep + "." + os.sep).encode(), self._pointer_bytes())
 
     def test_root_with_space(self):
         sub = os.path.join(self.root, "Profile Root")
@@ -185,7 +185,9 @@ class TestSetSelectedHost(_PointerCase):
                 raise OSError("dir fsync unsupported")
 
         set_selected_host(target, self.root, fsync=file_ok_dir_fails)
-        self.assertEqual(len(calls), 2)
+        # Windows cannot os.open() a directory at all (fsyncing one for durability is a POSIX technique);
+        # set_selected_host already swallows that OSError, so only the file fsync call happens there.
+        self.assertEqual(len(calls), 1 if sys.platform == "win32" else 2)
         self.assertEqual(self._pointer_bytes(), target.home.encode("utf-8"))
 
     # --- validation: ValueError and nothing created ---

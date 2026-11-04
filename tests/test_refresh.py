@@ -437,6 +437,12 @@ class _FakeCcLock:
         self.world.calls.append(("cc_release",))
 
 
+def _slash(path):
+    # Every fixture path in this file is written with forward slashes; os.path.join on Windows joins
+    # with a backslash even when its inputs already use "/", so lookups normalize to "/" first.
+    return path.replace("\\", "/")
+
+
 class FakeWorld:
     """Every seam a Refresher takes, as recording fakes over in-memory state."""
 
@@ -534,6 +540,7 @@ class FakeWorld:
 
     def list_dir(self, path):
         self.calls.append(("list_dir", path))
+        path = _slash(path)
         if path in self.list_dir_raises:
             raise self.list_dir_raises[path]
         if path not in self.registry:
@@ -544,10 +551,11 @@ class FakeWorld:
         return pid in self.alive
 
     def exists(self, path):
-        return path in self.paths
+        return _slash(path) in {_slash(p) for p in self.paths}
 
     def lock(self, path):
         self.calls.append(("lock", path))
+        path = _slash(path)
         if path in self.lock_table:
             return None
         self.lock_table.add(path)
@@ -2063,7 +2071,7 @@ class TestWarmUpReal(TripwireCase):
         seen = []
         refresh.find_claude_binary([], is_exec=lambda p: False, glob=lambda pat: seen.append(pat) or [],
                                    home="/Users/u")
-        self.assertEqual(seen, ["/Users/u/.nvm/versions/node/*/bin/claude"])
+        self.assertEqual(seen, [os.path.join("/Users/u", ".nvm", "versions", "node", "*", "bin", "claude")])
 
     def test_find_none(self):
         self.assertIsNone(self.find([], set()))

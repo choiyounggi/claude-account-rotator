@@ -46,8 +46,17 @@ from rotator.switcher import DEFAULT_CONTINUE_PROMPT, STATE_HINTS, SwitchResult,
 CFG = "/Users/user/Library/Application Support/claude-account-rotator-test/config.json"
 
 
+def _slash(path):
+    # Every fixture path here is written with forward slashes; os.path.abspath/join on Windows produce
+    # backslashes even from a "/"-only input, so lookups normalize both sides to "/" first.
+    return path.replace("\\", "/")
+
+
 def reader(files):
+    files = {_slash(k): v for k, v in files.items()}
+
     def read(path):
+        path = _slash(path)
         if path in files:
             return files[path]
         raise FileNotFoundError(path)
@@ -3602,13 +3611,18 @@ class TestPostinstall(unittest.TestCase):
     def test_fresh_install_runs_doctor_only(self):
         p, calls = self.run_script()
         self.assertEqual((p.returncode, calls), (0, ["doctor"]), p.stderr)
-        self.assertIn("rotator install", p.stdout)
+        # Windows has no background agent this release, so its next-steps line never mentions install.
+        if sys.platform == "win32":
+            self.assertIn("rotator status --watch", p.stdout)
+        else:
+            self.assertIn("rotator install", p.stdout)
 
     def test_failed_doctor_fails_the_install(self):
         p, calls = self.run_script(plist=True, doctor_rc=1)
         self.assertEqual((p.returncode, calls), (1, ["doctor"]))
         self.assertIn("cannot run the rotator", p.stderr)
 
+    @unittest.skipIf(sys.platform == "win32", "no background agent to refresh on Windows this release")
     def test_global_upgrade_refreshes_the_agent(self):
         p, calls = self.run_script(plist=True)
         self.assertEqual((p.returncode, calls), (0, ["doctor", "install"]), p.stderr)
@@ -3617,6 +3631,7 @@ class TestPostinstall(unittest.TestCase):
         p, calls = self.run_script(global_install=False, plist=True)
         self.assertEqual((p.returncode, calls), (0, ["doctor"]), p.stderr)
 
+    @unittest.skipIf(sys.platform == "win32", "no background agent to refresh on Windows this release")
     def test_failed_refresh_does_not_fail_the_install(self):
         p, calls = self.run_script(plist=True, install_rc=1)
         self.assertEqual((p.returncode, calls), (0, ["doctor", "install"]))

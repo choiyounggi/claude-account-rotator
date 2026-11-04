@@ -992,6 +992,12 @@ class Seq:
         return v
 
 
+def _slash(path):
+    # Every fixture path in this file is written with forward slashes; os.path.join on Windows joins
+    # with a backslash even when its inputs already use "/", so lookups normalize to "/" first.
+    return path.replace("\\", "/")
+
+
 class FakeFs:
     def __init__(self, files, dirs):
         self.files = dict(files)
@@ -1008,16 +1014,17 @@ class FakeFs:
 
     def read_text(self, path):
         self.reads.append(path)
-        v = self._get(path, True)
+        v = self._get(_slash(path), True)
         if v is None:
             raise OSError("absent")
         return v
 
     def glob_paths(self, pattern):
+        pattern = _slash(pattern)
         return sorted(k for k in self.files if self._get(k, False) is not None and fnmatch.fnmatchcase(k, pattern))
 
     def isdir(self, path):
-        return path in self.dirs
+        return _slash(path) in self.dirs
 
 
 def _raise_or_return(value):

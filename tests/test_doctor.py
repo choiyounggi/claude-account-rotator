@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest import mock
 
@@ -24,7 +25,7 @@ class TestOrcaVersion(unittest.TestCase):
         seen = []
         v = doctor.orca_version(lambda path: seen.append(path) or {"CFBundleShortVersionString": "1.4.241"})
         self.assertEqual(v, "1.4.241")
-        self.assertEqual(seen, ["/Applications/Orca.app/Contents/Info.plist"])
+        self.assertEqual(seen, [os.path.join("/Applications/Orca.app", "Contents", "Info.plist")])
 
     def test_missing_or_unreadable_is_none(self):
         def missing(path):
