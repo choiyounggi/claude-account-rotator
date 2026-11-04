@@ -1237,7 +1237,8 @@ class TestStaleInstallWiring(unittest.TestCase):
 
     def test_real_deps_use_the_real_check(self):
         seen = []
-        with mock.patch("rotator.launchd.install_stale", lambda *a, **k: seen.append(a) or True):
+        with mock.patch("rotator.cli.platform.system", return_value="Darwin"), \
+                mock.patch("rotator.launchd.install_stale", lambda *a, **k: seen.append(a) or True):
             self.assertIs(cli._real_stale_check(load_config(self.cfg_path))(), True)
         self.assertEqual(seen, [(launchd.plist_path_default(), CONFIG_DIR_DEFAULT, launchd.repo_root())])
 
@@ -2898,6 +2899,40 @@ class TestConsoleLogFallback(MainBase):
         with open(log_path, encoding="utf-8") as f:
             text = f.read()
         self.assertEqual(text.count("soft_pct"), 2)  # appended, not truncated on the second run
+
+    def test_log_file_is_closed_when_main_returns(self):
+        self.write_cfg({"soft_pct": 101})
+        log_dir = scratch("console-log-" + self._testMethodName)
+        opened = []
+
+        def recording_open(*a, **kw):
+            f = open(*a, **kw)
+            opened.append(f)
+            return f
+
+        with mock.patch.object(cli, "LOG_DIR_DEFAULT", log_dir), mock.patch.object(cli, "open", recording_open,
+                                                                                   create=True), \
+                mock.patch.object(cli.sys, "stdout", None), mock.patch.object(cli.sys, "stderr", None):
+            main(["--config", self.cfg_path, "daemon"])
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].closed)
+
+    def test_a_crash_traceback_lands_in_the_log_file(self):
+        # pythonw.exe has no sys.stderr, so Python's own traceback printing would drop it.
+        self.write_cfg({})
+        log_dir = scratch("console-log-" + self._testMethodName)
+
+        def boom(cfg):
+            raise RuntimeError("synthetic crash for the test")
+
+        with mock.patch.object(cli, "LOG_DIR_DEFAULT", log_dir), \
+                mock.patch.object(cli.sys, "stdout", None), mock.patch.object(cli.sys, "stderr", None):
+            with self.assertRaises(RuntimeError):
+                main(["--config", self.cfg_path, "daemon"], make_deps=boom, launchctl=FakeRunner())
+        with open(os.path.join(log_dir, cli.CONSOLE_LOG_FILENAME), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("Traceback", text)
+        self.assertIn("synthetic crash for the test", text)
 
     def test_injected_streams_never_touch_the_log_file(self):
         self.write_cfg({"soft_pct": 101})

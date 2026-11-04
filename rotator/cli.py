@@ -20,6 +20,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 import unicodedata
 from datetime import datetime, timezone, tzinfo
 from typing import Any, Callable, Dict, List, Optional, Sequence, TextIO, Tuple
@@ -1255,7 +1256,7 @@ def _install_kwargs(cfg: Config, config_path: str) -> dict:
 
 def _schtasks_install_kwargs(cfg: Config, config_path: str) -> dict:
     return {"python_exe": sys.executable, "source_root": launchd.repo_root(), "state_dir": cfg.state_dir,
-            "config_path": config_path, "timeouts": cfg.timeouts}
+            "config_path": config_path}
 
 
 def _real_stale_check(cfg: Config) -> Callable[[], bool]:
@@ -1391,7 +1392,7 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
                 if args.command == "install":
                     rc, msg = schtasks.install(runner=run, **_schtasks_install_kwargs(cfg, config_path))
                 else:
-                    rc, msg = schtasks.uninstall(runner=run, state_dir=cfg.state_dir, timeouts=cfg.timeouts)
+                    rc, msg = schtasks.uninstall(runner=run, state_dir=cfg.state_dir)
             else:
                 run = launchctl or launchd.run_launchctl
                 u = (uid or os.getuid)()
@@ -1418,6 +1419,11 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
             return _status(args, cfg, deps, out, err, tz or datetime.now().astimezone().tzinfo, term_ctl,
                            read_key, inp, stale_check)
         return _switch(args, cfg, deps, out, err)
+    except Exception:
+        if console_log is not None:
+            # Python prints an uncaught traceback to sys.stderr, which is None under pythonw.exe.
+            traceback.print_exc(file=console_log)
+        raise
     finally:
         if console_log is not None:
             console_log.close()

@@ -21,15 +21,18 @@ from xml.sax.saxutils import escape
 
 from rotator import daemon, launchd
 from rotator.config import LOG_DIR_DEFAULT
-from rotator.switcher import Timeouts
 from rotator.windows import IS_WINDOWS
 
 TASK_NAME = "claude-account-rotator"
 TASK_XML_FILENAME = "task.xml"
 QUERY_TIMEOUT_S = 30.0
 CREATE_TIMEOUT_S = 30.0
-# How long install() waits, after /Run, for the daemon to take its lock before reporting it never started.
-DAEMON_START_TIMEOUT_S = 10.0
+# How long install() waits, after /Run, for the daemon to take its lock before reporting it never started. The
+# daemon runs the Orca gate (orca.cmd --version, up to doctor.ORCA_CLI_VERSION_TIMEOUT_S) before it locks.
+DAEMON_START_TIMEOUT_S = 30.0
+# How long install()/uninstall() wait for a running daemon to stop on its own before /End. Windows never switches
+# sessions, so the longest job to finish is one token refresh (HTTP timeout, held-set flush, write retries).
+STOP_TIMEOUT_S = 90.0
 LOCK_POLL_INTERVAL_S = 0.5
 
 Runner = Callable[[List[str], float], Tuple[int, str, str]]
@@ -66,11 +69,14 @@ def _user_id(environ: Mapping[str, str]) -> Optional[str]:
 
 
 def build_task_xml(python_exe: str, app_root: str, config_path: str, user_id: str, state_dir: str, *,
-                   exists: Callable[[str], bool] = os.path.isfile) -> str:
-    """Task Scheduler schema 1.2 XML: a LogonTrigger for ``user_id`` that repeats every 5 minutes so a daemon
-    that merely exits (a config error, the Orca gate, a crash -- none of which is a launch failure) is revived
-    instead of staying dead until the next logon; an InteractiveToken/LeastPrivilege principal; and an Exec
-    action that runs the daemon with no console window.
+                   start_boundary: str, exists: Callable[[str], bool] = os.path.isfile) -> str:
+    """Task Scheduler schema 1.2 XML: a LogonTrigger for ``user_id``, plus a TimeTrigger from ``start_boundary``
+    (install time) that repeats every 5 minutes, so a daemon that merely exits (a config error, the Orca gate, a
+    crash -- none of which is a launch failure) is revived instead of staying dead until the next logon. The
+    repetition is not on the LogonTrigger because that would only start at the next logon: install's /Run
+    fires no trigger. IgnoreNew makes a repeat a no-op while the daemon runs. Trigger element order copies a
+    Task Scheduler export. An InteractiveToken/LeastPrivilege principal, and an Exec action that runs the
+    daemon with no console window.
 
     ``WorkingDirectory`` is ``state_dir``, not the app copy: Windows refuses to rename a running process's
     current working directory, and the app copy under ``state_dir`` is exactly what install() renames.
@@ -85,7 +91,7 @@ def build_task_xml(python_exe: str, app_root: str, config_path: str, user_id: st
     command = pythonw if exists(pythonw) else python_exe
     entry = os.path.join(app_root, "bin", "rotator")
     args = subprocess.list2cmdline([entry, "daemon", "--config", config_path])
-    uid, cmd = escape(user_id), escape('"%s"' % command)
+    uid, cmd, start = escape(user_id), escape('"%s"' % command), escape(start_boundary)
     arglist, cwd = escape(args), escape(state_dir)
     return (
         '<?xml version="1.0" encoding="UTF-16"?>\n'
@@ -94,11 +100,15 @@ def build_task_xml(python_exe: str, app_root: str, config_path: str, user_id: st
         '    <LogonTrigger>\n'
         '      <Enabled>true</Enabled>\n'
         '      <UserId>%(uid)s</UserId>\n'
+        '    </LogonTrigger>\n'
+        '    <TimeTrigger>\n'
         '      <Repetition>\n'
         '        <Interval>PT5M</Interval>\n'
         '        <StopAtDurationEnd>false</StopAtDurationEnd>\n'
         '      </Repetition>\n'
-        '    </LogonTrigger>\n'
+        '      <StartBoundary>%(start)s</StartBoundary>\n'
+        '      <Enabled>true</Enabled>\n'
+        '    </TimeTrigger>\n'
         '  </Triggers>\n'
         '  <Principals>\n'
         '    <Principal id="Author">\n'
@@ -126,7 +136,7 @@ def build_task_xml(python_exe: str, app_root: str, config_path: str, user_id: st
         '    </Exec>\n'
         '  </Actions>\n'
         '</Task>\n'
-    ) % {"uid": uid, "cmd": cmd, "args": arglist, "cwd": cwd}
+    ) % {"uid": uid, "cmd": cmd, "args": arglist, "cwd": cwd, "start": start}
 
 
 def _write_task_xml(path: str, xml: str) -> None:
@@ -199,15 +209,18 @@ def _stop_daemon(runner: Runner, sch: str, state_dir: str, timeout_s: float, *,
     """
     stop_path = os.path.join(state_dir, daemon.STOP_REQUEST_FILENAME)
     daemon.atomic_write_text(stop_path, "%s\n" % _utc_now().isoformat())
-    lock_path = os.path.join(state_dir, daemon.LOCK_FILENAME)
-    _poll_until(lambda: _lock_is_free(lock_path), timeout_s, sleep=sleep, clock=clock)
-    runner([sch, "/End", "/TN", TASK_NAME], QUERY_TIMEOUT_S)  # ignore rc: fine whether or not it was running
-    with contextlib.suppress(OSError):
-        os.remove(stop_path)
+    try:
+        lock_path = os.path.join(state_dir, daemon.LOCK_FILENAME)
+        _poll_until(lambda: _lock_is_free(lock_path), timeout_s, sleep=sleep, clock=clock)
+        runner([sch, "/End", "/TN", TASK_NAME], QUERY_TIMEOUT_S)  # ignore rc: fine whether or not it was running
+    finally:
+        # Even on Ctrl-C: a leftover request would stop the next daemon the moment its watcher starts.
+        with contextlib.suppress(OSError):
+            os.remove(stop_path)
 
 
 def install(*, runner: Runner, python_exe: str, source_root: str, state_dir: str, config_path: str,
-            timeouts: Timeouts, commit_of: Callable[[str], Optional[str]] = launchd.source_commit,
+            commit_of: Callable[[str], Optional[str]] = launchd.source_commit,
             now: Callable[[], datetime] = _utc_now, copy_file: launchd.CopyFile = shutil.copyfile,
             environ: Mapping[str, str] = os.environ, sleep: Callable[[float], None] = time.sleep,
             clock: Callable[[], float] = time.monotonic) -> Tuple[int, str]:
@@ -222,14 +235,15 @@ def install(*, runner: Runner, python_exe: str, source_root: str, state_dir: str
     # that is a running process's current working directory -- and that directory is exactly what the task's
     # WorkingDirectory points a running instance at. Stopping it first is what makes a reinstall over an
     # already running daemon (the normal upgrade path) succeed instead of failing every time with a copy error.
-    _stop_daemon(runner, sch, state_dir, launchd.exit_timeout_for(timeouts), sleep=sleep, clock=clock)
+    _stop_daemon(runner, sch, state_dir, STOP_TIMEOUT_S, sleep=sleep, clock=clock)
     commit = commit_of(source_root) or launchd.UNKNOWN_COMMIT
     try:
         app_root = launchd.copy_app(source_root, state_dir, commit=commit, copied_at=now(), copy_file=copy_file)
     except (launchd.AppCopyError, OSError) as e:
         return (1, "app copy failed: %s" % (e if isinstance(e, launchd.AppCopyError)
                                             else "%s (%s)" % (type(e).__name__, e)))
-    xml = build_task_xml(python_exe, app_root, config_path, user_id, state_dir)
+    start = now().astimezone().replace(microsecond=0).isoformat()
+    xml = build_task_xml(python_exe, app_root, config_path, user_id, state_dir, start_boundary=start)
     task_xml_path = os.path.join(state_dir, TASK_XML_FILENAME)
     _write_task_xml(task_xml_path, xml)
     rc, _, err = runner([sch, "/Create", "/TN", TASK_NAME, "/XML", task_xml_path, "/F"], CREATE_TIMEOUT_S)
@@ -248,15 +262,14 @@ def install(*, runner: Runner, python_exe: str, source_root: str, state_dir: str
     return (0, "installed %s (%s); app copy %s at %s" % (TASK_NAME, task_xml_path, app_root, commit))
 
 
-def uninstall(*, runner: Runner, state_dir: str, timeouts: Timeouts,
-             environ: Mapping[str, str] = os.environ, sleep: Callable[[float], None] = time.sleep,
+def uninstall(*, runner: Runner, state_dir: str, environ: Mapping[str, str] = os.environ, sleep: Callable[[float], None] = time.sleep,
              clock: Callable[[], float] = time.monotonic) -> Tuple[int, str]:
     """End and delete the task (if registered), then remove the app copy and task.xml. Returns (0, "not
     installed") when the task was never registered -- that is not an error."""
     sch = schtasks_exe(environ)
     rc, _, _ = runner([sch, "/Query", "/TN", TASK_NAME], QUERY_TIMEOUT_S)
     if rc == 0:
-        _stop_daemon(runner, sch, state_dir, launchd.exit_timeout_for(timeouts), sleep=sleep, clock=clock)
+        _stop_daemon(runner, sch, state_dir, STOP_TIMEOUT_S, sleep=sleep, clock=clock)
         rc2, _, err2 = runner([sch, "/Delete", "/TN", TASK_NAME, "/F"], QUERY_TIMEOUT_S)
         if rc2 != 0:
             return (1, "schtasks /Delete failed: %s" % err2.strip())

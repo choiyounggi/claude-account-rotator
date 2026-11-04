@@ -7,8 +7,7 @@ from datetime import datetime, timezone
 from typing import List
 from unittest import mock
 
-from rotator import daemon, launchd, schtasks
-from rotator.switcher import Timeouts
+from rotator import daemon, schtasks
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE = os.path.join(REPO, ".claude", "tmp", "test-schtasks")
@@ -103,9 +102,11 @@ class TestBuildTaskXml(unittest.TestCase):
     CONFIG = r"C:\Users\Test & User\AppData\Roaming\claude-account-rotator\config.json"
     USER_ID = r"EXAMPLE-DOMAIN\test&user"
 
+    START = "2026-11-04T13:00:00+09:00"
+
     def build(self, exists):
         xml = schtasks.build_task_xml(self.PYTHON, self.APP_ROOT, self.CONFIG, self.USER_ID, self.STATE_DIR,
-                                      exists=exists)
+                                      start_boundary=self.START, exists=exists)
         self.assertIn('encoding="UTF-16"', xml.splitlines()[0])
         return ET.fromstring(xml.encode("utf-16"))
 
@@ -118,12 +119,20 @@ class TestBuildTaskXml(unittest.TestCase):
         self.assertEqual(principal.find(NS + "LogonType").text, "InteractiveToken")
         self.assertEqual(principal.find(NS + "RunLevel").text, "LeastPrivilege")
 
-    def test_trigger_repeats_every_5_minutes_indefinitely(self):
+    def test_a_time_trigger_repeats_every_5_minutes_from_install(self):
         # A daemon that merely exits (config error, Orca gate, crash) is not a launch failure, so
-        # RestartOnFailure alone never revives it; Repetition is what gets it back within 5 minutes.
+        # RestartOnFailure alone never revives it. A repetition on the logon trigger would only start at the next
+        # logon (install's /Run does not fire a trigger), so the 5-minute repeat sits on a time trigger that
+        # starts at install time. Element order copies a Task Scheduler export (Repetition, StartBoundary,
+        # Enabled), and the logon trigger keeps its plain export shape (Enabled, UserId).
         root = self.build(exists=lambda p: False)
-        rep = root.find(NS + "Triggers/" + NS + "LogonTrigger/" + NS + "Repetition")
-        self.assertIsNotNone(rep)
+        triggers = root.find(NS + "Triggers")
+        self.assertEqual([c.tag for c in triggers], [NS + "LogonTrigger", NS + "TimeTrigger"])
+        logon, timed = list(triggers)
+        self.assertEqual([c.tag for c in logon], [NS + "Enabled", NS + "UserId"])
+        self.assertEqual([c.tag for c in timed], [NS + "Repetition", NS + "StartBoundary", NS + "Enabled"])
+        self.assertEqual(timed.find(NS + "StartBoundary").text, self.START)
+        rep = timed.find(NS + "Repetition")
         self.assertEqual(rep.find(NS + "Interval").text, "PT5M")
         self.assertIsNone(rep.find(NS + "Duration"))  # absent Duration: repeats indefinitely
         self.assertEqual(rep.find(NS + "StopAtDurationEnd").text, "false")
@@ -228,14 +237,14 @@ class InstallBase(unittest.TestCase):
             runner.lock_path = self.lock_path(kw.get("state_dir"))
         args = dict(runner=runner, python_exe=r"C:\Python39\python.exe", source_root=self.source,
                     state_dir=self.state, config_path=r"C:\Users\test\config.json",
-                    commit_of=lambda root: self.commit, now=lambda: COPIED_AT, timeouts=Timeouts(),
+                    commit_of=lambda root: self.commit, now=lambda: COPIED_AT,
                     environ={"USERDOMAIN": "EXAMPLE", "USERNAME": "test"},
                     sleep=self.clock.sleep, clock=self.clock.clock)
         args.update(kw)
         return schtasks.install(**args)
 
     def uninstall(self, runner, **kw):
-        args = dict(runner=runner, state_dir=self.state, timeouts=Timeouts(),
+        args = dict(runner=runner, state_dir=self.state,
                     sleep=self.clock.sleep, clock=self.clock.clock)
         args.update(kw)
         return schtasks.uninstall(**args)
@@ -430,8 +439,7 @@ class TestGracefulStop(InstallBase):
 
         rc, _ = self.install(runner)
         self.assertEqual(rc, 0)
-        full_budget = launchd.exit_timeout_for(Timeouts())
-        self.assertLess(self.clock.t, full_budget)  # stopped well short of the full wait, not a fixed sleep
+        self.assertLess(self.clock.t, schtasks.STOP_TIMEOUT_S)  # stopped well short of the full wait, not a fixed sleep
 
     def test_uninstall_falls_back_to_end_after_the_full_wait(self):
         lk = daemon.try_lock(self.lock_path())
@@ -443,12 +451,28 @@ class TestGracefulStop(InstallBase):
             order.append(argv[1])
             return (0, "", "")
 
-        timeouts = Timeouts()
-        rc, msg = self.uninstall(runner, timeouts=timeouts)
+        rc, msg = self.uninstall(runner)
         self.assertEqual(rc, 0)
         self.assertEqual(order, ["/Query", "/End", "/Delete"])  # /End still runs, as a fallback
-        self.assertEqual(self.clock.t, launchd.exit_timeout_for(timeouts))  # waited the full budget first
+        self.assertEqual(self.clock.t, schtasks.STOP_TIMEOUT_S)  # waited the full budget first
         self.assertFalse(os.path.isfile(self.stop_request_path()))  # removed whether or not the wait succeeded
+
+    def test_stop_budget_fits_a_token_refresh_not_a_session_switch(self):
+        # Windows never switches sessions, so the macOS switch-sized exit timeout (615 s by default) does not
+        # apply: the longest job to finish is one token refresh.
+        self.assertLessEqual(schtasks.STOP_TIMEOUT_S, 120.0)
+        self.assertGreaterEqual(schtasks.STOP_TIMEOUT_S, 60.0)
+
+    def test_interrupted_wait_still_removes_the_request(self):
+        lk = daemon.try_lock(self.lock_path())
+        self.addCleanup(lambda: lk.release())
+
+        def sleep(seconds):
+            raise KeyboardInterrupt  # Ctrl-C while install waits for the daemon to stop
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.install(FakeRunner(), sleep=sleep)
+        self.assertFalse(os.path.isfile(self.stop_request_path()))  # a stale request would stop a later daemon
 
     def test_uninstall_skips_the_request_when_nothing_is_installed(self):
         r = FakeRunner({"/Query": (1, "", "")})
@@ -481,6 +505,19 @@ class TestRunSchtasks(unittest.TestCase):
             rc, out, err = schtasks.run_schtasks(["schtasks.exe"], 5.0)
         self.assertEqual((rc, out, err), (0, "", ""))
         err.strip()  # must not raise AttributeError on None
+
+    def test_undecodable_output_is_replaced_not_raised(self):
+        # text=True decodes in the child's reader threads; strict decoding would raise UnicodeDecodeError (a
+        # ValueError, not an OSError) on a non-UTF-8 code page.
+        captured = []
+
+        def fake_run(argv, **kw):
+            captured.append((kw.get("text"), kw.get("errors")))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(schtasks.subprocess, "run", side_effect=fake_run):
+            schtasks.run_schtasks(["schtasks.exe"], 5.0)
+        self.assertEqual(captured, [(True, "replace")])
 
     def test_creationflags_applied_only_when_windows(self):
         captured = []

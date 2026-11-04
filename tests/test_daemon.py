@@ -1642,6 +1642,11 @@ class TestShownUsage(unittest.TestCase):
 
 class TickBase(unittest.TestCase):
     def setUp(self):
+        # These cover the macOS daemon, live-session switching included; on a Windows runner Daemon would
+        # otherwise turn switching off. Windows-specific tests patch IS_WINDOWS back to True inside the test.
+        p = unittest.mock.patch.object(daemon, "IS_WINDOWS", False)
+        p.start()
+        self.addCleanup(p.stop)
         self.env = FakeEnv()
         self.env.profiles = [prof(ACC_A), prof(ACC_B), prof(ACC_C)]
         self.env.usages = {a: live(a, 20.0) for a in (ACC_A, ACC_B, ACC_C)}
@@ -2827,6 +2832,21 @@ class TestWindowsGracefulStop(RunDaemonBase):
         # make a freshly started daemon stop itself right away).
         self.assertNotIn(self.stop_request_path, self.env.files)
         self.assertTrue(self.env.spawned[0].alive)
+
+    def test_stale_stop_request_is_gone_before_the_watcher_starts(self):
+        # If the watcher started first it could see the stale file and stop the fresh daemon at once.
+        self.env.files[self.stop_request_path] = "stale from a previous run\n"
+        self.env.wait_hook = lambda n: self.env.signal_handler() if n == 1 else None
+        base = self.env.deps()
+        seen = []
+
+        def spawn(fn, name):
+            seen.append((name, self.stop_request_path in self.env.files))
+            return base.spawn(fn, name)
+
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", True):
+            self.assertEqual(self.run_d(self.env.deps(spawn=spawn)), 0)
+        self.assertEqual(seen, [("rotator-stop-watch", False)])
 
 
 # --- token refresh wiring ----------------------------------------------------------------------------------
