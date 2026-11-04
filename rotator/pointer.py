@@ -69,7 +69,9 @@ def set_selected_host(
     fd, tmp = tempfile.mkstemp(prefix=".selected-host.", dir=root)
     handed = False
     try:
-        os.fchmod(fd, 0o600)
+        fchmod = getattr(os, "fchmod", None)  # Windows had no os.fchmod before Python 3.13
+        if fchmod is not None:
+            fchmod(fd, 0o600)
         f = os.fdopen(fd, "wb")
         handed = True
         with f:

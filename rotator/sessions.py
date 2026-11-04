@@ -333,7 +333,8 @@ def _tail_lines(config_dir: str, cwd: str, session_id: str, tail_bytes: int,
     if path is None:
         return
     # A plain open() of a FIFO blocks until a writer appears; open non-blocking and read regular files only.
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    # Windows has no FIFOs on a filesystem path and no os.O_NONBLOCK; getattr(..., 0) ORs in nothing there.
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     try:
         regular = stat.S_ISREG(os.fstat(fd).st_mode)
     except OSError:

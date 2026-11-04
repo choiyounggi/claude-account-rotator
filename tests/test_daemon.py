@@ -6,6 +6,7 @@ import logging.handlers
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import stat
@@ -464,8 +465,9 @@ class TestAtomicWrite(unittest.TestCase):
         atomic_write_text(p, "x")
         with open(p, encoding="utf-8") as f:
             self.assertEqual(f.read(), "x")
-        self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+        if sys.platform != "win32":  # Windows has no Unix permission bits to check
+            self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
 
     def test_replaces_existing(self):
         p = os.path.join(self.base, "state.json")
@@ -687,7 +689,8 @@ class TestSetupLogging(unittest.TestCase):
         self.assertEqual(hs[0].backupCount, 3)
         self.assertEqual(lg.level, logging.INFO)
         self.assertEqual(lg.name, "rotator")
-        self.assertEqual(stat.S_IMODE(os.stat(self.log_dir).st_mode), 0o700)
+        if sys.platform != "win32":  # Windows has no Unix permission bits to check
+            self.assertEqual(stat.S_IMODE(os.stat(self.log_dir).st_mode), 0o700)
 
     def test_debug_handle_line_absent_info_present(self):
         lg = setup_logging(self.log_dir, False)

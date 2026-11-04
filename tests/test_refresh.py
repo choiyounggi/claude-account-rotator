@@ -10,6 +10,7 @@ import os
 import pickle
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -2068,6 +2069,7 @@ class TestWarmUpReal(TripwireCase):
         self.assertIsNone(self.find([], set()))
         self.assertIsNone(self.find(["/x/claude"], set(), ["/Users/u/.nvm/versions/node/v1.0.0/bin/claude"]))
 
+    @unittest.skipIf(sys.platform == "win32", "Windows has no execute permission bit to toggle")
     def test_is_exec_file(self):
         os.makedirs(BASE, exist_ok=True)
         path = os.path.join(BASE, "fake-claude")
@@ -2129,7 +2131,9 @@ class TestWarmUpReal(TripwireCase):
         out = refresh.run_claude_quiet(["/c"], {}, "/s", 60.0, popen=P, killpg=lambda *a: kills.append(a))
         self.assertEqual(out, "timeout")
         import signal
-        self.assertEqual(kills, [(4242, signal.SIGKILL)])
+        # Windows' signal module has no SIGKILL; run_claude_quiet falls back to SIGTERM there.
+        expected_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+        self.assertEqual(kills, [(4242, expected_sig)])
 
     def test_run_timeout_kill_failure_still_reaps(self):
         P, _ = self.popen([subprocess.TimeoutExpired("/c", 60), -9])
@@ -2143,6 +2147,7 @@ class TestWarmUpReal(TripwireCase):
         self.assertEqual(refresh.run_claude_quiet(["/c"], {}, "/s", 60.0, popen=P, killpg=lambda *a: None),
                          "error")
 
+    @unittest.skipIf(sys.platform == "win32", "spawns a #!/bin/sh script; Windows has no shebang execution")
     def test_run_real_process_output_discarded(self):
         # A real child that writes to stdout/stderr: nothing reaches this process's streams.
         script = os.path.join(BASE, "noisy.sh")
@@ -2175,6 +2180,7 @@ class TestWarmUpReal(TripwireCase):
         with open(cap) as f:
             self.assertIn("SECRET-OUT", f.read())
 
+    @unittest.skipIf(sys.platform == "win32", "spawns a #!/bin/sh script; Windows has no shebang execution")
     def test_run_real_timeout(self):
         script = os.path.join(BASE, "sleepy.sh")
         os.makedirs(BASE, exist_ok=True)

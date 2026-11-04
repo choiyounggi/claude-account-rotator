@@ -1,5 +1,6 @@
 import os
 import stat
+import sys
 import tempfile
 import unittest
 
@@ -92,8 +93,9 @@ class TestSetSelectedHost(_PointerCase):
         self.assertEqual(self._pointer_bytes(), expected)
         self.assertEqual(self._pointer_bytes(), target.home.encode("utf-8"))
         self.assertFalse(self._pointer_bytes().endswith(b"\n"))
-        mode = stat.S_IMODE(os.stat(os.path.join(self.root, POINTER_FILENAME)).st_mode)
-        self.assertEqual(mode, 0o600)
+        if sys.platform != "win32":  # Windows has no Unix permission bits to check
+            mode = stat.S_IMODE(os.stat(os.path.join(self.root, POINTER_FILENAME)).st_mode)
+            self.assertEqual(mode, 0o600)
         self._assert_no_temp()
 
     def test_no_previous_returns_none(self):
@@ -123,8 +125,9 @@ class TestSetSelectedHost(_PointerCase):
         target = self._make_profile(ACC1, root=sub)
         set_selected_host(target, sub)
         self.assertEqual(self._pointer_bytes(sub), target.home.encode("utf-8"))
-        mode = stat.S_IMODE(os.stat(os.path.join(sub, POINTER_FILENAME)).st_mode)
-        self.assertEqual(mode, 0o600)
+        if sys.platform != "win32":  # Windows has no Unix permission bits to check
+            mode = stat.S_IMODE(os.stat(os.path.join(sub, POINTER_FILENAME)).st_mode)
+            self.assertEqual(mode, 0o600)
         self._assert_no_temp(sub)
 
     def test_replace_failure_keeps_old_and_no_temp(self):
@@ -240,6 +243,8 @@ class TestSetSelectedHost(_PointerCase):
         target = self._make_profile(ACC1, profile_json=False)
         self._assert_rejected(target)
 
+    @unittest.skipIf(sys.platform == "win32",
+                     "os.symlink needs elevated/Developer Mode privileges on Windows and is unreliable in CI")
     def test_home_symlinked_outside_root_rejected(self):
         os.makedirs(os.path.join(self.root, ACC1))
         with open(os.path.join(self.root, ACC1, "profile.json"), "w", encoding="utf-8") as f:

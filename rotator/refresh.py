@@ -906,7 +906,9 @@ def run_claude_quiet(argv: Sequence[str], env: Mapping[str, str], cwd: str, time
     except subprocess.TimeoutExpired:
         pass
     try:
-        killpg(proc.pid, signal.SIGKILL)
+        # Windows' signal module has no SIGKILL; this path is unreachable there this release anyway
+        # (refresh/daemon stay macOS-only), but the reference must not crash evaluating it.
+        killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
     except OSError:
         pass
     try:

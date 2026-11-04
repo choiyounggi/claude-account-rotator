@@ -5,6 +5,7 @@ import builtins
 import os
 import re
 import struct
+import sys
 import tempfile
 import threading
 import unittest
@@ -837,6 +838,7 @@ class ReadSessionModelTest(unittest.TestCase):
         t.join(5)
         return t.is_alive(), out
 
+    @unittest.skipIf(sys.platform == "win32", "FIFOs (os.mkfifo) are POSIX-only")
     def test_fifo_is_not_read(self):
         for sub in (re.sub("[^A-Za-z0-9]", "-", self.cwd), "-other-dir"):
             with self.subTest(sub=sub):

@@ -636,6 +636,7 @@ class LaunchdBase(unittest.TestCase):
         return sorted(n for n in os.listdir(self.state) if n != "app")
 
 
+@unittest.skipIf(sys.platform == "win32", "launchd is macOS-only; this tests its plist/POSIX-permission install mechanics directly")
 class TestLaunchd(LaunchdBase):
     all_calls: List[list] = []
 
@@ -766,6 +767,7 @@ def failing_copy(fail_at):
 IO_ERR = (5, "", "Bootstrap failed: 5: Input/output error\n")
 
 
+@unittest.skipIf(sys.platform == "win32", "launchd is macOS-only; this tests its plist/POSIX-permission install mechanics directly")
 class TestInstallRetry(LaunchdBase):
     """bootstrap right after bootout races the old instance still exiting (launchctl rc 5, Input/output error)."""
 
@@ -824,6 +826,7 @@ class TestInstallRetry(LaunchdBase):
         self.assertEqual(r.verbs(), ["print", "bootstrap", "print"])
 
 
+@unittest.skipIf(sys.platform == "win32", "launchd is macOS-only; this tests its POSIX-permission-preserving app copy directly")
 class TestAppCopy(LaunchdBase):
     def mode(self, *rel):
         return stat.S_IMODE(os.lstat(os.path.join(self.app, *rel)).st_mode)
@@ -950,6 +953,8 @@ class TestAppCopy(LaunchdBase):
         self.assertFalse(os.path.lexists(self.app))
         self.assertEqual(self.leftovers(), [])
 
+    @unittest.skipIf(sys.platform == "win32",
+                     "os.symlink needs elevated/Developer Mode privileges on Windows and is unreliable in CI")
     def test_symlinked_app_dir_refused_on_install(self):
         victim = scratch("victim-" + self._testMethodName)
         with open(os.path.join(victim, "keep.txt"), "w", encoding="utf-8") as f:
@@ -1009,6 +1014,8 @@ class TestAppCopy(LaunchdBase):
             self.assertEqual(read_file(os.path.join(self.state, rel)), text)
         self.assertTrue(os.path.isdir(self.source))
 
+    @unittest.skipIf(sys.platform == "win32",
+                     "os.symlink needs elevated/Developer Mode privileges on Windows and is unreliable in CI")
     def test_uninstall_symlinked_app_refused(self):
         victim = scratch("victim-" + self._testMethodName)
         with open(os.path.join(victim, "keep.txt"), "w", encoding="utf-8") as f:
@@ -3713,7 +3720,9 @@ class TestWindowsUnsupportedCommands(MainBase):
 
     def test_uninstall_refuses_before_touching_os_getuid(self):
         # uninstall skips the Orca gate entirely, so the Windows refusal must come before os.getuid().
-        with mock.patch("os.getuid", side_effect=AssertionError("os.getuid is not available on Windows")):
+        # create=True: real Windows has no os.getuid attribute at all to patch.
+        with mock.patch("os.getuid", create=True,
+                       side_effect=AssertionError("os.getuid is not available on Windows")):
             rc = self.windows("uninstall")
         self.assertEqual(rc, 2)
 

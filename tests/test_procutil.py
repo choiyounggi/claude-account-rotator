@@ -1,5 +1,6 @@
 """rotator.procutil.pid_alive: the one cross-platform liveness check, both branches on any OS."""
 import os
+import sys
 import unittest
 
 from rotator import procutil
@@ -14,6 +15,9 @@ class PidAliveGuardsTests(unittest.TestCase):
         self.assertIs(procutil.pid_alive(True), False)  # bool is an int subclass; must still be refused
 
 
+@unittest.skipIf(sys.platform == "win32",
+                 "is_windows=False forces the real POSIX os.kill(pid, 0) branch; on a real Windows process "
+                 "signal 0 is CTRL_C_EVENT, not a liveness probe, so this must never actually run there")
 class PidAlivePosixTests(unittest.TestCase):
     def test_the_current_process_is_alive(self):
         self.assertIs(procutil.pid_alive(os.getpid(), is_windows=False), True)

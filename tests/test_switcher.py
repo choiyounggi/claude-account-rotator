@@ -4,6 +4,7 @@ import io
 import json
 import os
 import stat
+import sys
 import tempfile
 import tokenize
 import unittest
@@ -2128,6 +2129,7 @@ class TestMirrorTrust(unittest.TestCase):
         self.assertIs(self.mirror(), True)
         self.assertFalse(self.read().endswith("\n"))
 
+    @unittest.skipIf(sys.platform == "win32", "Windows has no Unix permission bits to preserve")
     def test_mode_preserved(self):
         for i, mode in enumerate((0o600, 0o644)):
             with self.subTest(mode=mode):
@@ -2142,8 +2144,9 @@ class TestMirrorTrust(unittest.TestCase):
         self.assertEqual(self.backup_names(), [name])
         with open(os.path.join(self.backups, name), encoding="utf-8") as f:
             self.assertEqual(f.read(), original)
-        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.backups, name)).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(self.backups).st_mode), 0o700)
+        if sys.platform != "win32":  # Windows has no Unix permission bits to check
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.backups, name)).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(self.backups).st_mode), 0o700)
 
     def test_backups_pruned_to_newest_20(self):
         os.makedirs(self.backups)
@@ -2186,6 +2189,8 @@ class TestMirrorTrust(unittest.TestCase):
         self.assertIs(self.mirror(), False)
         self.assertFalse(os.path.exists(self.cfg))
 
+    @unittest.skipIf(sys.platform == "win32",
+                     "os.symlink needs elevated/Developer Mode privileges on Windows and is unreliable in CI")
     def test_symlink_refused(self):
         real = os.path.join(self.root, "real.json")
         with open(real, "w") as f:
@@ -2215,6 +2220,7 @@ class TestMirrorTrust(unittest.TestCase):
         self.assertNotEqual(self.read(), original)
         self.assertEqual(self.leftovers(), [])
 
+    @unittest.skipIf(sys.platform == "win32", "os.chmod does not restrict directory writes on Windows")
     def test_unwritable_folder_leaves_file_unchanged(self):
         text = self.write({"projects": {}})
         os.chmod(self.home, 0o500)
