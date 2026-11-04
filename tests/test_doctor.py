@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from rotator import doctor
 from rotator.doctor import FAIL, OK, WARN, Check
@@ -55,11 +56,52 @@ class TestCheckOrca(unittest.TestCase):
         self.assertEqual(doctor.check_orca("1.4.223-beta").level, FAIL)
 
 
+class TestOrcaVersionWindows(unittest.TestCase):
+    def test_no_cli_path_is_none(self):
+        self.assertIsNone(doctor.orca_version_windows(None))
+
+    def test_reads_stdout_from_the_version_flag(self):
+        run = mock.Mock(return_value=mock.Mock(returncode=0, stdout="1.4.241\n"))
+        v = doctor.orca_version_windows(r"C:\orca.exe", run=run)
+        self.assertEqual(v, "1.4.241")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], [r"C:\orca.exe", "--version"])
+
+    def test_nonzero_exit_is_none(self):
+        run = mock.Mock(return_value=mock.Mock(returncode=1, stdout=""))
+        self.assertIsNone(doctor.orca_version_windows(r"C:\orca.exe", run=run))
+
+    def test_run_failure_is_none(self):
+        run = mock.Mock(side_effect=OSError("not found"))
+        self.assertIsNone(doctor.orca_version_windows(r"C:\orca.exe", run=run))
+
+
 class TestOtherChecks(unittest.TestCase):
     def test_system(self):
         self.assertEqual(doctor.check_system("Darwin").level, OK)
         self.assertEqual(doctor.check_system("Linux").level, FAIL)
         self.assertEqual(doctor.check_system("").level, FAIL)
+
+    def test_system_windows_is_ok(self):
+        c = doctor.check_system("Windows")
+        self.assertEqual(c.level, OK)
+        self.assertIn("Windows", c.detail)
+
+    def test_orca_where_customizes_the_not_found_message(self):
+        c = doctor.check_orca(None, where="orca.exe on PATH")
+        self.assertEqual(c.level, FAIL)
+        self.assertIn("orca.exe on PATH", c.detail)
+
+    def test_agent_unsupported_warns_regardless_of_installed_or_stale(self):
+        for installed, stale in ((False, False), (True, False), (True, True)):
+            c = doctor.check_agent(installed, stale, supported=False)
+            self.assertEqual(c.level, WARN)
+            self.assertIn("Windows", c.detail)
+
+    def test_gate_where_flows_into_the_orca_reason(self):
+        reason = doctor.gate("Windows", None, where="orca.exe on PATH")
+        self.assertIn("orca.exe on PATH", reason)
+        self.assertIsNone(doctor.gate("Windows", "1.4.241"))
 
     def test_python_boundary(self):
         self.assertEqual(doctor.check_python((3, 8, 18)).level, FAIL)
