@@ -1614,13 +1614,21 @@ def _read_limit(s: Session) -> Optional[Tuple[str, datetime]]:
 
 def real_deps(cfg: Config) -> Deps:
     """The only constructor of real seams; building it touches nothing."""
-    r = refresh.Refresher(cfg, read_item=accounts.read_keychain_item, item_exists=accounts.keychain_item_exists,
-                          account_name=accounts.claude_code_keychain_account, write_item=accounts.write_keychain_item,
+    if IS_WINDOWS:
+        store_seams: Dict[str, Any] = dict(read_item=accounts.read_credentials_item,
+                                           item_exists=accounts.credentials_item_exists,
+                                           write_item=accounts.write_credentials_item,
+                                           store_key=lambda p: p.home)
+    else:
+        store_seams = dict(read_item=accounts.read_keychain_item, item_exists=accounts.keychain_item_exists,
+                           write_item=accounts.write_keychain_item)
+    r = refresh.Refresher(cfg, account_name=accounts.claude_code_keychain_account,
                           post=refresh._urllib_post, discover=sessions.discover_sessions, list_dir=os.listdir,
                           pid_alive=_pid_alive, exists=os.path.lexists, lock=try_lock, cc_lock=refresh.take_cc_lock,
                           now=_utc_now, monotonic=time.monotonic, sleep=time.sleep,
                           log=logging.getLogger("rotator.refresh"), find_claude=refresh.find_claude_binary,
-                          run_claude=refresh.run_claude_quiet, environ=os.environ.copy)
+                          run_claude=refresh.run_claude_quiet, environ=os.environ.copy, is_windows=IS_WINDOWS,
+                          **store_seams)
     return Deps(discover_profiles=accounts.discover_profiles, fetch_usage=usage.fetch_usage,
                 refresh_token=r.refresh, refresh_held=r.held_accounts,
                 discover_sessions=sessions.discover_sessions_with_model, read_limit=_read_limit,
