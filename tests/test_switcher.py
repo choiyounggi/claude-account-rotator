@@ -425,12 +425,31 @@ class TestRelaunchCommandWindows(unittest.TestCase):
         self.assertIn("-LiteralPath 'C:\\Users\\o''brien\\proj'", line)
 
     def test_powershell_dangerous_chars_stay_inside_one_literal(self):
-        for raw in ("$(x)", "`cmd`", "&calc", "x; rm -rf /", "x|y", 'x"y'):
+        for raw in ("$(x)", "`cmd`", "&calc", "x; rm -rf /", "x|y"):
             with self.subTest(raw=raw):
                 s = _win_sess(("claude", "--model", raw))
                 with mock.patch.object(sw, "IS_WINDOWS", True):
                     line = build_relaunch_command(s, r"C:\accounts\new", shell="powershell")
                 self.assertIn("'" + raw.replace("'", "''") + "'", line)
+
+    def test_powershell_refuses_args_native_passing_would_mangle(self):
+        # Windows PowerShell 5.1 passes a native command's arguments without escaping an embedded ", drops an
+        # empty one and lets a trailing backslash swallow the closing quote, so claude would get other args.
+        for raw in ('{"a":1}', "", "C:\\dir\\"):
+            with self.subTest(raw=raw):
+                s = _win_sess(("claude", "--settings", raw))
+                with mock.patch.object(sw, "IS_WINDOWS", True):
+                    with self.assertRaises(ValueError):
+                        build_relaunch_command(s, r"C:\accounts\new", shell="powershell")
+
+    def test_git_bash_line_sets_the_env_in_the_shell_not_through_env(self):
+        # Under MSYS an exec'd env.exe stays alive as claude's parent, and the next switch would see env.exe
+        # instead of the shell; bash's own NAME=value prefix leaves bash as the parent.
+        s = _win_sess((r"C:\nvm\claude.exe",))
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            line = build_relaunch_command(s, r"C:\accounts\new", shell="posix")
+        self.assertNotIn("env ", line)
+        self.assertIn(" && CLAUDE_CONFIG_DIR=", line)
 
     def test_powershell_refuses_control_character(self):
         s = _win_sess(("claude", "--model", "a\nb"))
@@ -1212,6 +1231,12 @@ class TestCheckPaneBindingWindows(unittest.TestCase):
     def test_mac_shell_name_not_recognised_on_windows(self):
         table = {1111: (20, "claude.exe"), 20: (30, "zsh"), 30: (1, "orca.exe")}
         self.assertEqual(self._check(table), "foreign_ancestor")
+
+    def test_chain_ending_in_another_terminal_is_foreign(self):
+        for host in ("windowsterminal.exe", "explorer.exe", "conhost.exe"):
+            with self.subTest(host=host):
+                table = {1111: (20, "claude.exe"), 20: (30, "pwsh.exe"), 30: (1, host)}
+                self.assertEqual(self._check(table), "foreign_ancestor")
 
     def test_wsl_is_multiplexer(self):
         table = {1111: (20, "claude.exe"), 20: (1, "wsl.exe")}
@@ -2675,7 +2700,8 @@ WIN_CWD_FS = "C:/Users/alice/proj"
 
 
 class TestTrustsWindowsSpelling(unittest.TestCase):
-    """On Windows, Claude Code may key a project by either path-separator spelling (task brief item 8)."""
+    """On Windows Claude Code reads a project's trust only under its forward-slash key (its key function
+    replaces every backslash with "/"), whatever spelling the session cwd uses."""
 
     def _trusts(self, projects, cwd):
         def read_text(path):
@@ -2686,8 +2712,9 @@ class TestTrustsWindowsSpelling(unittest.TestCase):
     def test_forward_slash_entry_found_for_backslash_cwd(self):
         self.assertTrue(self._trusts({WIN_CWD_FS: {"hasTrustDialogAccepted": True}}, WIN_CWD_BS))
 
-    def test_backslash_entry_found_for_forward_slash_cwd(self):
-        self.assertTrue(self._trusts({WIN_CWD_BS: {"hasTrustDialogAccepted": True}}, WIN_CWD_FS))
+    def test_backslash_entry_is_ignored_like_claude_code_does(self):
+        self.assertFalse(self._trusts({WIN_CWD_BS: {"hasTrustDialogAccepted": True}}, WIN_CWD_FS))
+        self.assertFalse(self._trusts({WIN_CWD_BS: {"hasTrustDialogAccepted": True}}, WIN_CWD_BS))
 
     def test_neither_spelling_present_untrusted(self):
         self.assertFalse(self._trusts({"C:/Users/alice/other": {"hasTrustDialogAccepted": True}}, WIN_CWD_BS))
@@ -2717,6 +2744,12 @@ class TestTrustedDocWindowsSpelling(unittest.TestCase):
         doc, changed = self._doc({}, WIN_CWD_BS)
         self.assertTrue(changed)
         self.assertEqual(doc["projects"], {WIN_CWD_FS: {"hasTrustDialogAccepted": True}})
+
+    def test_backslash_entry_does_not_count_and_is_left_alone(self):
+        doc, changed = self._doc({WIN_CWD_BS: {"hasTrustDialogAccepted": True}}, WIN_CWD_BS)
+        self.assertTrue(changed)
+        self.assertEqual(doc["projects"], {WIN_CWD_BS: {"hasTrustDialogAccepted": True},
+                                           WIN_CWD_FS: {"hasTrustDialogAccepted": True}})
 
     def test_already_trusted_under_other_spelling_is_noop(self):
         doc, changed = self._doc({WIN_CWD_FS: {"hasTrustDialogAccepted": True}}, WIN_CWD_BS)

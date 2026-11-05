@@ -286,10 +286,12 @@ def _is_claude(exec_path: str, argv: Tuple[str, ...]) -> bool:
 
 
 def _env_get_ci(env: Dict[str, str], key: str) -> Optional[str]:
-    """Case-insensitive env lookup: Windows env names are case-insensitive, though
+    """Env lookup, case-insensitive on Windows only: names are case-insensitive there, though
     rotator.windows.parse_env_block keeps whatever casing the process actually used."""
     if key in env:
         return env[key]
+    if not _win.IS_WINDOWS:
+        return None
     key_lower = key.lower()
     for k, v in env.items():
         if k.lower() == key_lower:

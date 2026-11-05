@@ -151,6 +151,11 @@ on Windows, the same way they do on macOS (interrupt, `/exit`, then a relaunch l
   (`shell_unsupported`) rather than guess at quoting rules neither shell uses.
 - **Not supported**: `cmd.exe`, WSL (`wsl.exe`) and an SSH session (`ssh.exe`) are treated as a foreign terminal,
   the same way `tmux`/`screen` are on macOS.
+- **Arguments PowerShell would change**: Windows PowerShell 5.1 passes `claude` an argument containing `"`, an
+  empty one, or one ending in `\` in altered form, so a session started with such an option (for example
+  `--settings '{"a":1}'`) is not switched in PowerShell (`relaunch_unbuildable`).
+- **Trust**: the target account trusts the folder under Claude Code's own key, the path with every `\` turned
+  into `/`; a backslash key is never read by Claude Code, so it does not count.
 - **The Orca CLI binary**: Orca ships `resources\bin\orca.cmd` (a batch file) next to a native
   `resources\bin\orca.exe` launcher. The rotator always drives the native `orca.exe`, never `orca.cmd`: Python
   runs a `.cmd` through `cmd.exe`, which re-parses the typed relaunch text, and a path or argument containing

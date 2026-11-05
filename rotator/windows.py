@@ -12,7 +12,7 @@ import os
 import struct
 import sys
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -48,11 +48,57 @@ def rotator_log_dir(*, environ: Mapping[str, str] = os.environ) -> str:
     return os.path.join(environ.get("LOCALAPPDATA", ""), "claude-account-rotator", "Logs")
 
 
+# --- Win32 function prototypes ---------------------------------------------------------------------------
+# ctypes calls an unprototyped function as returning a 32-bit int and converts Python ints to 32-bit ints,
+# which cuts 64-bit pointers and handles in half. Every call below goes through these prototypes instead, on
+# private DLL objects so the shared ``ctypes.windll`` attributes other code may rely on stay untouched.
+
+_API: Optional[object] = None
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+def _api() -> object:
+    global _API
+    if _API is None:
+        from types import SimpleNamespace
+        k32 = ctypes.WinDLL("kernel32")  # type: ignore[attr-defined]
+        ntdll = ctypes.WinDLL("ntdll")  # type: ignore[attr-defined]
+        shell32 = ctypes.WinDLL("shell32")  # type: ignore[attr-defined]
+        P, H, BOOL, DWORD = ctypes.POINTER, ctypes.c_void_p, ctypes.c_int, ctypes.c_ulong
+
+        def proto(dll: Any, name: str, restype: Any, *argtypes: Any) -> Any:
+            fn = getattr(dll, name)
+            fn.restype, fn.argtypes = restype, list(argtypes)
+            return fn
+
+        _API = SimpleNamespace(
+            OpenProcess=proto(k32, "OpenProcess", H, DWORD, BOOL, DWORD),
+            CloseHandle=proto(k32, "CloseHandle", BOOL, H),
+            GetExitCodeProcess=proto(k32, "GetExitCodeProcess", BOOL, H, P(DWORD)),
+            GetProcessTimes=proto(k32, "GetProcessTimes", BOOL, H, P(_FILETIME), P(_FILETIME), P(_FILETIME),
+                                  P(_FILETIME)),
+            QueryFullProcessImageNameW=proto(k32, "QueryFullProcessImageNameW", BOOL, H, DWORD, ctypes.c_wchar_p,
+                                             P(DWORD)),
+            IsWow64Process=proto(k32, "IsWow64Process", BOOL, H, P(ctypes.c_int)),
+            ReadProcessMemory=proto(k32, "ReadProcessMemory", BOOL, H, ctypes.c_void_p, P(ctypes.c_char),
+                                    ctypes.c_size_t, P(ctypes.c_size_t)),
+            LocalFree=proto(k32, "LocalFree", ctypes.c_void_p, ctypes.c_void_p),
+            CreateToolhelp32Snapshot=proto(k32, "CreateToolhelp32Snapshot", H, DWORD, DWORD),
+            Process32FirstW=proto(k32, "Process32FirstW", BOOL, H, P(_PROCESSENTRY32W)),
+            Process32NextW=proto(k32, "Process32NextW", BOOL, H, P(_PROCESSENTRY32W)),
+            NtQueryInformationProcess=proto(ntdll, "NtQueryInformationProcess", ctypes.c_long, H, ctypes.c_ulong,
+                                            P(_PROCESS_BASIC_INFORMATION), ctypes.c_ulong, P(ctypes.c_ulong)),
+            CommandLineToArgvW=proto(shell32, "CommandLineToArgvW", P(ctypes.c_wchar_p), ctypes.c_wchar_p,
+                                     P(ctypes.c_int)),
+        )
+    return _API
+
+
 # --- process liveness ------------------------------------------------------------------------------------
 
 
 def _default_win_probe(pid: int) -> bool:
-    kernel32 = ctypes.windll.kernel32  # Windows-only attribute of ctypes
+    kernel32 = _api()
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return False
@@ -73,7 +119,7 @@ class _FILETIME(ctypes.Structure):
 
 
 def _default_create_time_probe(pid: int) -> Optional[Tuple[int, int]]:
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _api()
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return None
@@ -112,7 +158,7 @@ def proc_start(pid: int, *,
 
 
 def _default_image_path_probe(pid: int) -> Optional[str]:
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _api()
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return None
@@ -170,7 +216,7 @@ def _default_pointer_size() -> int:
 
 
 def _default_open_vm_handle(pid: int) -> int:
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _api()
     handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
     if not handle:
         raise OSError(f"OpenProcess failed for pid {pid}")
@@ -178,11 +224,11 @@ def _default_open_vm_handle(pid: int) -> int:
 
 
 def _default_close_handle(handle: int) -> None:
-    ctypes.windll.kernel32.CloseHandle(handle)
+    _api().CloseHandle(handle)
 
 
 def _default_is_wow64_process(handle: int) -> bool:
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _api()
     result = ctypes.c_int(0)
     if not kernel32.IsWow64Process(handle, ctypes.byref(result)):
         raise OSError("IsWow64Process failed")
@@ -190,7 +236,7 @@ def _default_is_wow64_process(handle: int) -> bool:
 
 
 def _default_peb_address(handle: int) -> int:
-    ntdll = ctypes.windll.ntdll
+    ntdll = _api()
     info = _PROCESS_BASIC_INFORMATION()
     returned = ctypes.c_ulong(0)
     status = ntdll.NtQueryInformationProcess(handle, 0, ctypes.byref(info), ctypes.sizeof(info),
@@ -204,7 +250,7 @@ def _default_peb_address(handle: int) -> int:
 
 
 def _default_read_memory(handle: int, address: int, size: int) -> bytes:
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _api()
     buf = ctypes.create_string_buffer(size)
     read = ctypes.c_size_t(0)
     if not kernel32.ReadProcessMemory(handle, ctypes.c_void_p(address), buf, size, ctypes.byref(read)):
@@ -215,8 +261,7 @@ def _default_read_memory(handle: int, address: int, size: int) -> bytes:
 def _default_split_command_line(command_line: str) -> Tuple[str, ...]:
     if not command_line:
         return ()
-    shell32 = ctypes.windll.shell32
-    kernel32 = ctypes.windll.kernel32
+    shell32 = kernel32 = _api()
     argc = ctypes.c_int(0)
     argv_ptr = shell32.CommandLineToArgvW(command_line, ctypes.byref(argc))
     if not argv_ptr:
@@ -310,9 +355,9 @@ class _PROCESSENTRY32W(ctypes.Structure):
 
 def _default_snapshot_probe() -> List[Tuple[int, int, str]]:
     """One (pid, parent pid, lowercased image file name) row per process, via Toolhelp32."""
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _api()
     snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if not snapshot or snapshot == -1:
+    if not snapshot or snapshot == INVALID_HANDLE_VALUE:
         raise OSError("CreateToolhelp32Snapshot failed")
     try:
         entry = _PROCESSENTRY32W()

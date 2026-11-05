@@ -598,8 +598,14 @@ class DiscoverTest(unittest.TestCase):
     def test_config_dir_and_terminal_handle_lookups_are_case_insensitive(self):
         # Windows env names are case-insensitive; rotator.windows.parse_env_block keeps whatever
         # casing the process actually used, so sessions.py must match these two keys regardless of it.
-        result = self.discover_with_env({"claude_config_dir": "/h/acc1", "Orca_Terminal_Handle": HANDLE})
+        with unittest.mock.patch.object(rotator.sessions._win, "IS_WINDOWS", True):
+            result = self.discover_with_env({"claude_config_dir": "/h/acc1", "Orca_Terminal_Handle": HANDLE})
         self.assertEqual([(s.config_dir, s.terminal_handle) for s in result], [("/h/acc1", HANDLE)])
+
+    def test_env_lookups_stay_exact_off_windows(self):
+        # macOS env names are case-sensitive: Claude Code ignores claude_config_dir there.
+        result = self.discover_with_env({"claude_config_dir": "/h/acc1", "orca_terminal_handle": HANDLE})
+        self.assertEqual([(s.config_dir, s.terminal_handle) for s in result], [(DEFAULT_HOME, None)])
 
     def test_status_mapping(self):
         cases = [(entry(4242, status="busy"), "busy"), (entry(4242, status="compacting"), "unknown"),

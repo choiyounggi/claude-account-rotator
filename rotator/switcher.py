@@ -345,9 +345,18 @@ def build_relaunch_command(session: Session, target_home: str, shell: str = "pos
         if shell == "powershell" and any(c in _PS_QUOTE_VARIANTS for c in tok):
             raise ValueError("relaunch: quote-variant character not allowed in PowerShell")
     if shell == "powershell":
+        # Windows PowerShell 5.1 hands a native command its arguments without escaping an embedded '"', drops an
+        # empty one, and lets a trailing backslash swallow the closing quote: claude would get other arguments.
+        for tok in kept:
+            if tok == "" or '"' in tok or tok.endswith("\\"):
+                raise ValueError("relaunch: argument PowerShell would pass on changed")
+    if shell == "powershell":
         return _build_powershell(session, target_home, kept)
     # target_home stays verbatim: Claude Code derives the Keychain item name from the exact string.
-    return ("cd " + _q(session.cwd) + " && " + ENV_BINARY + " CLAUDE_CONFIG_DIR=" + _q(target_home)
+    # Git Bash sets the variables itself: under MSYS an exec'd env.exe stays alive as claude's parent, and the
+    # next switch would then find env.exe instead of the shell above claude.
+    env_prefix = "" if IS_WINDOWS else ENV_BINARY + " "
+    return ("cd " + _q(session.cwd) + " && " + env_prefix + "CLAUDE_CONFIG_DIR=" + _q(target_home)
             + " ORCA_CLAUDE_INJECTED_CONFIG_DIR=" + _q(target_home) + " " + _q(session.argv[0])
             + " --resume " + _q(session.session_id) + "".join(" " + _q(t) for t in kept))
 
@@ -883,20 +892,8 @@ def _source_trusted(run: _Run) -> bool:
     return _trusts(run.read_text, os.path.join(run.session.config_dir, ".claude.json"), run.session.cwd)
 
 
-def _spelling_variants(path: str) -> List[str]:
-    """``path``, and on Windows only its forward-slash and backslash twins: Claude Code there may key a
-    project by either separator spelling (task brief item 8), whichever ``path`` itself uses."""
-    if not IS_WINDOWS:
-        return [path]
-    out = [path]
-    for alt in (path.replace("\\", "/"), path.replace("/", "\\")):
-        if alt not in out:
-            out.append(alt)
-    return out
-
-
 def _trust_keys(cwd: str) -> List[str]:
-    """``cwd`` and its ancestors, each as every spelling ``_spelling_variants`` allows."""
+    """``cwd`` and its ancestors, spelled the way Claude Code keys projects on this OS."""
     # Claude Code accepts any trusted ancestor, git root or not: a session runs in a worktree
     # (.git file) whose only trusted entry is the parent repository folder.
     dirname = ntpath.dirname if IS_WINDOWS else os.path.dirname
@@ -910,10 +907,8 @@ def _trust_keys(cwd: str) -> List[str]:
         d = parent
     if not IS_WINDOWS:
         return candidates
-    out: List[str] = []
-    for c in candidates:
-        out.extend(_spelling_variants(c))
-    return out
+    # Claude Code reads trust only under its own key, every backslash replaced with "/".
+    return [c.replace("\\", "/") for c in candidates]
 
 
 def _trusts(read_text: ReadText, config_path: str, cwd: str) -> bool:
@@ -946,11 +941,7 @@ def _trusted_doc(raw: bytes, cwd: str) -> Optional[Tuple[dict, bool]]:
         return None
     key = cwd
     if IS_WINDOWS:
-        key = cwd.replace("\\", "/")  # Claude Code's own key spelling on Windows
-        for variant in _spelling_variants(cwd):
-            if isinstance(projects.get(variant), dict):
-                key = variant
-                break
+        key = cwd.replace("\\", "/")  # the only spelling Claude Code reads on Windows
     entry = projects.setdefault(key, {})
     if not isinstance(entry, dict):
         return None
