@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import struct
 import sys
 from datetime import datetime, timezone
-from typing import Callable, Mapping, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -125,16 +126,219 @@ def _default_image_path_probe(pid: int) -> Optional[str]:
         kernel32.CloseHandle(handle)
 
 
-def read_proc(pid: int, *, probe: Callable[[int], Optional[str]] = _default_image_path_probe
-             ) -> Tuple[str, Tuple[str, ...], dict]:
+PROCESS_QUERY_INFORMATION = 0x0400
+PROCESS_VM_READ = 0x0010
+
+# x64 PEB/RTL_USER_PROCESS_PARAMETERS layout (undocumented but stable since Windows XP x64).
+_PEB_PROCESS_PARAMETERS_OFFSET = 0x20
+_PARAMS_COMMAND_LINE_OFFSET = 0x70  # UNICODE_STRING: Length(u16) MaximumLength(u16) pad(4) Buffer(ptr)
+_PARAMS_ENVIRONMENT_OFFSET = 0x80  # PVOID Environment
+_PARAMS_ENVIRONMENT_SIZE_OFFSET = 0x3F0  # SIZE_T EnvironmentSize (Windows 8+)
+_UNICODE_STRING_HEADER_SIZE = 16
+_MAX_ENVIRONMENT_BYTES = 1024 * 1024  # 1 MiB cap on the environment block read
+
+
+class _PROCESS_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("Reserved1", ctypes.c_void_p),
+        ("PebBaseAddress", ctypes.c_void_p),
+        ("Reserved2", ctypes.c_void_p * 2),
+        ("UniqueProcessId", ctypes.c_void_p),
+        ("Reserved3", ctypes.c_void_p),
+    ]
+
+
+def parse_env_block(data: bytes) -> Dict[str, str]:
+    """Parse a Windows process environment block: a UTF-16-LE run of ``NAME=value\\0`` entries,
+    normally ending in an empty entry (a block missing that final terminator still parses). Entries
+    starting with ``=`` -- Windows' per-drive current-directory entries, e.g. ``=C:=C:\\x`` -- are
+    skipped. Windows env names are case-insensitive; this keeps whatever casing the process used."""
+    text = data.decode("utf-16-le", errors="replace")
+    out: Dict[str, str] = {}
+    for entry in text.split("\x00"):
+        if not entry or entry.startswith("="):
+            continue
+        name, sep, value = entry.partition("=")
+        if not sep:
+            continue
+        out[name] = value
+    return out
+
+
+def _default_pointer_size() -> int:
+    return ctypes.sizeof(ctypes.c_void_p)
+
+
+def _default_open_vm_handle(pid: int) -> int:
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+    if not handle:
+        raise OSError(f"OpenProcess failed for pid {pid}")
+    return handle
+
+
+def _default_close_handle(handle: int) -> None:
+    ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def _default_is_wow64_process(handle: int) -> bool:
+    kernel32 = ctypes.windll.kernel32
+    result = ctypes.c_int(0)
+    if not kernel32.IsWow64Process(handle, ctypes.byref(result)):
+        raise OSError("IsWow64Process failed")
+    return bool(result.value)
+
+
+def _default_peb_address(handle: int) -> int:
+    ntdll = ctypes.windll.ntdll
+    info = _PROCESS_BASIC_INFORMATION()
+    returned = ctypes.c_ulong(0)
+    status = ntdll.NtQueryInformationProcess(handle, 0, ctypes.byref(info), ctypes.sizeof(info),
+                                             ctypes.byref(returned))
+    if status != 0:
+        raise OSError(f"NtQueryInformationProcess failed: status={status:#x}")
+    peb = info.PebBaseAddress
+    if not peb:
+        raise OSError("PebBaseAddress is null")
+    return peb
+
+
+def _default_read_memory(handle: int, address: int, size: int) -> bytes:
+    kernel32 = ctypes.windll.kernel32
+    buf = ctypes.create_string_buffer(size)
+    read = ctypes.c_size_t(0)
+    if not kernel32.ReadProcessMemory(handle, ctypes.c_void_p(address), buf, size, ctypes.byref(read)):
+        raise OSError(f"ReadProcessMemory failed at {address:#x}")
+    return buf.raw[: read.value]
+
+
+def _default_split_command_line(command_line: str) -> Tuple[str, ...]:
+    if not command_line:
+        return ()
+    shell32 = ctypes.windll.shell32
+    kernel32 = ctypes.windll.kernel32
+    argc = ctypes.c_int(0)
+    argv_ptr = shell32.CommandLineToArgvW(command_line, ctypes.byref(argc))
+    if not argv_ptr:
+        raise OSError("CommandLineToArgvW failed")
+    try:
+        arr = ctypes.cast(argv_ptr, ctypes.POINTER(ctypes.c_wchar_p))
+        return tuple(arr[i] for i in range(argc.value))
+    finally:
+        kernel32.LocalFree(argv_ptr)
+
+
+def _read_exact(read_memory: Callable[[int, int, int], bytes], handle: int, address: int, size: int) -> bytes:
+    data = read_memory(handle, address, size)
+    if len(data) != size:
+        raise OSError(f"short read at {address:#x}: {len(data)}/{size} bytes")
+    return data
+
+
+def read_proc(pid: int, *,
+              probe: Callable[[int], Optional[str]] = _default_image_path_probe,
+              pointer_size: Callable[[], int] = _default_pointer_size,
+              open_vm_handle: Callable[[int], int] = _default_open_vm_handle,
+              close_handle: Callable[[int], None] = _default_close_handle,
+              is_wow64: Callable[[int], bool] = _default_is_wow64_process,
+              peb_address: Callable[[int], int] = _default_peb_address,
+              read_memory: Callable[[int, int, int], bytes] = _default_read_memory,
+              split_command_line: Callable[[str], Tuple[str, ...]] = _default_split_command_line,
+              ) -> Tuple[str, Tuple[str, ...], dict]:
     """(exec_path, argv, env) for ``pid``.
 
-    Windows cannot read another process's argv/env without an elevated handle, so those always come
-    back empty; rotator.sessions still recognizes a Claude Code process from its exe name and shows the
-    session, with switching marked unavailable (no ORCA_TERMINAL_HANDLE to bind a pane to) this release.
+    exec_path comes from QueryFullProcessImageNameW. argv and env are read from the target's PEB
+    (NtQueryInformationProcess -> ProcessParameters -> CommandLine/Environment, via ReadProcessMemory)
+    and really filled in now. Only supports a 64-bit Python reading a 64-bit target: a 32-bit Python or
+    a WOW64 (32-bit) target raise OSError, since their PEB layouts differ and are not handled here.
+
+    Raises OSError whenever the process can't be read: it has exited, a Win32/NT call fails, or a read
+    comes back short. Never logs env values -- they can hold secrets.
     """
     path = probe(pid)
-    return (path or "", (), {})
+    if path is None:
+        raise OSError(f"could not read process image path for pid {pid}")
+    if pointer_size() != 8:
+        raise OSError("32-bit Python cannot read a 64-bit process's memory")
+    handle = open_vm_handle(pid)
+    try:
+        if is_wow64(handle):
+            raise OSError(f"pid {pid} is a WOW64 (32-bit) process; unsupported")
+        peb = peb_address(handle)
+        params = struct.unpack(
+            "<Q", _read_exact(read_memory, handle, peb + _PEB_PROCESS_PARAMETERS_OFFSET, 8))[0]
+
+        header = _read_exact(read_memory, handle, params + _PARAMS_COMMAND_LINE_OFFSET,
+                             _UNICODE_STRING_HEADER_SIZE)
+        length = struct.unpack_from("<H", header, 0)[0]
+        buffer_ptr = struct.unpack_from("<Q", header, 8)[0]
+        cmdline_bytes = _read_exact(read_memory, handle, buffer_ptr, length) if length else b""
+        argv = split_command_line(cmdline_bytes.decode("utf-16-le", errors="replace"))
+
+        env_ptr = struct.unpack(
+            "<Q", _read_exact(read_memory, handle, params + _PARAMS_ENVIRONMENT_OFFSET, 8))[0]
+        env_size = struct.unpack(
+            "<Q", _read_exact(read_memory, handle, params + _PARAMS_ENVIRONMENT_SIZE_OFFSET, 8))[0]
+        env_size = min(env_size, _MAX_ENVIRONMENT_BYTES)
+        env_data = _read_exact(read_memory, handle, env_ptr, env_size) if env_size else b""
+        env = parse_env_block(env_data)
+    finally:
+        close_handle(handle)
+    return (path, argv, env)
+
+
+# --- process table (rotator.sessions discovery) -----------------------------------------------------------
+
+TH32CS_SNAPPROCESS = 0x00000002
+_MAX_PATH = 260
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_ulong),
+        ("cntUsage", ctypes.c_ulong),
+        ("th32ProcessID", ctypes.c_ulong),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", ctypes.c_ulong),
+        ("cntThreads", ctypes.c_ulong),
+        ("th32ParentProcessID", ctypes.c_ulong),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.c_ulong),
+        ("szExeFile", ctypes.c_wchar * _MAX_PATH),
+    ]
+
+
+def _default_snapshot_probe() -> List[Tuple[int, int, str]]:
+    """One (pid, parent pid, lowercased image file name) row per process, via Toolhelp32."""
+    kernel32 = ctypes.windll.kernel32
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snapshot or snapshot == -1:
+        raise OSError("CreateToolhelp32Snapshot failed")
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            raise OSError("Process32FirstW failed")
+        rows = []
+        while True:
+            rows.append((entry.th32ProcessID, entry.th32ParentProcessID, entry.szExeFile.lower()))
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                break
+        return rows
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+
+def process_table(*, snapshot_probe: Callable[[], List[Tuple[int, int, str]]] = _default_snapshot_probe
+                  ) -> Dict[int, Tuple[int, str]]:
+    """pid -> (parent pid, image file name lowercased), via CreateToolhelp32Snapshot.
+
+    Raises OSError when the snapshot fails or comes back empty.
+    """
+    rows = snapshot_probe()
+    if not rows:
+        raise OSError("process snapshot came back empty")
+    return {pid: (ppid, name) for pid, ppid, name in rows}
 
 
 # --- console mode and key reading (rotator.cli status --watch) -------------------------------------------
