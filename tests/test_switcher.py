@@ -2699,8 +2699,9 @@ class TestTrustsWindowsSpelling(unittest.TestCase):
 
 
 class TestTrustedDocWindowsSpelling(unittest.TestCase):
-    """mirror_trust's _trusted_doc writes under whichever spelling the target already has, or the given one
-    when neither spelling exists yet (task brief item 8)."""
+    """mirror_trust's _trusted_doc writes under whichever spelling the target already has, or Claude Code's own
+    spelling when neither exists yet: on Windows it keys projects with forward slashes (its key function
+    replaces every backslash with "/")."""
 
     def _doc(self, projects, cwd):
         raw = json.dumps({"projects": projects}).encode("utf-8")
@@ -2712,10 +2713,10 @@ class TestTrustedDocWindowsSpelling(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(doc["projects"], {WIN_CWD_FS: {"allowedTools": [], "hasTrustDialogAccepted": True}})
 
-    def test_creates_under_given_spelling_when_neither_exists(self):
+    def test_creates_under_claude_codes_forward_slash_spelling_when_neither_exists(self):
         doc, changed = self._doc({}, WIN_CWD_BS)
         self.assertTrue(changed)
-        self.assertEqual(doc["projects"], {WIN_CWD_BS: {"hasTrustDialogAccepted": True}})
+        self.assertEqual(doc["projects"], {WIN_CWD_FS: {"hasTrustDialogAccepted": True}})
 
     def test_already_trusted_under_other_spelling_is_noop(self):
         doc, changed = self._doc({WIN_CWD_FS: {"hasTrustDialogAccepted": True}}, WIN_CWD_BS)

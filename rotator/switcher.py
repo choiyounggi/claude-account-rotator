@@ -946,6 +946,7 @@ def _trusted_doc(raw: bytes, cwd: str) -> Optional[Tuple[dict, bool]]:
         return None
     key = cwd
     if IS_WINDOWS:
+        key = cwd.replace("\\", "/")  # Claude Code's own key spelling on Windows
         for variant in _spelling_variants(cwd):
             if isinstance(projects.get(variant), dict):
                 key = variant
