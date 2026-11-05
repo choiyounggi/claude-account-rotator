@@ -266,9 +266,13 @@ class ReadEnvironmentTests(unittest.TestCase):
         env, _ = self.read({self.ENV: data}, env_size_field=0)
         self.assertEqual(env, {"A": "1", "B": "2"})
 
-    def test_empty_environment(self):
-        env, _ = self.read({self.ENV: b"\x00\x00\x00\x00"}, env_size_field=0)
-        self.assertEqual(env, {})
+    def test_an_environment_with_no_variables_is_unreadable(self):
+        # Every live Windows process has some (SystemRoot at least); none means a process still starting or
+        # a failed read, and an empty env would make its session look like the default account's.
+        for regions in ({self.ENV: b"\x00\x00\x00\x00"}, {}):
+            with self.subTest(readable=bool(regions)):
+                with self.assertRaises(OSError):
+                    self.read(regions, env_size_field=0)
 
     def test_read_stops_at_the_cap(self):
         huge = ("X=" + "y" * 1000 + "\x00").encode("utf-16-le") * 1200  # ~2.4 MiB, never terminated
@@ -301,12 +305,17 @@ class RealWindowsReadProcTests(unittest.TestCase):
     code through injected probes, on any OS."""
 
     def setUp(self):
+        # The child says when it is running: read_proc targets live sessions, not a process still starting,
+        # whose parameters are not readable yet (the read right after Popen found an empty environment).
         self.child = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)", "ARG ONE", "x"],
+            [sys.executable, "-c", "import sys, time; print('ready', flush=True); time.sleep(30)", "ARG ONE", "x"],
             env=dict(os.environ, ORCA_TERMINAL_HANDLE="term_fake123", CLAUDE_CONFIG_DIR=r"C:\fake\home"),
+            stdout=subprocess.PIPE, text=True,
         )
-        self.addCleanup(self.child.kill)
+        self.addCleanup(self.child.stdout.close)
         self.addCleanup(self.child.wait)
+        self.addCleanup(self.child.kill)
+        self.assertEqual(self.child.stdout.readline().strip(), "ready")
 
     def test_read_proc_reads_real_argv_and_env(self):
         exec_path, argv, env = windows.read_proc(self.child.pid)

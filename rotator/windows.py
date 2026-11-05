@@ -360,6 +360,9 @@ def read_proc(pid: int, *,
         env_ptr = struct.unpack(
             "<Q", _read_exact(read_memory, handle, params + _PARAMS_ENVIRONMENT_OFFSET, 8))[0]
         env = parse_env_block(_read_env_block(read_memory, handle, env_ptr))
+        if not env:
+            # A live process always has some variables; none means it is still starting or the read failed.
+            raise OSError(f"pid {pid}: environment not readable yet")
     finally:
         close_handle(handle)
     return (path, argv, env)
