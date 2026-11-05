@@ -12,6 +12,14 @@ from datetime import datetime, timezone
 from unittest import mock
 
 import rotator.switcher as sw
+
+
+def setUpModule():
+    # These tests describe the macOS switcher unless a test patches IS_WINDOWS back to True itself, so they
+    # mean the same on a Windows runner, where rotator.switcher would otherwise take its Windows branches.
+    p = mock.patch.object(sw, "IS_WINDOWS", False)
+    p.start()
+    unittest.addModuleCleanup(p.stop)
 from rotator.models import Profile, Session
 from rotator.switcher import (
     DEFAULT_CONTINUE_PROMPT,

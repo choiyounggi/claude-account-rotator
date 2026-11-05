@@ -3226,7 +3226,8 @@ class TestRefreshExitLog(RunDaemonBase):
 
 class TestRealDeps(unittest.TestCase):
     def test_identity(self):
-        deps = real_deps(make_cfg())
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", False):  # the macOS wiring, on any runner
+            deps = real_deps(make_cfg())
         self.assertIs(deps.switch, switcher.switch_session)
         self.assertIs(deps.make_driver, switcher.OrcaCliDriver)
         self.assertIsInstance(deps.procs, switcher.OsProcessProbe)

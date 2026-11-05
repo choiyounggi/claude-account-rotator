@@ -604,7 +604,8 @@ class DiscoverTest(unittest.TestCase):
 
     def test_env_lookups_stay_exact_off_windows(self):
         # macOS env names are case-sensitive: Claude Code ignores claude_config_dir there.
-        result = self.discover_with_env({"claude_config_dir": "/h/acc1", "orca_terminal_handle": HANDLE})
+        with unittest.mock.patch.object(rotator.sessions._win, "IS_WINDOWS", False):
+            result = self.discover_with_env({"claude_config_dir": "/h/acc1", "orca_terminal_handle": HANDLE})
         self.assertEqual([(s.config_dir, s.terminal_handle) for s in result], [(DEFAULT_HOME, None)])
 
     def test_status_mapping(self):

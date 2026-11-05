@@ -211,6 +211,72 @@ class ReadProcTests(unittest.TestCase):
         self.assertEqual(split_calls, [command_line])
 
 
+class RegionMemory:
+    """ReadProcessMemory over contiguous regions: a read returns what the region holding ``address`` has from
+    there on (up to ``size``), and raises like the real call when no region holds it."""
+
+    def __init__(self, regions):
+        self.regions = regions  # start address -> bytes
+        self.calls = []
+
+    def read(self, handle, address, size):
+        self.calls.append((address, size))
+        for start, data in self.regions.items():
+            if start <= address < start + len(data):
+                return data[address - start:address - start + size]
+        raise OSError("ReadProcessMemory failed at %#x" % address)
+
+
+class ReadEnvironmentTests(unittest.TestCase):
+    """The environment block is read up to its own end marker (two NUL characters), not EnvironmentSize: a
+    process that changed its environment after start can leave that field smaller than the block."""
+
+    PEB, PARAMS, ENV = 0x7FF000000000, 0x1230000, 0x1240FF0  # ENV sits 16 bytes before a page boundary
+
+    def read(self, regions, env_size_field):
+        mem = RegionMemory({
+            self.PEB + 0x20: struct.pack("<Q", self.PARAMS),
+            self.PARAMS + 0x70: struct.pack("<HH4xQ", 0, 0, 0),
+            self.PARAMS + 0x80: struct.pack("<Q", self.ENV),
+            self.PARAMS + 0x3F0: struct.pack("<Q", env_size_field),
+            **regions,
+        })
+        _, _, env = windows.read_proc(
+            123, probe=lambda pid: "x.exe", open_vm_handle=lambda pid: 9, close_handle=lambda h: None,
+            is_wow64=lambda h: False, peb_address=lambda h: self.PEB, read_memory=mem.read,
+            split_command_line=lambda cl: ())
+        return env, mem
+
+    def block(self, entries):
+        return ("\x00".join(entries) + "\x00\x00").encode("utf-16-le")
+
+    def test_reads_past_a_too_small_environment_size(self):
+        data = self.block(["A=1", "ORCA_TERMINAL_HANDLE=term_fake123", "Z=last"])
+        env, _ = self.read({self.ENV: data + b"garbage-after-the-block"}, env_size_field=8)
+        self.assertEqual(env, {"A": "1", "ORCA_TERMINAL_HANDLE": "term_fake123", "Z": "last"})
+
+    def test_a_block_crossing_a_page_boundary_is_read_whole(self):
+        data = self.block(["K%d=%s" % (i, "v" * 40) for i in range(200)])
+        env, mem = self.read({self.ENV: data}, env_size_field=0)
+        self.assertEqual(len(env), 200)
+        self.assertGreater(len(mem.calls), 4)  # read in page-sized pieces, not one oversized request
+
+    def test_unterminated_block_ending_at_an_unreadable_page_keeps_what_was_read(self):
+        data = "A=1\x00B=2\x00".encode("utf-16-le")  # no final empty entry; nothing readable after it
+        env, _ = self.read({self.ENV: data}, env_size_field=0)
+        self.assertEqual(env, {"A": "1", "B": "2"})
+
+    def test_empty_environment(self):
+        env, _ = self.read({self.ENV: b"\x00\x00\x00\x00"}, env_size_field=0)
+        self.assertEqual(env, {})
+
+    def test_read_stops_at_the_cap(self):
+        huge = ("X=" + "y" * 1000 + "\x00").encode("utf-16-le") * 1200  # ~2.4 MiB, never terminated
+        env, mem = self.read({self.ENV: huge}, env_size_field=0)
+        self.assertLessEqual(sum(size for _, size in mem.calls if _ >= self.ENV), windows._MAX_ENVIRONMENT_BYTES + 4096)
+        self.assertIn("X", env)
+
+
 class ProcessTableTests(unittest.TestCase):
     def test_builds_pid_to_parent_and_name_map(self):
         rows = [(100, 1, "explorer.exe"), (200, 100, "cmd.exe")]
@@ -245,7 +311,9 @@ class RealWindowsReadProcTests(unittest.TestCase):
     def test_read_proc_reads_real_argv_and_env(self):
         exec_path, argv, env = windows.read_proc(self.child.pid)
         self.assertEqual(argv[-2:], ("ARG ONE", "x"))
-        self.assertEqual(env.get("ORCA_TERMINAL_HANDLE"), "term_fake123")
+        # Names only on failure: values can hold CI secrets.
+        self.assertEqual(env.get("ORCA_TERMINAL_HANDLE"), "term_fake123",
+                         "read %d variables: %s" % (len(env), sorted(env)))
         self.assertEqual(env.get("CLAUDE_CONFIG_DIR"), r"C:\fake\home")
 
     def test_process_table_includes_child_with_parent_and_image_name(self):

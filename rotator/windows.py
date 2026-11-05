@@ -179,7 +179,6 @@ PROCESS_VM_READ = 0x0010
 _PEB_PROCESS_PARAMETERS_OFFSET = 0x20
 _PARAMS_COMMAND_LINE_OFFSET = 0x70  # UNICODE_STRING: Length(u16) MaximumLength(u16) pad(4) Buffer(ptr)
 _PARAMS_ENVIRONMENT_OFFSET = 0x80  # PVOID Environment
-_PARAMS_ENVIRONMENT_SIZE_OFFSET = 0x3F0  # SIZE_T EnvironmentSize (Windows 8+)
 _UNICODE_STRING_HEADER_SIZE = 16
 _MAX_ENVIRONMENT_BYTES = 1024 * 1024  # 1 MiB cap on the environment block read
 
@@ -209,6 +208,44 @@ def parse_env_block(data: bytes) -> Dict[str, str]:
             continue
         out[name] = value
     return out
+
+
+_PAGE = 4096
+
+
+def _env_block_end(data: bytes) -> Optional[int]:
+    """Byte length of the block up to and including its final empty entry (two NUL characters), or None."""
+    i = data.find(b"\x00\x00\x00\x00")
+    while i != -1:
+        if i % 2 == 0:
+            return i + 4
+        i = data.find(b"\x00\x00\x00\x00", i + 1)
+    return None
+
+
+def _read_env_block(read_memory: Callable[[int, int, int], bytes], handle: int, address: int) -> bytes:
+    """The environment block at ``address``, read a page at a time up to its own end marker.
+
+    EnvironmentSize is not used: a process that changes its environment gets a new block, and that field can
+    then be smaller than the block, which would drop every variable past it. A page that cannot be read ends
+    the block where it is; the read never goes past _MAX_ENVIRONMENT_BYTES."""
+    data = b""
+    while address and len(data) < _MAX_ENVIRONMENT_BYTES:
+        want = min(_PAGE - (address % _PAGE), _MAX_ENVIRONMENT_BYTES - len(data))
+        try:
+            chunk = read_memory(handle, address, want)
+        except OSError:
+            break
+        if not chunk:
+            break
+        data += chunk
+        end = _env_block_end(data)
+        if end is not None:
+            return data[:end]
+        if len(chunk) < want:
+            break
+        address += len(chunk)
+    return data
 
 
 def _default_pointer_size() -> int:
@@ -322,11 +359,7 @@ def read_proc(pid: int, *,
 
         env_ptr = struct.unpack(
             "<Q", _read_exact(read_memory, handle, params + _PARAMS_ENVIRONMENT_OFFSET, 8))[0]
-        env_size = struct.unpack(
-            "<Q", _read_exact(read_memory, handle, params + _PARAMS_ENVIRONMENT_SIZE_OFFSET, 8))[0]
-        env_size = min(env_size, _MAX_ENVIRONMENT_BYTES)
-        env_data = _read_exact(read_memory, handle, env_ptr, env_size) if env_size else b""
-        env = parse_env_block(env_data)
+        env = parse_env_block(_read_env_block(read_memory, handle, env_ptr))
     finally:
         close_handle(handle)
     return (path, argv, env)
