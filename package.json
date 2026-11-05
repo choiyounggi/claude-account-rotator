@@ -1,6 +1,6 @@
 {
   "name": "claude-account-rotator",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Switch Orca-hosted Claude Code sessions to another account before they hit the rate limit.",
   "license": "MIT",
   "author": "choiyounggi",
