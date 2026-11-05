@@ -156,6 +156,11 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertIs(load("{}").accept_trust_dialog, True)
         self.assertIs(load('{"accept_trust_dialog": false}').accept_trust_dialog, False)
 
+    def test_experimental_windows_switch_default_and_override(self):
+        self.assertIs(load("{}").experimental_windows_switch, False)
+        self.assertIs(Config().experimental_windows_switch, False)
+        self.assertIs(load('{"experimental_windows_switch": true}').experimental_windows_switch, True)
+
     def test_policy_config_carries_overrides(self):
         cfg = load('{"cooldown_s": 60, "stale_max_age_s": 120}')
         pc = cfg.policy_config()
@@ -196,6 +201,8 @@ class TestConfigValidation(unittest.TestCase):
         ('{"copy_trust": 1}', "copy_trust"),
         ('{"accept_trust_dialog": "yes"}', "accept_trust_dialog"),
         ('{"profiles_root": "rel/x"}', "profiles_root"),
+        ('{"experimental_windows_switch": 1}', "experimental_windows_switch"),
+        ('{"experimental_windows_switch": "true"}', "experimental_windows_switch"),
         ('{"continue_prompt": "a\\tb"}', "continue_prompt"),
     ]
 
@@ -4039,6 +4046,28 @@ class TestWindowsUnsupportedCommands(MainBase):
         self.assertIn("not available on Windows yet", self.err.getvalue())
         self.assertEqual(self.cfg_seen, [])  # refused before any deps were built
 
+    def test_refusal_names_the_experimental_flag(self):
+        rc = self.windows("switch", "--session", "1", "--to", ACC_B)
+        self.assertEqual(rc, 2)
+        self.assertIn("experimental_windows_switch", self.err.getvalue())
+
+    def test_switch_allowed_with_experimental_flag(self):
+        self.write_cfg({"experimental_windows_switch": True})
+        rc = self.windows("switch", "--session", "1", "--to", ACC_B)
+        self.assertNotIn("not available on Windows yet", self.err.getvalue())
+        # past the gate: deps were built and it fails for an unrelated reason (no such session).
+        self.assertEqual(rc, 2)
+        self.assertIn("no live Claude Code session", self.err.getvalue())
+        self.assertEqual(len(self.cfg_seen), 1)
+
+    def test_switch_dry_run_allowed_without_the_flag(self):
+        # --dry-run sends nothing, so it always works on Windows (task brief item 3).
+        rc = self.windows("switch", "--session", "1", "--to", ACC_B, "--dry-run")
+        self.assertNotIn("not available on Windows yet", self.err.getvalue())
+        self.assertEqual(rc, 2)
+        self.assertIn("no live Claude Code session", self.err.getvalue())
+        self.assertEqual(len(self.cfg_seen), 1)
+
     def test_status_is_not_refused_on_windows(self):
         rc = self.windows("status", "--json")
         self.assertEqual(rc, 0)
@@ -4047,6 +4076,71 @@ class TestWindowsUnsupportedCommands(MainBase):
     # install/uninstall are no longer refused on Windows (stage 2): see TestWindowsInstallWiring, which mocks
     # rotator.schtasks.install/uninstall so the test never touches the real machine's app-copy state dir.
     # daemon is covered by TestRunDaemonWindowsAutoSwitch in test_daemon.py.
+
+
+class _WinProcs:
+    def __init__(self, table):
+        self._table = table
+
+    def read_env(self, pid):
+        return None
+
+    def is_alive(self, pid):
+        return True
+
+    def process_table(self):
+        return self._table
+
+
+class TestSwitchDryRunWindowsShell(MainBase):
+    """``switch --dry-run`` on Windows previews the relaunch line in the shell detected for the session's
+    claude parent process (task brief items 3, 5, 6)."""
+
+    def setUp(self):
+        super().setUp()
+        self.env = standard_env()
+        self.s = sess(1, ACC_A, argv=("claude",))
+        self.env.sessions = [self.s]
+
+    def _dry_run(self, table):
+        self.out, self.err = io.StringIO(), io.StringIO()
+        with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
+                mock.patch("rotator.switcher.IS_WINDOWS", True):
+            rc = main(["--config", self.cfg_path, "switch", "--session", "1", "--to", ACC_B, "--dry-run"],
+                      make_deps=lambda cfg: self.env.deps(procs=_WinProcs(table)), launchctl=FakeRunner(),
+                      uid=lambda: 501, stdout=self.out, stderr=self.err, tz=timezone.utc)
+        return rc
+
+    def test_powershell_line_previewed_for_pwsh_parent(self):
+        rc = self._dry_run({1: (20, "claude.exe"), 20: (1, "pwsh.exe")})
+        self.assertEqual(rc, 0)
+        self.assertIn("relaunch preview: Set-Location -LiteralPath ", self.out.getvalue())
+
+    def test_posix_line_previewed_for_bash_parent(self):
+        rc = self._dry_run({1: (20, "claude.exe"), 20: (1, "bash.exe")})
+        self.assertEqual(rc, 0)
+        self.assertIn("relaunch preview: cd ", self.out.getvalue())
+
+    def test_unsupported_parent_preview_unavailable(self):
+        rc = self._dry_run({1: (20, "claude.exe"), 20: (1, "cmd.exe")})
+        self.assertEqual(rc, 0)
+        self.assertIn("relaunch preview unavailable", self.out.getvalue())
+
+    def test_process_table_misbehaving_seam_preview_unavailable_not_a_crash(self):
+        # relaunch_shell only fails closed on OSError; a seam that breaks its own documented contract and
+        # raises something else must still read as "unavailable" here, not crash the CLI (see rotator.cli._switch).
+        class _Raising(_WinProcs):
+            def process_table(self):
+                raise RuntimeError("process table unavailable")
+
+        self.out, self.err = io.StringIO(), io.StringIO()
+        with mock.patch("rotator.cli.platform.system", return_value="Windows"), \
+                mock.patch("rotator.switcher.IS_WINDOWS", True):
+            rc = main(["--config", self.cfg_path, "switch", "--session", "1", "--to", ACC_B, "--dry-run"],
+                      make_deps=lambda cfg: self.env.deps(procs=_Raising({})), launchctl=FakeRunner(),
+                      uid=lambda: 501, stdout=self.out, stderr=self.err, tz=timezone.utc)
+        self.assertEqual(rc, 0)
+        self.assertIn("relaunch preview unavailable", self.out.getvalue())
 
 
 class TestDoctorCommand(MainBase):
@@ -4110,6 +4204,16 @@ class TestDoctorCommand(MainBase):
         self.assertTrue(self.line("orca CLI").startswith("[ok]"))
         self.assertTrue(self.line("background agent").startswith("[ok]"))
         self.assertIn("installed", self.line("background agent"))
+
+    def test_windows_experimental_switch_off_by_default(self):
+        self.assertEqual(self.windows_doctor(), 0)
+        self.assertTrue(self.line("experimental switch").startswith("[warn]"))
+        self.assertIn("experimental_windows_switch=true", self.line("experimental switch"))
+
+    def test_windows_experimental_switch_on(self):
+        self.write_cfg({"experimental_windows_switch": True})
+        self.assertEqual(self.windows_doctor(), 0)
+        self.assertTrue(self.line("experimental switch").startswith("[ok]"))
 
     def test_windows_background_agent_not_installed(self):
         self.assertEqual(self.windows_doctor(runner=FakeRunner({"/Query": (1, "", "")})), 0)

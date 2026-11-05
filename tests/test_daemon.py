@@ -345,7 +345,7 @@ class TestReasonClasses(unittest.TestCase):
             for b in sets[i + 1:]:
                 self.assertEqual(a & b, frozenset())
         self.assertEqual(frozenset().union(*sets), set(switcher.REASONS))
-        self.assertEqual([len(s) for s in sets], [8, 2, 8, 1, 9])
+        self.assertEqual([len(s) for s in sets], [10, 2, 8, 1, 9])
 
     def test_classify(self):
         self.assertEqual(classify_untouched("target_untrusted"), "target")
@@ -954,6 +954,29 @@ class TestRunSwitch(RunSwitchBase):
         self.run_switch(on_intent=lambda i, t: seen.append(("intent", i, t, len(self.switch_calls()))),
                         on_attempt=lambda: seen.append(("attempt", len(self.switch_calls()))))
         self.assertEqual(seen, [("intent", identity_of(self.s), T0, 0), ("attempt", 0)])
+
+
+class TestRunSwitchOrcaCliUnavailable(RunSwitchBase):
+    """real_deps' make_driver returns None on Windows when no usable orca.exe exists next to orca.cmd;
+    run_switch then refuses the switch instead of calling deps.switch with no driver (task brief item 7)."""
+
+    def test_refuses_without_calling_switch_or_driver(self):
+        deps = dataclasses.replace(self.env.deps(), make_driver=lambda: None)
+        out = self.run_switch(deps=deps)
+        self.assertEqual(out.status, "done")
+        self.assertEqual(self.switch_calls(), [])
+        rec = self.stored()
+        self.assertEqual(rec["result"]["reason"], "orca_cli_unavailable")
+        self.assertEqual(rec["result"]["state"], "untouched")
+        self.assertEqual(rec["result"]["ok"], False)
+        self.assertEqual(rec["unswitchable"], "orca_cli_unavailable")
+        self.assert_released()
+
+    def test_present_driver_still_switches_normally(self):
+        self.env.results = [result()]
+        out = self.run_switch()
+        self.assertEqual(out.status, "done")
+        self.assertEqual(len(self.switch_calls()), 1)
 
 
 class TestPostVerify(unittest.TestCase):
@@ -2776,6 +2799,61 @@ class TestRunDaemonWindowsAutoSwitch(RunDaemonBase):
         self.assertEqual([c for c in self.env.calls if c[0] == "write_pointer"], [])
 
 
+class TestSwitchSupported(unittest.TestCase):
+    """Daemon._switch_supported: macOS is always supported; Windows needs experimental_windows_switch
+    (task brief item 2)."""
+
+    def _supported(self, *, is_windows, experimental):
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", is_windows):
+            d = daemon.Daemon(make_cfg(experimental_windows_switch=experimental), None, logging.getLogger("t"))
+        return d._switch_supported
+
+    def test_mac_always_supported(self):
+        self.assertTrue(self._supported(is_windows=False, experimental=False))
+        self.assertTrue(self._supported(is_windows=False, experimental=True))
+
+    def test_windows_without_flag_unsupported(self):
+        self.assertFalse(self._supported(is_windows=True, experimental=False))
+
+    def test_windows_with_flag_supported(self):
+        self.assertTrue(self._supported(is_windows=True, experimental=True))
+
+
+class TestRunDaemonWindowsExperimentalSwitch(RunDaemonBase):
+    """experimental_windows_switch=True logs auto_switch_experimental instead of auto_switch_unavailable and
+    lifts the auto_switch flag on Windows; macOS ignores the flag (task brief item 2)."""
+
+    def setUp(self):
+        super().setUp()
+        # No live session: this class covers only the start log and the flags snapshot, not dispatch.
+        self.env.sessions = []
+        self.env.wait_hook = lambda n: self.env.signal_handler() if n == 1 else None
+
+    def test_logs_experimental_instead_of_unavailable(self):
+        self.make(make_cfg(experimental_windows_switch=True))
+        self.env.wait_hook = lambda n: self.env.signal_handler() if n == 1 else None
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", True):
+            self.assertEqual(self.run_d(), 0)
+        self.assertEqual(self.env.logs("auto_switch_unavailable"), [])
+        self.assertEqual(self.env.logs("auto_switch_experimental"), ["event=auto_switch_experimental os=windows"])
+        self.assertEqual(self.snap()["flags"]["auto_switch"], True)
+
+    def test_mac_ignores_flag_neither_log_line(self):
+        self.make(make_cfg(experimental_windows_switch=True))
+        self.env.wait_hook = lambda n: self.env.signal_handler() if n == 1 else None
+        self.assertEqual(self.run_d(), 0)  # IS_WINDOWS False here (TickBase patches it)
+        self.assertEqual(self.env.logs("auto_switch_experimental"), [])
+        self.assertEqual(self.env.logs("auto_switch_unavailable"), [])
+
+    def test_flag_off_still_logs_unavailable(self):
+        self.make(make_cfg())
+        self.env.wait_hook = lambda n: self.env.signal_handler() if n == 1 else None
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", True):
+            self.assertEqual(self.run_d(), 0)
+        self.assertEqual(self.env.logs("auto_switch_experimental"), [])
+        self.assertEqual(self.env.logs("auto_switch_unavailable"), ["event=auto_switch_unavailable os=windows"])
+
+
 class TestDaemonStartNoConsole(RunDaemonBase):
     """Under pythonw.exe (no console) sys.stdout/sys.stderr are None; the real logger must not crash on that."""
 
@@ -3148,7 +3226,8 @@ class TestRefreshExitLog(RunDaemonBase):
 
 class TestRealDeps(unittest.TestCase):
     def test_identity(self):
-        deps = real_deps(make_cfg())
+        with unittest.mock.patch.object(daemon, "IS_WINDOWS", False):  # the macOS wiring, on any runner
+            deps = real_deps(make_cfg())
         self.assertIs(deps.switch, switcher.switch_session)
         self.assertIs(deps.make_driver, switcher.OrcaCliDriver)
         self.assertIsInstance(deps.procs, switcher.OsProcessProbe)

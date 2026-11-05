@@ -66,7 +66,7 @@ ORPHANED_HINT = (
 # treated as structural, so a reason added upstream fails closed instead of being retried.
 STRUCTURAL_REASONS = frozenset({
     "no_terminal_handle", "terminal_handle_invalid", "no_argv", "relaunch_unbuildable", "same_account",
-    "cwd_missing", "registry_mismatch", "pane_binding_unverified",
+    "cwd_missing", "registry_mismatch", "pane_binding_unverified", "shell_unsupported", "orca_cli_unavailable",
 })
 TARGET_REASONS = frozenset({"target_untrusted", "target_home_missing"})
 # Exclusions for these reasons expire after Config.exclusion_ttl_s: the cause (an untrusted folder, a transcript
@@ -253,7 +253,8 @@ class Deps:
     discover_sessions: Callable[[Sequence[str]], List[Session]]
     read_limit: Callable[[Session], Optional[Tuple[str, datetime]]]
     switch: Callable[..., SwitchResult]
-    make_driver: Callable[[], TerminalDriver]
+    # None on Windows when no usable orca.exe was found next to orca.cmd (see real_deps and run_switch).
+    make_driver: Callable[[], Optional[TerminalDriver]]
     procs: ProcessProbe
     read_pointer: Callable[[str], Optional[str]]
     write_pointer: Callable[[Profile, str], Optional[str]]
@@ -579,11 +580,19 @@ def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cf
                 on_attempt()
             logger.info("event=switch_start pid=%d source=%s mode=%s target=%s own=%s attempt=%d",
                         pid, source, cur_mode, cur_target.account_id, own.account_id, attempt)
-            res = deps.switch(session, cur_target, cur_mode, driver=deps.make_driver(), procs=deps.procs,
-                              timeouts=cfg.timeouts, continue_prompt=cfg.continue_prompt,
-                              profiles_root=cfg.profiles_root, copy_trust=cfg.copy_trust and not cfg.dry_run,
-                              trust_backup_dir=os.path.join(cfg.state_dir, BACKUPS_DIRNAME),
-                              accept_trust=cfg.accept_trust_dialog and not cfg.dry_run)
+            driver = deps.make_driver()
+            if driver is None:
+                # Windows only: no usable orca.exe next to orca.cmd (see real_deps/_make_windows_driver).
+                # orca.cmd is never driven directly -- Python would run it through cmd.exe, which re-parses
+                # the typed relaunch text and could let a stray & | % ^ " break out of it or inject a command.
+                res = SwitchResult(ok=False, step="preflight", reason="orca_cli_unavailable", state="untouched",
+                                   new_pid=None, relaunch_command="", recoverable=False)
+            else:
+                res = deps.switch(session, cur_target, cur_mode, driver=driver, procs=deps.procs,
+                                  timeouts=cfg.timeouts, continue_prompt=cfg.continue_prompt,
+                                  profiles_root=cfg.profiles_root, copy_trust=cfg.copy_trust and not cfg.dry_run,
+                                  trust_backup_dir=os.path.join(cfg.state_dir, BACKUPS_DIRNAME),
+                                  accept_trust=cfg.accept_trust_dialog and not cfg.dry_run)
             calls = attempt
             last_mode, last_target = cur_mode, cur_target
             _log_result(logger, session, source, cur_mode, cur_target, attempt, res)
@@ -1027,8 +1036,9 @@ class Daemon:
 
     def __init__(self, cfg: Config, deps: Deps, logger: logging.Logger) -> None:
         self._cfg = cfg
-        # Live-session switching drives Orca's terminal (rotator.switcher), which is macOS-only this release.
-        self._switch_supported = not IS_WINDOWS
+        # Live-session switching drives Orca's terminal (rotator.switcher); on Windows it is experimental and
+        # needs an explicit opt-in (see README "Experimental: switching a running session").
+        self._switch_supported = not IS_WINDOWS or cfg.experimental_windows_switch
         self._deps = deps
         self._log = logger
         self._lock = threading.Lock()
@@ -1544,7 +1554,10 @@ def run_daemon(cfg: Config, deps: Deps) -> int:
     2 when profiles_root is missing."""
     log = deps.make_logger()
     if IS_WINDOWS and cfg.auto_switch:
-        log.info("event=auto_switch_unavailable os=windows")  # see Daemon._switch_supported
+        if cfg.experimental_windows_switch:
+            log.info("event=auto_switch_experimental os=windows")
+        else:
+            log.info("event=auto_switch_unavailable os=windows")  # see Daemon._switch_supported
     if not deps.isdir(cfg.profiles_root):
         log.error("event=profiles_root_missing path=%s", cfg.profiles_root)
         return 2
@@ -1652,6 +1665,13 @@ def _read_limit(s: Session) -> Optional[Tuple[str, datetime]]:
     return sessions.read_session_limit(s.config_dir, s.cwd, s.session_id, s.started_at)
 
 
+def _make_windows_driver() -> Optional[TerminalDriver]:
+    """None when no usable orca.exe was found (see switcher.windows_orca_driver_binary); run_switch then
+    refuses the switch with reason "orca_cli_unavailable" instead of risking orca.cmd through cmd.exe."""
+    binary = switcher.windows_orca_driver_binary()
+    return switcher.OrcaCliDriver(binary) if binary else None
+
+
 def real_deps(cfg: Config) -> Deps:
     """The only constructor of real seams; building it touches nothing."""
     if IS_WINDOWS:
@@ -1659,9 +1679,11 @@ def real_deps(cfg: Config) -> Deps:
                                            item_exists=accounts.credentials_item_exists,
                                            write_item=accounts.write_credentials_item,
                                            store_key=lambda p: p.home)
+        make_driver: Callable[[], Optional[TerminalDriver]] = _make_windows_driver
     else:
         store_seams = dict(read_item=accounts.read_keychain_item, item_exists=accounts.keychain_item_exists,
                            write_item=accounts.write_keychain_item)
+        make_driver = switcher.OrcaCliDriver
     r = refresh.Refresher(cfg, account_name=accounts.claude_code_keychain_account,
                           post=refresh._urllib_post, discover=sessions.discover_sessions, list_dir=os.listdir,
                           pid_alive=_pid_alive, exists=os.path.lexists, lock=try_lock, cc_lock=refresh.take_cc_lock,
@@ -1673,7 +1695,7 @@ def real_deps(cfg: Config) -> Deps:
                 refresh_token=r.refresh, refresh_held=r.held_accounts,
                 discover_sessions=sessions.discover_sessions_with_model, read_limit=_read_limit,
                 switch=switcher.switch_session,
-                make_driver=switcher.OrcaCliDriver, procs=switcher.OsProcessProbe(),
+                make_driver=make_driver, procs=switcher.OsProcessProbe(),
                 read_pointer=pointer.read_selected_host, write_pointer=pointer.set_selected_host,
                 now=_utc_now, monotonic=time.monotonic, spawn=_spawn, wait_stop=_wait_stop, lock=try_lock,
                 read_text=_read_text_utf8, write_text=atomic_write_text, unlink=_unlink_quiet, list_dir=os.listdir,

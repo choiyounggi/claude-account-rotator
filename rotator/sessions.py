@@ -156,7 +156,7 @@ def _proc_start_macos(pid: int) -> Optional[datetime]:
 
 def _read_proc(pid: int) -> ProcInfo:
     """exec_path/argv/env for a live pid: macOS sysctl KERN_PROCARGS2, or rotator.windows.read_proc
-    (exec path only -- Windows cannot read another process's argv/env without elevation)."""
+    (PEB/ReadProcessMemory)."""
     return _win.read_proc(pid) if _win.IS_WINDOWS else _read_proc_macos(pid)
 
 
@@ -280,7 +280,23 @@ def _is_claude(exec_path: str, argv: Tuple[str, ...]) -> bool:
         return True
     if argv and os.path.basename(argv[0]) in _CLAUDE_BASENAMES:
         return True
-    return any(_CLAUDE_PKG_SEGMENT in "/" + x for x in (exec_path,) + tuple(argv[:2]))
+    # Normalize Windows' backslash separators so the package-segment check below, written with
+    # forward slashes, also matches a node.exe running a claude-code script there.
+    return any(_CLAUDE_PKG_SEGMENT in "/" + x.replace("\\", "/") for x in (exec_path,) + tuple(argv[:2]))
+
+
+def _env_get_ci(env: Dict[str, str], key: str) -> Optional[str]:
+    """Env lookup, case-insensitive on Windows only: names are case-insensitive there, though
+    rotator.windows.parse_env_block keeps whatever casing the process actually used."""
+    if key in env:
+        return env[key]
+    if not _win.IS_WINDOWS:
+        return None
+    key_lower = key.lower()
+    for k, v in env.items():
+        if k.lower() == key_lower:
+            return v
+    return None
 
 
 def _pick_winner(cands: Sequence[_Candidate]) -> _Candidate:
@@ -487,7 +503,8 @@ def discover_sessions(
 
     Never raises for bad registry data or unreadable processes: those entries are skipped with a
     DEBUG record on the ``rotator.sessions`` logger. Only CLAUDE_CONFIG_DIR and ORCA_TERMINAL_HANDLE
-    are read from a process env. A ``str`` ``homes`` raises TypeError.
+    are read from a process env, matched case-insensitively (Windows env names are case-insensitive).
+    A ``str`` ``homes`` raises TypeError.
 
     read_model None: Session.model stays None and no transcript is read; otherwise the model comes
     from read_model(config_dir, cwd, session_id), else from model_from_argv(argv).
@@ -556,7 +573,7 @@ def discover_sessions(
             _skip(w.path, "not_claude")
             continue
 
-        cfg = env.get("CLAUDE_CONFIG_DIR")
+        cfg = _env_get_ci(env, "CLAUDE_CONFIG_DIR")
         if cfg is None or cfg == "":
             config_dir = default_home
         elif os.path.isabs(cfg):
@@ -564,7 +581,7 @@ def discover_sessions(
         else:
             _skip(w.path, "config_dir_relative")
             continue
-        terminal_handle = env.get("ORCA_TERMINAL_HANDLE") or None
+        terminal_handle = _env_get_ci(env, "ORCA_TERMINAL_HANDLE") or None
 
         try:
             s = Session(
