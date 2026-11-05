@@ -46,6 +46,7 @@ TOP_KEYS = (
     "copy_trust",
     "accept_trust_dialog",
     "profiles_root",
+    "experimental_windows_switch",
 )
 TIMEOUT_KEYS = ("idle_s", "exit_s", "shell_s", "ready_s", "prompt_s", "poll_s")
 
@@ -82,6 +83,8 @@ class Config:
     copy_trust: bool = True
     accept_trust_dialog: bool = True
     profiles_root: str = PROFILES_ROOT_DEFAULT
+    # Opt-in to driving a live session's Orca pane on Windows (PowerShell, Git Bash); macOS ignores it.
+    experimental_windows_switch: bool = False
     # Not a JSON key: where state, locks and records live. load_config always uses CONFIG_DIR_DEFAULT
     # whatever --config names, so every daemon and CLI process contends on the same lock files.
     state_dir: str = CONFIG_DIR_DEFAULT
@@ -178,7 +181,8 @@ def parse_config(obj: object, *, state_dir: str) -> Config:
                 raise ConfigError(_PROMPT_MESSAGE)
             vals[key] = value
         elif key in ("dry_run", "auto_switch", "pointer_correction", "token_refresh", "session_token_warmup",
-                     "session_token_warmup_request", "copy_trust", "accept_trust_dialog"):
+                     "session_token_warmup_request", "copy_trust", "accept_trust_dialog",
+                     "experimental_windows_switch"):
             if type(value) is not bool:
                 raise ConfigError("%s: must be true or false" % key)
             vals[key] = value

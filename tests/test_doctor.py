@@ -141,6 +141,16 @@ class TestOtherChecks(unittest.TestCase):
         self.assertEqual(doctor.check_agent(True, True).level, WARN)
         self.assertEqual(doctor.check_agent(True, False).level, OK)
 
+    def test_experimental_switch_on(self):
+        c = doctor.check_experimental_switch(True)
+        self.assertEqual(c.level, OK)
+        self.assertIn("on", c.detail)
+
+    def test_experimental_switch_off(self):
+        c = doctor.check_experimental_switch(False)
+        self.assertEqual(c.level, WARN)
+        self.assertIn("experimental_windows_switch=true", c.detail)
+
 
 class TestGate(unittest.TestCase):
     def test_ok(self):

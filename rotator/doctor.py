@@ -129,6 +129,16 @@ def check_config(error: Optional[str]) -> Check:
     return Check("config", FAIL, "%s (the other checks use the defaults)" % error)
 
 
+def check_experimental_switch(enabled: bool) -> Check:
+    """Windows only: whether experimental_windows_switch lets this machine drive a live session's Orca pane."""
+    if enabled:
+        return Check("experimental switch", OK,
+                     "on: session switching is experimental on Windows (PowerShell, Git Bash); "
+                     "verified in CI only")
+    return Check("experimental switch", WARN,
+                 "off: set experimental_windows_switch=true in the config to enable it (see README)")
+
+
 def check_agent(installed: bool, stale: bool, *, supported: bool = True) -> Check:
     if not supported:
         return Check("background agent", WARN, "not available on Windows yet")

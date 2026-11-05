@@ -52,8 +52,10 @@ class FakeClock:
 
 class TestVocabulary(unittest.TestCase):
     def test_reasons_unique_and_complete(self):
-        self.assertEqual(len(sw.REASONS), 28)
+        self.assertEqual(len(sw.REASONS), 30)
         self.assertEqual(len(set(sw.REASONS)), len(sw.REASONS))
+        self.assertIn("shell_unsupported", sw.REASONS)
+        self.assertIn("orca_cli_unavailable", sw.REASONS)
 
     def test_steps_and_states(self):
         self.assertEqual(
@@ -366,6 +368,134 @@ class TestRelaunchCommand(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_relaunch_command(_sess(("claude", "--model", "a\\b")), "/Users/user/h")
 
+    def test_bad_shell_value_refused(self):
+        with self.assertRaises(ValueError):
+            build_relaunch_command(_sess(("claude",)), "/Users/user/h", shell="fish")
+
+
+def _win_sess(argv, *, cwd=r"C:\Users\alice\proj", sid=SID1):
+    # config_dir stays a POSIX path: Session.__post_init__ validates it with os.path.isabs regardless of
+    # platform, and only cwd/argv/session_id matter to build_relaunch_command.
+    return Session(pid=1111, session_id=sid, cwd=cwd, status="idle", config_dir="/Users/user/old/home",
+                   argv=tuple(argv), terminal_handle="term_00000000")
+
+
+class TestRelaunchCommandWindows(unittest.TestCase):
+    """build_relaunch_command on Windows: posix (Git Bash) allows backslashes and claude.exe; powershell has
+    its own quoting shape entirely. Patching IS_WINDOWS lets this run on any host (see task brief)."""
+
+    def test_posix_allows_backslash_and_claude_exe(self):
+        s = _win_sess((r"C:\nvm\claude.exe",))
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            line = build_relaunch_command(s, r"C:\accounts\new", shell="posix")
+        self.assertTrue(line.startswith("cd "))
+        self.assertIn(r"C:\Users\alice\proj", line)
+        self.assertIn(r"C:\accounts\new", line)
+        self.assertIn(r"C:\nvm\claude.exe", line)
+
+    def test_posix_claude_exe_rejected_without_windows(self):
+        # Off Windows, argv[0] must still be exactly "claude" (mac behaviour unchanged).
+        s = _win_sess((r"C:\nvm\claude.exe",))
+        with self.assertRaises(ValueError):
+            build_relaunch_command(s, r"C:\accounts\new", shell="posix")
+
+    def test_powershell_shape(self):
+        s = _win_sess((r"C:\nvm\claude.exe", "--model", "opus"))
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            line = build_relaunch_command(s, r"C:\accounts\new", shell="powershell")
+        self.assertEqual(
+            line,
+            "Set-Location -LiteralPath 'C:\\Users\\alice\\proj'; $p=$env:CLAUDE_CONFIG_DIR; "
+            "$q=$env:ORCA_CLAUDE_INJECTED_CONFIG_DIR; try { $env:CLAUDE_CONFIG_DIR='C:\\accounts\\new'; "
+            "$env:ORCA_CLAUDE_INJECTED_CONFIG_DIR='C:\\accounts\\new'; & 'C:\\nvm\\claude.exe' --resume '"
+            + SID1 + "' '--model' 'opus' } finally "
+            "{ $env:CLAUDE_CONFIG_DIR=$p; $env:ORCA_CLAUDE_INJECTED_CONFIG_DIR=$q }",
+        )
+
+    def test_powershell_claude_bare_name_accepted(self):
+        s = _win_sess(("claude",))
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            line = build_relaunch_command(s, r"C:\accounts\new", shell="powershell")
+        self.assertIn("& 'claude' --resume '" + SID1 + "' }", line)
+
+    def test_powershell_single_quote_doubled(self):
+        s = _win_sess(("claude",), cwd=r"C:\Users\o'brien\proj")
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            line = build_relaunch_command(s, r"C:\accounts\new", shell="powershell")
+        self.assertIn("-LiteralPath 'C:\\Users\\o''brien\\proj'", line)
+
+    def test_powershell_dangerous_chars_stay_inside_one_literal(self):
+        for raw in ("$(x)", "`cmd`", "&calc", "x; rm -rf /", "x|y", 'x"y'):
+            with self.subTest(raw=raw):
+                s = _win_sess(("claude", "--model", raw))
+                with mock.patch.object(sw, "IS_WINDOWS", True):
+                    line = build_relaunch_command(s, r"C:\accounts\new", shell="powershell")
+                self.assertIn("'" + raw.replace("'", "''") + "'", line)
+
+    def test_powershell_refuses_control_character(self):
+        s = _win_sess(("claude", "--model", "a\nb"))
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            with self.assertRaises(ValueError):
+                build_relaunch_command(s, r"C:\accounts\new", shell="powershell")
+
+    def test_powershell_refuses_smart_quote_variants(self):
+        for ch in ("\u2018", "\u2019", "\u201a", "\u201b"):
+            with self.subTest(ch=repr(ch)):
+                s = _win_sess(("claude", "--model", "a" + ch + "b"))
+                with mock.patch.object(sw, "IS_WINDOWS", True):
+                    with self.assertRaises(ValueError):
+                        build_relaunch_command(s, r"C:\accounts\new", shell="powershell")
+
+
+class _TableProbe:
+    def __init__(self, table=None, error=None):
+        self._table = table
+        self._error = error
+
+    def process_table(self):
+        if self._error is not None:
+            raise self._error
+        return self._table
+
+
+class TestRelaunchShell(unittest.TestCase):
+    def test_macos_always_posix(self):
+        with mock.patch.object(sw, "IS_WINDOWS", False):
+            self.assertEqual(sw.relaunch_shell(_TableProbe({}), _sess(("claude",))), "posix")
+
+    def test_windows_pwsh_parent_is_powershell(self):
+        table = {1111: (20, "claude.exe"), 20: (1, "pwsh.exe")}
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            self.assertEqual(sw.relaunch_shell(_TableProbe(table), _sess(("claude",))), "powershell")
+
+    def test_windows_powershell_exe_parent_is_powershell(self):
+        table = {1111: (20, "claude.exe"), 20: (1, "powershell.exe")}
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            self.assertEqual(sw.relaunch_shell(_TableProbe(table), _sess(("claude",))), "powershell")
+
+    def test_windows_bash_parent_is_posix(self):
+        table = {1111: (20, "claude.exe"), 20: (1, "bash.exe")}
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            self.assertEqual(sw.relaunch_shell(_TableProbe(table), _sess(("claude",))), "posix")
+
+    def test_windows_sh_exe_parent_is_posix(self):
+        table = {1111: (20, "claude.exe"), 20: (1, "sh.exe")}
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            self.assertEqual(sw.relaunch_shell(_TableProbe(table), _sess(("claude",))), "posix")
+
+    def test_windows_cmd_exe_parent_unsupported(self):
+        table = {1111: (20, "claude.exe"), 20: (1, "cmd.exe")}
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            self.assertIsNone(sw.relaunch_shell(_TableProbe(table), _sess(("claude",))))
+
+    def test_windows_pid_missing_from_table(self):
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            self.assertIsNone(sw.relaunch_shell(_TableProbe({}), _sess(("claude",))))
+
+    def test_windows_process_table_oserror(self):
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            self.assertIsNone(sw.relaunch_shell(_TableProbe(error=OSError("x")), _sess(("claude",))))
+
 
 class TestPreservedArgs(unittest.TestCase):
     def _kept(self, *rest):
@@ -617,6 +747,88 @@ class TestOrcaCliDriver(unittest.TestCase):
         self.assertIs(d._run, sw._run_subprocess)
         self.assertEqual(d._binary, sw.ORCA_BINARY_DEFAULT)
 
+    def test_cmd_binary_refused_on_windows(self):
+        fake = FakeRun()
+        d = OrcaCliDriver(binary=r"C:\Orca\resources\bin\orca.cmd", run=fake)
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            with self.assertRaises(ValueError):
+                d.send(H, "/exit", enter=True, interrupt=False)
+        self.assertEqual(fake.calls, [])
+
+    def test_bat_binary_refused_on_windows(self):
+        fake = FakeRun()
+        d = OrcaCliDriver(binary=r"C:\Orca\resources\bin\orca.bat", run=fake)
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            with self.assertRaises(ValueError):
+                d.send(H, "/exit", enter=True, interrupt=False)
+        self.assertEqual(fake.calls, [])
+
+    def test_cmd_binary_allowed_off_windows(self):
+        # IS_WINDOWS False on this host: the .cmd guard only applies on Windows itself.
+        fake = FakeRun((0, '{"send":{"accepted":true}}', ""))
+        d = OrcaCliDriver(binary=r"C:\Orca\resources\bin\orca.cmd", run=fake)
+        d.send(H, "/exit", enter=True, interrupt=False)
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_exe_binary_allowed_on_windows(self):
+        fake = FakeRun((0, '{"send":{"accepted":true}}', ""))
+        d = OrcaCliDriver(binary=r"C:\Orca\resources\bin\orca.exe", run=fake)
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            d.send(H, "/exit", enter=True, interrupt=False)
+        self.assertEqual(len(fake.calls), 1)
+
+
+class TestRunSubprocessCreationFlags(unittest.TestCase):
+    def test_windows_passes_create_no_window(self):
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen.update(kw)
+
+            class R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return R()
+
+        with mock.patch.object(sw, "IS_WINDOWS", True), \
+                mock.patch.object(sw.subprocess, "run", fake_run), \
+                mock.patch.object(sw.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True):
+            sw._run_subprocess([B, "x"], 1.0)
+        self.assertEqual(seen.get("creationflags"), 0x08000000)
+
+    def test_macos_passes_zero(self):
+        rc, out, err = sw._run_subprocess(["/usr/bin/true"], 5.0)
+        self.assertEqual(rc, 0)
+
+
+WIN_ORCA_CMD = r"C:\Users\someone\AppData\Local\Programs\Orca\resources\bin\orca.cmd"
+WIN_ORCA_BIN = r"C:\Users\someone\AppData\Local\Programs\Orca\resources\bin"
+
+
+class TestWindowsOrcaDriverBinary(unittest.TestCase):
+    """The native orca.exe sibling OrcaCliDriver must use on Windows, never orca.cmd/.bat (see task brief
+    item 7: a .cmd is run through cmd.exe, which re-parses the typed relaunch text)."""
+
+    def test_sibling_exe_found_next_to_cmd(self):
+        exe = WIN_ORCA_BIN + r"\orca.exe"
+        which = {"orca.cmd": WIN_ORCA_CMD}.get
+        got = sw.windows_orca_driver_binary(which=which, isfile=lambda p: p == exe)
+        self.assertEqual(got, exe)
+
+    def test_no_sibling_exe_refuses(self):
+        which = {"orca.cmd": WIN_ORCA_CMD}.get
+        self.assertIsNone(sw.windows_orca_driver_binary(which=which, isfile=lambda p: False))
+
+    def test_native_launcher_already_found_used_directly(self):
+        exe = WIN_ORCA_BIN + r"\orca.exe"
+        which = {"orca.exe": exe}.get
+        got = sw.windows_orca_driver_binary(which=which, isfile=lambda p: True)
+        self.assertEqual(got, exe)
+
+    def test_nothing_on_path_refuses(self):
+        self.assertIsNone(sw.windows_orca_driver_binary(which=lambda n: None, isfile=lambda p: True))
+
 
 # ---------------------------------------------------------------- Task 05
 
@@ -743,6 +955,41 @@ class TestOsProcessProbe(unittest.TestCase):
                                side_effect=AssertionError("must not be used with an injected kill")):
             self.assertIs(OsProcessProbe(kill=kill).is_alive(42), True)
         self.assertEqual(calls, [(42, 0)])
+
+    def test_windows_read_env_case_insensitive_keys_and_presence(self):
+        def fake_read_proc(pid):
+            return (r"C:\x\claude.exe", (), {"Claude_Config_Dir": r"C:\accounts\a",
+                                             "Orca_Terminal_Handle": "term_9", "TMUX": "1"})
+        with mock.patch.object(sw, "IS_WINDOWS", True), mock.patch.object(sw._win, "read_proc", fake_read_proc):
+            env = OsProcessProbe().read_env(42)
+        self.assertEqual(env.config_dir, r"C:\accounts\a")
+        self.assertEqual(env.terminal_handle, "term_9")
+        self.assertEqual(env.present, frozenset({"TMUX"}))
+
+    def test_windows_read_env_missing_keys_is_empty_proc_env(self):
+        with mock.patch.object(sw, "IS_WINDOWS", True), \
+                mock.patch.object(sw._win, "read_proc", lambda pid: (r"C:\x\claude.exe", (), {})):
+            self.assertEqual(OsProcessProbe().read_env(42), ProcEnv())
+
+    def test_windows_read_env_oserror_is_none(self):
+        def raiser(pid):
+            raise OSError("gone")
+        with mock.patch.object(sw, "IS_WINDOWS", True), mock.patch.object(sw._win, "read_proc", raiser):
+            self.assertIsNone(OsProcessProbe().read_env(42))
+
+    def test_windows_process_table_delegates_to_windows_seam(self):
+        table = {1234: (567, "pwsh.exe")}
+        with mock.patch.object(sw, "IS_WINDOWS", True), \
+                mock.patch.object(sw._win, "process_table", lambda: table, create=True):
+            self.assertEqual(OsProcessProbe().process_table(), table)
+
+    def test_windows_process_table_oserror_propagates(self):
+        def raiser():
+            raise OSError("fail")
+        with mock.patch.object(sw, "IS_WINDOWS", True), \
+                mock.patch.object(sw._win, "process_table", raiser, create=True):
+            with self.assertRaises(OSError):
+                OsProcessProbe().process_table()
 
 
 # ---------------------------------------------------------------- Task 06
@@ -932,6 +1179,59 @@ class TestCheckPaneBinding(unittest.TestCase):
                 with self.subTest(table=name, env=env):
                     fault = self._check(table, env=env)
                     self.assertTrue(fault is None or (fault in sw.BINDING_FAULTS and fault != "table_unavailable"))
+
+
+def _win_shell_chain(n_shells, host="orca.exe"):
+    table = {1111: (9000, "claude.exe")}
+    for i in range(n_shells):
+        table[9000 + i] = (9000 + i + 1, "pwsh.exe")
+    table[9000 + n_shells] = (1, host)
+    return table
+
+
+class TestCheckPaneBindingWindows(unittest.TestCase):
+    """check_pane_binding's Windows branch: pwsh.exe/powershell.exe/bash.exe/sh.exe are shells, orca.exe is the
+    pane host, cmd.exe is a foreign ancestor, wsl.exe/ssh.exe are multiplexers (task brief item 4)."""
+
+    def _check(self, table, env=OK_ENV, handle="term_00000000"):
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            return check_pane_binding(1111, handle, table, env)
+
+    def test_pwsh_bound(self):
+        table = {1111: (20, "claude.exe"), 20: (30, "pwsh.exe"), 30: (1, "orca.exe")}
+        self.assertIsNone(self._check(table))
+
+    def test_bash_bound(self):
+        table = {1111: (20, "claude.exe"), 20: (30, "bash.exe"), 30: (1, "orca.exe")}
+        self.assertIsNone(self._check(table))
+
+    def test_cmd_exe_is_foreign_ancestor(self):
+        table = {1111: (20, "claude.exe"), 20: (30, "cmd.exe"), 30: (1, "orca.exe")}
+        self.assertEqual(self._check(table), "foreign_ancestor")
+
+    def test_mac_shell_name_not_recognised_on_windows(self):
+        table = {1111: (20, "claude.exe"), 20: (30, "zsh"), 30: (1, "orca.exe")}
+        self.assertEqual(self._check(table), "foreign_ancestor")
+
+    def test_wsl_is_multiplexer(self):
+        table = {1111: (20, "claude.exe"), 20: (1, "wsl.exe")}
+        self.assertEqual(self._check(table), "multiplexer")
+
+    def test_ssh_exe_is_multiplexer(self):
+        table = {1111: (20, "claude.exe"), 20: (1, "ssh.exe")}
+        self.assertEqual(self._check(table), "multiplexer")
+
+    def test_fifteen_shells_then_host_bound(self):
+        self.assertIsNone(self._check(_win_shell_chain(15)))
+
+    def test_sixteen_shells_hop_limit(self):
+        self.assertEqual(self._check(_win_shell_chain(16)), "hop_limit")
+
+    def test_env_multiplexer_and_handle_mismatch_still_apply(self):
+        table = {1111: (20, "claude.exe"), 20: (30, "pwsh.exe"), 30: (1, "orca.exe")}
+        env = ProcEnv(terminal_handle="term_00000000", present=frozenset({"TMUX"}))
+        self.assertEqual(self._check(table, env=env), "env_multiplexer")
+        self.assertEqual(self._check(table, env=ProcEnv(terminal_handle="other")), "handle_mismatch")
 
 
 # ---------------------------------------------------------------- Task 07: shared fake world
@@ -2368,6 +2668,65 @@ class TestTrustCopyPreflight(unittest.TestCase):
             res = w.run("soft", copy_trust=True, trust_backup_dir=BACKUP_DIR)
         self.assertEqual(res, HAPPY)
         self.assertEqual(seen, [ACC_NEW])
+
+
+WIN_CWD_BS = r"C:\Users\alice\proj"
+WIN_CWD_FS = "C:/Users/alice/proj"
+
+
+class TestTrustsWindowsSpelling(unittest.TestCase):
+    """On Windows, Claude Code may key a project by either path-separator spelling (task brief item 8)."""
+
+    def _trusts(self, projects, cwd):
+        def read_text(path):
+            return json.dumps({"projects": projects})
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            return sw._trusts(read_text, "/x/.claude.json", cwd)
+
+    def test_forward_slash_entry_found_for_backslash_cwd(self):
+        self.assertTrue(self._trusts({WIN_CWD_FS: {"hasTrustDialogAccepted": True}}, WIN_CWD_BS))
+
+    def test_backslash_entry_found_for_forward_slash_cwd(self):
+        self.assertTrue(self._trusts({WIN_CWD_BS: {"hasTrustDialogAccepted": True}}, WIN_CWD_FS))
+
+    def test_neither_spelling_present_untrusted(self):
+        self.assertFalse(self._trusts({"C:/Users/alice/other": {"hasTrustDialogAccepted": True}}, WIN_CWD_BS))
+
+    def test_off_windows_only_exact_spelling_matches(self):
+        def read_text(path):
+            return json.dumps({"projects": {WIN_CWD_FS: {"hasTrustDialogAccepted": True}}})
+        self.assertFalse(sw._trusts(read_text, "/x/.claude.json", WIN_CWD_BS))
+
+
+class TestTrustedDocWindowsSpelling(unittest.TestCase):
+    """mirror_trust's _trusted_doc writes under whichever spelling the target already has, or the given one
+    when neither spelling exists yet (task brief item 8)."""
+
+    def _doc(self, projects, cwd):
+        raw = json.dumps({"projects": projects}).encode("utf-8")
+        with mock.patch.object(sw, "IS_WINDOWS", True):
+            return sw._trusted_doc(raw, cwd)
+
+    def test_writes_existing_forward_slash_entry_for_backslash_cwd(self):
+        doc, changed = self._doc({WIN_CWD_FS: {"allowedTools": []}}, WIN_CWD_BS)
+        self.assertTrue(changed)
+        self.assertEqual(doc["projects"], {WIN_CWD_FS: {"allowedTools": [], "hasTrustDialogAccepted": True}})
+
+    def test_creates_under_given_spelling_when_neither_exists(self):
+        doc, changed = self._doc({}, WIN_CWD_BS)
+        self.assertTrue(changed)
+        self.assertEqual(doc["projects"], {WIN_CWD_BS: {"hasTrustDialogAccepted": True}})
+
+    def test_already_trusted_under_other_spelling_is_noop(self):
+        doc, changed = self._doc({WIN_CWD_FS: {"hasTrustDialogAccepted": True}}, WIN_CWD_BS)
+        self.assertFalse(changed)
+        self.assertEqual(doc["projects"], {WIN_CWD_FS: {"hasTrustDialogAccepted": True}})
+
+    def test_off_windows_uses_exact_cwd_key_only(self):
+        raw = json.dumps({"projects": {WIN_CWD_FS: {"allowedTools": []}}}).encode("utf-8")
+        doc, changed = sw._trusted_doc(raw, WIN_CWD_BS)
+        self.assertTrue(changed)
+        self.assertEqual(set(doc["projects"]), {WIN_CWD_FS, WIN_CWD_BS})
 
 
 class TestProceedPaths(unittest.TestCase):

@@ -5,9 +5,11 @@ import glob
 import json
 import logging
 import math
+import ntpath
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -16,8 +18,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Tuple
 
+from rotator import windows as _win
 from rotator.models import PROFILES_ROOT_DEFAULT, Profile, ReadText, Session
 from rotator.procutil import pid_alive as _cross_platform_pid_alive
+from rotator.windows import IS_WINDOWS
 
 logger = logging.getLogger("rotator.switcher")
 
@@ -29,7 +33,8 @@ REASONS = ("no_terminal_handle", "terminal_handle_invalid", "no_argv", "relaunch
            "pane_binding_unverified", "pane_not_claude", "registry_mismatch", "dialog_open", "not_idle",
            "send_refused", "interrupt_timeout", "screen_unreadable", "trust_dialog", "input_not_empty",
            "exit_timeout", "session_already_running", "ready_timeout", "launched_elsewhere",
-           "account_unverified", "wrong_account", "prompt_blocked_permission", "prompt_unconfirmed")
+           "account_unverified", "wrong_account", "prompt_blocked_permission", "prompt_unconfirmed",
+           "shell_unsupported", "orca_cli_unavailable")
 DEFAULT_CONTINUE_PROMPT = "계정 전환으로 세션이 재시작됐어. 중단된 작업을 이어서 진행해줘."
 MAX_PROMPT_CHARS = 800
 ENV_BINARY = "/usr/bin/env"
@@ -67,7 +72,16 @@ MAX_ANCESTOR_HOPS = 16
 SHELL_NAMES = frozenset({"sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh"})
 LOGIN_NAMES = frozenset({"login"})
 PANE_HOST_NAMES = frozenset({"orca-terminal-host"})
-MULTIPLEXER_NAMES = frozenset({"tmux", "screen", "zellij", "abduco", "dtach", "ssh", "sshd", "mosh-server"})
+MULTIPLEXER_NAMES = frozenset({"tmux", "screen", "zellij", "abduco", "dtach", "ssh", "sshd", "mosh-server",
+                               "wsl.exe", "ssh.exe"})
+# Windows pane-binding equivalents of SHELL_NAMES/PANE_HOST_NAMES above: Orca runs as Orca.exe there (and its
+# terminal daemon is the same Electron binary), lowercased to orca.exe; cmd.exe and anything else is foreign.
+WINDOWS_SHELL_NAMES = frozenset({"pwsh.exe", "powershell.exe", "bash.exe", "sh.exe"})
+WINDOWS_PANE_HOST_NAMES = frozenset({"orca.exe"})
+# Which relaunch-line shell matches the name of claude's direct parent process (relaunch_shell); any other
+# parent (cmd.exe, …) refuses the switch with REASONS "shell_unsupported".
+WINDOWS_SHELL_FOR_PARENT = {"pwsh.exe": "powershell", "powershell.exe": "powershell",
+                           "bash.exe": "posix", "sh.exe": "posix"}
 BINDING_FAULTS = ("table_unavailable", "chain_broken", "multiplexer", "foreign_ancestor", "hop_limit",
                   "env_unreadable", "env_multiplexer", "handle_mismatch", "no_shell")
 _RECOVERABLE_STATES = frozenset({"exited", "relaunched", "verified"})
@@ -283,20 +297,55 @@ def _valid_handle(h: object) -> bool:
             and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in h))
 
 
-def build_relaunch_command(session: Session, target_home: str) -> str:
-    """The one shell line typed after /exit; ValueError when the session cannot be re-emitted safely."""
+_SHELLS = ("posix", "powershell")
+# PowerShell closes a single-quoted string early on any of these, the way it would on an ASCII "'".
+_PS_QUOTE_VARIANTS = "‘’‚‛"
+
+
+def _pq(s: str) -> str:
+    """Single-quote one PowerShell token, doubling an embedded ``'``."""
+    return "'" + s.replace("'", "''") + "'"
+
+
+def _build_powershell(session: Session, target_home: str, kept: List[str]) -> str:
+    kept_part = "".join(" " + _pq(t) for t in kept)
+    return ("Set-Location -LiteralPath " + _pq(session.cwd) + "; $p=$env:CLAUDE_CONFIG_DIR; "
+            "$q=$env:ORCA_CLAUDE_INJECTED_CONFIG_DIR; try { $env:CLAUDE_CONFIG_DIR=" + _pq(target_home) + "; "
+            "$env:ORCA_CLAUDE_INJECTED_CONFIG_DIR=" + _pq(target_home) + "; & " + _pq(session.argv[0])
+            + " --resume " + _pq(session.session_id) + kept_part
+            + " } finally { $env:CLAUDE_CONFIG_DIR=$p; $env:ORCA_CLAUDE_INJECTED_CONFIG_DIR=$q }")
+
+
+def build_relaunch_command(session: Session, target_home: str, shell: str = "posix") -> str:
+    """The one line typed after /exit; ValueError when the session cannot be re-emitted safely.
+
+    ``shell`` picks the syntax: "posix" (macOS's shell, and Git Bash on Windows) or "powershell" (Windows
+    PowerShell/pwsh). On Windows (only, both shells), argv[0]'s basename may also be "claude.exe" and paths
+    may hold backslashes; "posix" still accepts only bare "claude" and forbids backslashes off Windows.
+    "powershell" quotes every token in single quotes and refuses a control character or one of the Unicode
+    quote variants PowerShell also treats as closing a single-quoted string.
+    """
+    if shell not in _SHELLS:
+        raise ValueError("relaunch: shell must be one of %r" % (_SHELLS,))
     if session.argv == ():
         raise ValueError("relaunch: empty argv")
-    if os.path.basename(session.argv[0]) != "claude":
+    basename = ntpath.basename(session.argv[0]) if IS_WINDOWS else os.path.basename(session.argv[0])
+    if not (basename == "claude" or (IS_WINDOWS and basename == "claude.exe")):
         raise ValueError("relaunch: argv[0] is not claude")
     if _SESSION_ID_RE.fullmatch(session.session_id) is None:
         raise ValueError("relaunch: session id not allowed")
-    if not os.path.isabs(session.cwd) or not os.path.isabs(target_home):
+    isabs = ntpath.isabs if IS_WINDOWS else os.path.isabs
+    if not isabs(session.cwd) or not isabs(target_home):
         raise ValueError("relaunch: cwd and target home must be absolute")
     kept = _preserved_args(session.argv)
-    for tok in [session.cwd, target_home, session.argv[0], session.session_id] + kept:
-        if any(ord(c) < 32 or ord(c) == 127 or c == "\\" for c in tok):
+    tokens = [session.cwd, target_home, session.argv[0], session.session_id] + kept
+    for tok in tokens:
+        if any(ord(c) < 32 or ord(c) == 127 or (c == "\\" and not IS_WINDOWS) for c in tok):
             raise ValueError("relaunch: control character or backslash")
+        if shell == "powershell" and any(c in _PS_QUOTE_VARIANTS for c in tok):
+            raise ValueError("relaunch: quote-variant character not allowed in PowerShell")
+    if shell == "powershell":
+        return _build_powershell(session, target_home, kept)
     # target_home stays verbatim: Claude Code derives the Keychain item name from the exact string.
     return ("cd " + _q(session.cwd) + " && " + ENV_BINARY + " CLAUDE_CONFIG_DIR=" + _q(target_home)
             + " ORCA_CLAUDE_INJECTED_CONFIG_DIR=" + _q(target_home) + " " + _q(session.argv[0])
@@ -308,7 +357,8 @@ def build_relaunch_command(session: Session, target_home: str) -> str:
 def _run_subprocess(argv: List[str], timeout_s: float) -> Tuple[int, str, str]:
     try:
         cp = subprocess.run(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            timeout=timeout_s, shell=False, check=False, encoding="utf-8", errors="replace")
+                            timeout=timeout_s, shell=False, check=False, encoding="utf-8", errors="replace",
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0)
     except subprocess.TimeoutExpired:
         return 124, "", "timeout"
     except OSError:
@@ -389,6 +439,56 @@ def _parse_screen(rc: int, out: str, err: str) -> ScreenReceipt:
                          draft=_str_or_none(term.get("draft")), agent_wait=agent_wait, raw=_raw(out, err))
 
 
+def windows_orca_cli_path(which: Optional[Callable[[str], Optional[str]]] = None) -> Optional[str]:
+    """Orca's CLI on Windows: ``orca.cmd`` (Orca's command name there), else an ``orca`` launcher in a ``bin``
+    folder (Orca ships both under ``resources\\bin``). The app's own ``Orca.exe`` also matches ``orca.exe``
+    because Windows names ignore case, but it is Electron and ``--version`` would open the app, so any hit
+    outside a ``bin`` folder is skipped. Shared with ``rotator.cli`` (its gate/doctor use) and
+    ``windows_orca_driver_binary`` below, since ``rotator.daemon`` cannot import ``rotator.cli`` (circular)."""
+    which = which or shutil.which
+    found = which("orca.cmd")
+    if found:
+        return found
+    for name in ("orca.exe", "orca"):
+        found = which(name)
+        if found and ntpath.basename(ntpath.dirname(found)).lower() == "bin":
+            return found
+    return None
+
+
+def windows_orca_driver_binary(which: Optional[Callable[[str], Optional[str]]] = None,
+                               isfile: Callable[[str], bool] = os.path.isfile) -> Optional[str]:
+    """The native ``orca.exe`` launcher OrcaCliDriver must use on Windows, resolved next to ``orca.cmd``; None
+    when no ``orca.exe`` exists there. Never ``orca.cmd``/``.bat``: Python runs those through ``cmd.exe``,
+    which re-parses the typed relaunch text (see OrcaCliDriver.send's own guard, task brief item 7)."""
+    found = windows_orca_cli_path(which)
+    if found is None:
+        return None
+    if found.lower().endswith((".cmd", ".bat")):
+        candidate = ntpath.join(ntpath.dirname(found), "orca.exe")
+        return candidate if isfile(candidate) else None
+    return found
+
+
+def relaunch_shell(procs: ProcessProbe, session: Session) -> Optional[str]:
+    """"posix" on macOS; on Windows, "powershell" or "posix" per the name of claude's direct parent process in
+    ``procs``'s process table, or None when that parent is not pwsh.exe/powershell.exe/bash.exe/sh.exe
+    (REASONS "shell_unsupported", task brief item 5)."""
+    if not IS_WINDOWS:
+        return "posix"
+    try:
+        table = procs.process_table()
+    except OSError:
+        return None
+    entry = table.get(session.pid)
+    if entry is None:
+        return None
+    parent = table.get(entry[0])
+    if parent is None:
+        return None
+    return WINDOWS_SHELL_FOR_PARENT.get(_proc_name(parent[1]))
+
+
 class OrcaCliDriver:
     """TerminalDriver over the ``orca terminal`` CLI. Logs nothing: its output may hold pane text."""
 
@@ -400,6 +500,10 @@ class OrcaCliDriver:
     def send(self, handle: str, text: Optional[str], *, enter: bool, interrupt: bool) -> SendReceipt:
         if not _valid_handle(handle):
             raise ValueError("invalid terminal handle")
+        if IS_WINDOWS and self._binary.lower().endswith((".cmd", ".bat")):
+            # cmd.exe re-parses a .cmd/.bat's arguments; the typed relaunch text could break out of it or
+            # inject a command (&, |, %, ^, "). The native orca.exe launcher next to it never has this problem.
+            raise ValueError("orca cli binary must not be a .cmd/.bat launcher on Windows")
         if text is not None and (text == "" or text.startswith("-")):
             raise ValueError("text would be parsed as an orca option")
         argv = [self._binary, "terminal", "send", "--terminal", handle]
@@ -441,6 +545,15 @@ def _parse_env(line: str) -> ProcEnv:
     return ProcEnv(config_dir=cfg[-1] if cfg else None, terminal_handle=hdl[-1] if hdl else None, present=present)
 
 
+def _parse_env_windows(env: Mapping[str, str]) -> ProcEnv:
+    """ProcEnv from read_proc's env dict: Claude Code's own casing is exact, but look the keys up
+    case-insensitively since nothing guarantees it (see OsProcessProbe.read_env, task brief item 4)."""
+    lower = {k.lower(): v for k, v in env.items()}
+    present = frozenset(k for k in ENV_PRESENCE_KEYS if k.lower() in lower)
+    return ProcEnv(config_dir=lower.get("claude_config_dir"), terminal_handle=lower.get("orca_terminal_handle"),
+                   present=present)
+
+
 def _parse_process_table(stdout: str) -> Dict[int, Tuple[int, str]]:
     table: Dict[int, Tuple[int, str]] = {}
     for line in stdout.splitlines():
@@ -474,6 +587,12 @@ class OsProcessProbe:
         return True
 
     def read_env(self, pid: int) -> Optional[ProcEnv]:
+        if IS_WINDOWS:
+            try:
+                _, _, env = _win.read_proc(pid)
+            except OSError:
+                return None
+            return _parse_env_windows(env)
         rc, out, _ = self._run([PS_BINARY, "-E", "-ww", "-o", "command=", "-p", str(pid)], PS_TIMEOUT_S)
         if rc != 0:
             return None
@@ -481,6 +600,8 @@ class OsProcessProbe:
         return _parse_env(line)
 
     def process_table(self) -> Mapping[int, Tuple[int, str]]:
+        if IS_WINDOWS:
+            return _win.process_table()
         rc, out, _ = self._run([PS_BINARY, "-A", "-o", "pid=,ppid=,comm="], PS_TIMEOUT_S)
         if rc != 0:
             raise OSError("process table unavailable")
@@ -585,6 +706,8 @@ def check_pane_binding(pid: int, handle: str, table: Mapping[int, Tuple[int, str
     if pid not in table:
         return "chain_broken"
     cur = table[pid][0]
+    shell_names = WINDOWS_SHELL_NAMES if IS_WINDOWS else SHELL_NAMES
+    pane_host_names = WINDOWS_PANE_HOST_NAMES if IS_WINDOWS else PANE_HOST_NAMES
     verified = False
     shells = 0
     for _ in range(MAX_ANCESTOR_HOPS):
@@ -594,11 +717,11 @@ def check_pane_binding(pid: int, handle: str, table: Mapping[int, Tuple[int, str
         name = _proc_name(comm)
         if name in MULTIPLEXER_NAMES:
             return "multiplexer"
-        if name in SHELL_NAMES or name in LOGIN_NAMES:
-            shells += name in SHELL_NAMES
+        if name in shell_names or (not IS_WINDOWS and name in LOGIN_NAMES):
+            shells += name in shell_names
             cur = ppid
             continue
-        if name in PANE_HOST_NAMES:
+        if name in pane_host_names:
             verified = True
             break
         return "foreign_ancestor"
@@ -760,22 +883,45 @@ def _source_trusted(run: _Run) -> bool:
     return _trusts(run.read_text, os.path.join(run.session.config_dir, ".claude.json"), run.session.cwd)
 
 
+def _spelling_variants(path: str) -> List[str]:
+    """``path``, and on Windows only its forward-slash and backslash twins: Claude Code there may key a
+    project by either separator spelling (task brief item 8), whichever ``path`` itself uses."""
+    if not IS_WINDOWS:
+        return [path]
+    out = [path]
+    for alt in (path.replace("\\", "/"), path.replace("/", "\\")):
+        if alt not in out:
+            out.append(alt)
+    return out
+
+
+def _trust_keys(cwd: str) -> List[str]:
+    """``cwd`` and its ancestors, each as every spelling ``_spelling_variants`` allows."""
+    # Claude Code accepts any trusted ancestor, git root or not: a session runs in a worktree
+    # (.git file) whose only trusted entry is the parent repository folder.
+    dirname = ntpath.dirname if IS_WINDOWS else os.path.dirname
+    d = cwd
+    candidates: List[str] = []
+    for _ in range(64):
+        candidates.append(d)
+        parent = dirname(d)
+        if parent == d:
+            break
+        d = parent
+    if not IS_WINDOWS:
+        return candidates
+    out: List[str] = []
+    for c in candidates:
+        out.extend(_spelling_variants(c))
+    return out
+
+
 def _trusts(read_text: ReadText, config_path: str, cwd: str) -> bool:
     cfg = _read_registry(read_text, config_path)
     projects = cfg.get("projects") if cfg else None
     if not isinstance(projects, dict):
         return False
-    # Claude Code accepts any trusted ancestor, git root or not: a session runs in a worktree
-    # (.git file) whose only trusted entry is the parent repository folder.
-    d = cwd
-    candidates: List[str] = []
-    for _ in range(64):
-        candidates.append(d)
-        parent = os.path.dirname(d)
-        if parent == d:
-            break
-        d = parent
-    for c in candidates:
+    for c in _trust_keys(cwd):
         entry = projects.get(c)
         if isinstance(entry, dict) and entry.get(TRUST_KEY) is True:
             return True
@@ -798,7 +944,13 @@ def _trusted_doc(raw: bytes, cwd: str) -> Optional[Tuple[dict, bool]]:
     projects = doc.setdefault("projects", {})
     if not isinstance(projects, dict):
         return None
-    entry = projects.setdefault(cwd, {})
+    key = cwd
+    if IS_WINDOWS:
+        for variant in _spelling_variants(cwd):
+            if isinstance(projects.get(variant), dict):
+                key = variant
+                break
+    entry = projects.setdefault(key, {})
     if not isinstance(entry, dict):
         return None
     if entry.get(TRUST_KEY) is True:
@@ -906,8 +1058,11 @@ def _preflight(run: _Run) -> Optional[SwitchResult]:
     logger.debug("switch handle=%s", s.terminal_handle)
     if s.argv == ():
         return fail("no_argv")
+    ok, shell = _guarded(relaunch_shell, run.procs, s)
+    if not ok or shell is None:
+        return fail("shell_unsupported")
     try:
-        run.line = build_relaunch_command(s, target.home)
+        run.line = build_relaunch_command(s, target.home, shell=shell)
     except ValueError:
         return fail("relaunch_unbuildable")
     if os.path.normpath(target.home) == os.path.normpath(s.config_dir):

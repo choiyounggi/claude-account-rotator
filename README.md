@@ -90,7 +90,8 @@ has a default. From a checkout, run `bin/rotator` instead of `rotator`
 Windows support now covers `doctor`, the dashboard, `install`/`uninstall` (a Task Scheduler task) and the
 daemon with pointer correction — repointing Orca's `selected-host` so a *new* session starts on the account
 with the most headroom. Automatic switching of a session that is already running, and `rotator switch`, are
-still macOS-only (stage 3): the daemon never drives Orca's terminal on Windows this release.
+off by default on Windows; set `experimental_windows_switch: true` to turn them on (see
+"Experimental: switching a running session" below).
 
 **Works today**: `rotator doctor` (OS-aware checks: Orca's version via `orca.cmd --version`, the orca CLI on
 PATH, Claude accounts under `%APPDATA%\orca\claude-profiles`, the Task Scheduler task), the dashboard
@@ -128,14 +129,35 @@ rotator status --watch
   within 90 seconds.
 - Under the task there is no console: anything the daemon would print before its log starts, including a crash
   traceback, goes to `rotator-console.log` in the log folder.
-- **Not yet supported**: `rotator switch` refuses with one clear line and exit code 2. The daemon never switches
-  a session that is already running; it logs `event=auto_switch_unavailable os=windows` once at start and keeps
-  correcting `selected-host` (both still follow `auto_switch`, `pointer_correction` and `dry_run` as on macOS).
+- **Off by default**: without `experimental_windows_switch: true`, `rotator switch` refuses with one clear line
+  and exit code 2 (`--dry-run` still works: it sends nothing). The daemon never switches a session that is
+  already running; it logs `event=auto_switch_unavailable os=windows` once at start and keeps correcting
+  `selected-host` (both still follow `auto_switch`, `pointer_correction` and `dry_run` as on macOS).
 - **Limits**: a profile's home must be on NTFS; FAT/exFAT's weaker file-locking identity is not supported for
   token refresh there.
 
 This has been verified in CI only (GitHub Actions `windows-latest`, Python 3.9 and 3.12) — it has not yet been
 run on a real Windows machine.
+
+### Experimental: switching a running session
+
+Set `experimental_windows_switch: true` to let the daemon and `rotator switch` drive a live session's Orca pane
+on Windows, the same way they do on macOS (interrupt, `/exit`, then a relaunch line with the other account's
+`CLAUDE_CONFIG_DIR`). It logs `event=auto_switch_experimental os=windows` once at start instead of
+`auto_switch_unavailable`.
+
+- **Supported shells**: PowerShell (`pwsh.exe`, `powershell.exe`) and Git Bash (`bash.exe`, `sh.exe`), detected
+  from the name of `claude`'s direct parent process. `cmd.exe` and anything else refuse the switch
+  (`shell_unsupported`) rather than guess at quoting rules neither shell uses.
+- **Not supported**: `cmd.exe`, WSL (`wsl.exe`) and an SSH session (`ssh.exe`) are treated as a foreign terminal,
+  the same way `tmux`/`screen` are on macOS.
+- **The Orca CLI binary**: Orca ships `resources\bin\orca.cmd` (a batch file) next to a native
+  `resources\bin\orca.exe` launcher. The rotator always drives the native `orca.exe`, never `orca.cmd`: Python
+  runs a `.cmd` through `cmd.exe`, which re-parses the typed relaunch text, and a path or argument containing
+  `& | % ^ "` could break out of it or inject a command. When no `orca.exe` exists next to `orca.cmd`, the
+  rotator refuses to switch (`orca_cli_unavailable`) instead of risking `cmd.exe`.
+- **Verified in CI only**: like the rest of Windows support, this has not been run by hand on a real Windows
+  machine.
 
 ## Doctor
 
@@ -591,6 +613,7 @@ starts with the key.
 | `copy_trust` | `true` | `true` / `false`; mirror the session's own folder trust into the target account (see "Getting past refusals") |
 | `accept_trust_dialog` | `true` | `true` / `false`; switch untrusted targets anyway and answer the trust dialog for exactly the session's folder after the relaunch (see "Getting past refusals") |
 | `profiles_root` | `~/Library/Application Support/orca/claude-profiles` | absolute path (`~` expanded) |
+| `experimental_windows_switch` | `false` | `true` / `false`; on Windows, opt into `rotator switch` and the daemon's automatic switching of a live session (PowerShell and Git Bash only, not `cmd.exe`; verified in CI only, see "Windows"). macOS ignores it. |
 
 Numbers must be finite and not `true`/`false`.
 

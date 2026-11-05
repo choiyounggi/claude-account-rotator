@@ -42,12 +42,12 @@ from rotator.daemon import (
 )
 from rotator.policy import decide
 from rotator.sessions import session_homes
-from rotator.switcher import ORCA_BINARY_DEFAULT, build_relaunch_command, result_hint
+from rotator.switcher import ORCA_BINARY_DEFAULT, build_relaunch_command, relaunch_shell, result_hint
 
 WINDOWS_UNSUPPORTED_COMMANDS: Tuple[str, ...] = ("switch",)
 WINDOWS_UNSUPPORTED_MESSAGE = (
-    "rotator %s is not available on Windows yet: switching a running session automatically "
-    "comes in a later release"
+    "rotator %s is not available on Windows yet: set experimental_windows_switch=true in the config to enable "
+    "it (see README), or add --dry-run to preview without sending anything"
 )
 # Under pythonw.exe sys.stdout/sys.stderr are None; an early-exit message that would otherwise vanish is
 # appended here instead.
@@ -820,6 +820,7 @@ _SWITCH_REASONS = {
     "session_already_running": "이미 실행 중", "ready_timeout": "재시작 시간 초과",
     "launched_elsewhere": "다른 계정으로 실행됨", "account_unverified": "계정 미확인", "wrong_account": "잘못된 계정",
     "prompt_blocked_permission": "권한 확인창", "prompt_unconfirmed": "이어가기 미확인",
+    "shell_unsupported": "지원하지 않는 셸", "orca_cli_unavailable": "orca 실행 파일 없음",
 }
 _SWITCH_STATES = {
     "interrupted": "작업만 중단됨", "exit_pending": "종료 확인 안 됨", "exited": "종료 후 재실행 미확인",
@@ -1272,7 +1273,13 @@ def _windows_orca_cli_path(which: Optional[Callable[[str], Optional[str]]] = Non
     """Orca's CLI on Windows: ``orca.cmd`` (Orca's command name there), else an ``orca`` launcher in a ``bin``
     folder (Orca ships both under ``resources\\bin``). The app's own ``Orca.exe`` also matches ``orca.exe``
     because Windows names ignore case, but it is Electron and ``--version`` would open the app, so any hit
-    outside a ``bin`` folder is skipped."""
+    outside a ``bin`` folder is skipped.
+
+    Same algorithm as ``rotator.switcher.windows_orca_cli_path``, kept as a separate function here (not an
+    import alias) so this module's own ``shutil.which`` stays the patchable default for this module's tests;
+    ``rotator.daemon`` cannot import this module (circular: this module imports from ``rotator.daemon``), so
+    it uses the switcher copy to resolve OrcaCliDriver's binary.
+    """
     which = which or shutil.which
     found = which("orca.cmd")
     if found:
@@ -1309,7 +1316,8 @@ def _doctor(cfg: Config, deps: Deps, out: TextIO, stale: bool, config_error: Opt
                   doctor.check_orca(version, where=WINDOWS_ORCA_CLI_WHERE),
                   doctor.check_orca_cli(cli_path or "orca.cmd", cli_path is not None),
                   doctor.check_accounts(count, cfg.profiles_root),
-                  doctor.check_agent(installed, stale, supported=True)]
+                  doctor.check_agent(installed, stale, supported=True),
+                  doctor.check_experimental_switch(cfg.experimental_windows_switch)]
     else:
         checks = [doctor.check_system(system), doctor.check_python(sys.version_info[:3]),
                   doctor.check_config(config_error),
@@ -1375,7 +1383,8 @@ def main(argv: Optional[Sequence[str]] = None, *, make_deps: Optional[Callable[[
                 return 2
             config_error = str(e)
             cfg = Config(state_dir=CONFIG_DIR_DEFAULT)
-        if args.command in WINDOWS_UNSUPPORTED_COMMANDS and platform.system() == "Windows":
+        if (args.command in WINDOWS_UNSUPPORTED_COMMANDS and platform.system() == "Windows"
+                and not cfg.experimental_windows_switch and not getattr(args, "dry_run", False)):
             print(WINDOWS_UNSUPPORTED_MESSAGE % args.command, file=err)
             return 2
         if orca_gate is None and make_deps is None and launchctl is None:
@@ -1544,8 +1553,13 @@ def _switch(args: argparse.Namespace, cfg: Config, deps: Deps, out: TextIO, err:
         print("decide: action=%s target=%s reason=%s (cooldown not applied in this preview)"
               % (d.action, d.target.account_id if d.target else "-", d.reason), file=out)
         try:
-            print("relaunch preview: " + build_relaunch_command(s, target.home), file=out)
-        except ValueError as e:
+            shell = relaunch_shell(deps.procs, s)
+            if shell is None:
+                raise ValueError("no supported shell found for this session (shell_unsupported)")
+            print("relaunch preview: " + build_relaunch_command(s, target.home, shell=shell), file=out)
+        except Exception as e:
+            # relaunch_shell only fails closed on OSError from deps.procs.process_table(); a misbehaving
+            # seam raising anything else must still read as "unavailable", not crash the preview command.
             print("relaunch preview unavailable: %s" % e, file=out)
         print("dry run: nothing was sent", file=out)
         return 0
