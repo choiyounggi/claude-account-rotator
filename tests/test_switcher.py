@@ -825,8 +825,15 @@ class TestRunSubprocessCreationFlags(unittest.TestCase):
         self.assertEqual(seen.get("creationflags"), 0x08000000)
 
     def test_macos_passes_zero(self):
-        rc, out, err = sw._run_subprocess(["/usr/bin/true"], 5.0)
-        self.assertEqual(rc, 0)
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen.update(kw)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(sw.subprocess, "run", fake_run):  # IS_WINDOWS is off for this module
+            rc, _, _ = sw._run_subprocess([B, "x"], 1.0)
+        self.assertEqual((rc, seen.get("creationflags")), (0, 0))
 
 
 WIN_ORCA_CMD = r"C:\Users\someone\AppData\Local\Programs\Orca\resources\bin\orca.cmd"

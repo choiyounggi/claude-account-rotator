@@ -311,9 +311,28 @@ class RealWindowsReadProcTests(unittest.TestCase):
     def test_read_proc_reads_real_argv_and_env(self):
         exec_path, argv, env = windows.read_proc(self.child.pid)
         self.assertEqual(argv[-2:], ("ARG ONE", "x"))
-        # Names only on failure: values can hold CI secrets.
+        # Names only on failure (values can hold CI secrets), plus where the block read went.
         self.assertEqual(env.get("ORCA_TERMINAL_HANDLE"), "term_fake123",
-                         "read %d variables: %s" % (len(env), sorted(env)))
+                         "read %d variables: %s; %s" % (len(env), sorted(env), self._env_probe()))
+
+    def _env_probe(self):
+        """Where read_proc's environment read went: the pointers it follows and the first page it reads."""
+        h = windows._default_open_vm_handle(self.child.pid)
+        try:
+            peb = windows._default_peb_address(h)
+            params = struct.unpack("<Q", windows._default_read_memory(h, peb + 0x20, 8))[0]
+            env_ptr = struct.unpack("<Q", windows._default_read_memory(h, params + 0x80, 8))[0]
+            size = struct.unpack("<Q", windows._default_read_memory(h, params + 0x3F0, 8))[0]
+            try:
+                first = windows._default_read_memory(h, env_ptr, 4096 - env_ptr % 4096)
+                head = "first read %d bytes, head %s" % (len(first), first[:32].hex())
+            except OSError as e:
+                head = "first read failed: %s" % e
+            return "peb=%#x params=%#x env=%#x EnvironmentSize=%d %s" % (peb, params, env_ptr, size, head)
+        except Exception as e:  # diagnostics only
+            return "probe failed: %r" % (e,)
+        finally:
+            windows._default_close_handle(h)
         self.assertEqual(env.get("CLAUDE_CONFIG_DIR"), r"C:\fake\home")
 
     def test_process_table_includes_child_with_parent_and_image_name(self):
