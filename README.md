@@ -225,7 +225,7 @@ npm uninstall -g claude-account-rotator   # after `rotator uninstall`, for an np
   never a pattern), removes the plist, then removes exactly `app/` under the state dir — only if it is a real
   directory there; a symlink or file in its place is reported and left alone.
 - The agent runs `/usr/bin/python3 <state dir>/app/bin/rotator --config <abs path> daemon` from `<state dir>/app`
-  with `RunAtLoad` and `KeepAlive`. Its `ExitTimeOut` is computed from `timeouts` at install time (615 s with the
+  with `RunAtLoad` and `KeepAlive`. Its `ExitTimeOut` is computed from `timeouts` at install time (695 s with the
   defaults: one full switch plus margin), so re-run `rotator install` after changing `timeouts`.
 - Run `rotator uninstall` before running `rotator daemon` in the foreground. Otherwise the second copy finds the
   daemon lock held and exits 1, and with `KeepAlive` launchd restarts the agent copy every 10 s
@@ -607,6 +607,7 @@ starts with the key.
 | `timeouts.ready_s` | `60` | number >= 0 |
 | `timeouts.prompt_s` | `15` | number >= 0 |
 | `timeouts.poll_s` | `0.5` | number > 0 |
+| `timeouts.screen_s` | `5` | number >= 0; how long a screen read is repeated while it is unreadable right after a relaunch or a Ctrl-C, and while the typed `/exit` has not shown up in the input box |
 | `continue_prompt` | `계정 전환으로 세션이 재시작됐어. 중단된 작업을 이어서 진행해줘.` | one non-empty line of at most 800 characters, no control characters, not starting with `-` or `/` |
 | `dry_run` | `false` | `true` / `false` |
 | `auto_switch` | `true` | `true` / `false` |
@@ -665,8 +666,13 @@ Numbers must be finite and not `true`/`false`.
    `pane_binding_unverified`, which the rotator marks unswitchable (fails closed).
 3. If a pane respawns its shell before the session registry is written, the relaunch line could be typed into
    the respawned shell.
-4. There is an unavoidable window between reading the screen and sending `/exit` or the continue prompt; a
-   keystroke typed by the user in that window is mixed with the rotator's input.
+4. There is an unavoidable window between reading the screen and sending the continue prompt, or pressing Enter
+   after `/exit`; a keystroke typed by the user in that window is mixed with the rotator's input. `/exit` is
+   typed without Enter first and submitted only when the input box then reads exactly `/exit`. Otherwise the
+   five characters are erased with backspaces, but only while the box ends with `/exit`: the switch stops as
+   `exit_unconfirmed` and is retried after `cooldown_s` (soft switches included). When the box does not end with
+   `/exit`, or the erase is not accepted, `/exit` is left for the user to remove (`exit_left_typed`) and that
+   process is not switched again until it is replaced.
 5. Hard mode may restore the cancelled prompt into the input box after Ctrl-C, which ends the attempt at the
    exit step as `interrupted` / `input_not_empty`. The process is retried in soft mode, which in turn waits
    until the input box is empty, so the session stays put until the user clears or sends that text.

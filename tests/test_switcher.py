@@ -60,7 +60,9 @@ class FakeClock:
 
 class TestVocabulary(unittest.TestCase):
     def test_reasons_unique_and_complete(self):
-        self.assertEqual(len(sw.REASONS), 30)
+        self.assertEqual(len(sw.REASONS), 32)
+        self.assertIn("exit_unconfirmed", sw.REASONS)
+        self.assertIn("exit_left_typed", sw.REASONS)
         self.assertEqual(len(set(sw.REASONS)), len(sw.REASONS))
         self.assertIn("shell_unsupported", sw.REASONS)
         self.assertIn("orca_cli_unavailable", sw.REASONS)
@@ -111,6 +113,14 @@ class TestTimeouts(unittest.TestCase):
         self.assertEqual(t.ready_s, 60.0)
         self.assertEqual(t.prompt_s, 15.0)
         self.assertEqual(t.poll_s, 0.5)
+        self.assertEqual(t.screen_s, 5.0)
+
+    def test_screen_s_validated(self):
+        self.assertEqual(Timeouts(screen_s=0).screen_s, 0)
+        with self.assertRaises(ValueError):
+            Timeouts(screen_s=-1)
+        with self.assertRaises(ValueError):
+            Timeouts(screen_s=float("nan"))
 
     def test_ints_accepted(self):
         t = Timeouts(exit_s=5, poll_s=1)
@@ -261,20 +271,22 @@ class TestWaitUntil(unittest.TestCase):
 
 
 class TestSwitchBudget(unittest.TestCase):
-    def test_default_budget_is_555(self):
+    def test_default_budget_is_635(self):
         # Two exit windows (each may overrun by one screen read) and one confirm send; one screen read and one
-        # trust-dialog key for the ready wait.
-        self.assertEqual(switch_budget_s(Timeouts()), 555.0)
+        # trust-dialog key for the ready wait; three screen windows, the /exit read-back's read and its Enter.
+        self.assertEqual(switch_budget_s(Timeouts()), 635.0)
 
     def test_budget_tracks_timeouts(self):
-        t = Timeouts(idle_s=0, exit_s=0, shell_s=0, ready_s=0, prompt_s=0)
-        self.assertEqual(switch_budget_s(t), 385.0)
+        t = Timeouts(idle_s=0, exit_s=0, shell_s=0, ready_s=0, prompt_s=0, screen_s=0)
+        self.assertEqual(switch_budget_s(t), 450.0)
+        self.assertEqual(switch_budget_s(dataclasses.replace(t, screen_s=2.0)), 456.0)
 
     def test_budget_covers_exit_confirm_and_trust_calls(self):
         base = 4 * sw.ORCA_CALL_TIMEOUT_S + 3 * sw.ORCA_SEND_TIMEOUT_S + 5.0 + 5 * sw.PS_TIMEOUT_S
-        t = Timeouts(idle_s=0, exit_s=0, shell_s=0, ready_s=0, prompt_s=0)
-        # Two exit windows each overrun by one read; one exit-confirm and one trust-dialog key.
-        self.assertEqual(switch_budget_s(t) - base, 3 * sw.ORCA_CALL_TIMEOUT_S + 2 * sw.ORCA_SEND_TIMEOUT_S)
+        t = Timeouts(idle_s=0, exit_s=0, shell_s=0, ready_s=0, prompt_s=0, screen_s=0)
+        # Two exit windows each overrun by one read; one exit-confirm and one trust-dialog key; the /exit read-back
+        # overruns by one read and is followed by one more send.
+        self.assertEqual(switch_budget_s(t) - base, 4 * sw.ORCA_CALL_TIMEOUT_S + 3 * sw.ORCA_SEND_TIMEOUT_S)
 
 
 # ---------------------------------------------------------------- Task 03
@@ -1107,8 +1119,51 @@ class TestClassifyScreen(unittest.TestCase):
         s = _screen("❯ ", below=("Do you want to proceed?", "Trust this directory?"))
         self.assertEqual(classify_screen(s), "trust_dialog")
 
-    def test_draft_ignored(self):
-        self.assertIsNone(classify_screen(dataclasses.replace(EMPTY_SCREEN, draft="queued text")))
+    def test_draft_is_typed_text(self):
+        # Orca 1.4.242 moves what is typed in the input box out of tail and into draft (issue #22).
+        self.assertEqual(classify_screen(dataclasses.replace(EMPTY_SCREEN, draft="queued text")), "input_not_empty")
+
+    def test_placeholder_shaped_draft_is_typed_text(self):
+        # Orca leaves its placeholder out of draft, so text shaped like it was typed by the user.
+        s = dataclasses.replace(EMPTY_SCREEN, draft='Try "x" then "y"')
+        self.assertEqual(classify_screen(s), "input_not_empty")
+
+    def test_blank_draft_is_empty(self):
+        self.assertIsNone(classify_screen(dataclasses.replace(EMPTY_SCREEN, draft="")))
+        self.assertIsNone(classify_screen(dataclasses.replace(EMPTY_SCREEN, draft=" \n ")))
+
+    def test_draft_without_rules_is_input_not_empty(self):
+        s = ScreenReceipt(ok=True, source="screen", tail=("● answer", "❯"), draft="초안")
+        self.assertEqual(classify_screen(s), "input_not_empty")
+
+    def test_dialog_wins_over_draft(self):
+        s = dataclasses.replace(_screen("❯ ", below=("Do you want to proceed?",)), draft="x")
+        self.assertEqual(classify_screen(s), "dialog_open")
+
+
+class TestInputText(unittest.TestCase):
+    def test_draft_wins_over_tail(self):
+        self.assertEqual(sw.input_text(dataclasses.replace(_screen("❯ "), draft=" 초안/exit ")), "초안/exit")
+
+    def test_tail_text_without_draft(self):
+        self.assertEqual(sw.input_text(_screen("❯ /exit")), "/exit")
+
+    def test_empty_and_placeholder(self):
+        self.assertEqual(sw.input_text(EMPTY_SCREEN), "")
+        self.assertEqual(sw.input_text(_screen('❯ Try "fix lint errors"')), "")
+
+    def test_no_input_box(self):
+        self.assertIsNone(sw.input_text(ScreenReceipt(ok=False)))
+        self.assertIsNone(sw.input_text(_screen("❯ ", source="screen-unavailable")))
+        self.assertIsNone(sw.input_text(ScreenReceipt(ok=True, source="screen", tail=())))
+
+    def test_shape_carries_no_text(self):
+        rec = dataclasses.replace(_screen("❯ SECRETINPUT", above=("SECRETABOVE",)), draft="SECRETDRAFT")
+        shape = sw.screen_shape(rec)
+        self.assertEqual(shape, "ok=True source=screen lines=5 rules=[1, 3] input_len=11 draft_len=11")
+        self.assertNotIn("SECRET", shape)
+        self.assertEqual(sw.screen_shape(ScreenReceipt(ok=False)),
+                         "ok=False source=None lines=0 rules=[] input_len=- draft_len=0")
 
 
 def _shell_chain(n_shells):
@@ -1382,11 +1437,21 @@ def _raise_or_return(value):
 
 
 class FakeDriver:
+    """Scripted driver with a model of the input box, ``pre`` + ``typed``: ``pre`` is user text the scripted
+    ``screens`` do not show (issue #22), ``typed`` what the switcher typed without Enter. An Enter submits the box,
+    backspaces erase from its end, a refused send changes nothing. While something is typed, a screen read returns
+    ``readback`` screens instead of ``screens``; by default the box as Orca 1.4.242 reports it, in ``draft``."""
+
     def __init__(self):
         self.calls = []
         self.script = {}
         self.screens = []
+        self.readback = []
         self.waits = []
+        self.pre = ""
+        self.typed = ""
+        self.submitted = []
+        self.confirmed = False
 
     @staticmethod
     def _kind(text, interrupt):
@@ -1400,24 +1465,57 @@ class FakeDriver:
             return "down"
         if text == "/exit":
             return "exit"
+        if text and set(text) == {sw.KEY_BACKSPACE}:
+            return "backspace"
         if text.startswith("cd "):
             return "relaunch"
         return "prompt"
+
+    def _type(self, kind, text, enter):
+        if kind == "backspace":
+            box = (self.pre + self.typed)[:-len(text)]
+            self.pre, self.typed = box[:len(self.pre)], box[len(self.pre):]
+        elif kind == "enter":
+            if self.typed:
+                self.submitted.append(self.pre + self.typed)
+                self.pre = self.typed = ""
+            elif self.exit_submitted():
+                self.confirmed = True
+        elif kind == "digit" and self.exit_submitted():
+            self.confirmed = True
+        elif kind in ("exit", "prompt", "relaunch"):
+            if enter:
+                self.submitted.append(self.pre + self.typed + text)
+                self.pre = self.typed = ""
+            else:
+                self.typed += text
+
+    def exit_submitted(self):
+        return "/exit" in self.submitted
 
     def send(self, handle, text, *, enter, interrupt):
         self.calls.append(("send", handle, text, enter, interrupt))
         kind = self._kind(text, interrupt)
         queue = self.script.get(kind)
         if queue:
-            return _raise_or_return(queue.pop(0))
-        if kind == "prompt":
-            return SendReceipt(
+            r = queue.pop(0)
+        elif kind == "prompt":
+            r = SendReceipt(
                 "accepted", stages=("input_accepted", "turn_started"), observation="turn_started", request_id="req-1"
             )
-        return SendReceipt("accepted")
+        else:
+            r = SendReceipt("accepted")
+        # A raising or unconfirmed send is modelled as delivered; only a refusal leaves the box alone.
+        if not (isinstance(r, SendReceipt) and r.delivery == "refused"):
+            self._type(kind, text, enter)
+        return _raise_or_return(r)
 
     def read_screen(self, handle):
         self.calls.append(("read_screen", handle))
+        if self.typed:
+            if self.readback:
+                return _raise_or_return(self.readback.pop(0))
+            return dataclasses.replace(EMPTY_SCREEN, draft=self.pre + self.typed)
         return _raise_or_return(self.screens.pop(0)) if self.screens else EMPTY_SCREEN
 
     def wait_for(self, handle, condition, timeout_ms):
@@ -1458,8 +1556,8 @@ class FakeProcs:
             return v
         if pid == OLD_PID:
             if self.exit_needs_confirm:
-                return not (self.driver.sent("exit") and (self.driver.sent("enter") or self.driver.sent("digit")))
-            return not self.driver.sent("exit")
+                return not (self.driver.exit_submitted() and self.driver.confirmed)
+            return not self.driver.exit_submitted()
         if pid == NEW_PID:
             return self.driver.sent("relaunch")
         return False
@@ -1939,6 +2037,191 @@ class TestPreExit(unittest.TestCase):
         self.assertIs(w.driver.sent("interrupt"), False)
 
 
+DRAFT_SCREEN = dataclasses.replace(EMPTY_SCREEN, draft="보내지 않은 초안")
+BACKSPACES = sw.KEY_BACKSPACE * 5
+
+
+class TestExitReadBack(unittest.TestCase):
+    """Issue #22: /exit is typed, read back, and submitted only when the input box holds exactly /exit."""
+
+    def _stopped(self, state="untouched"):
+        return result("exit", "exit_unconfirmed", state)
+
+    def _left(self, state="untouched"):
+        return result("exit", "exit_left_typed", state)
+
+    def test_draft_seen_before_exit_types_nothing(self):
+        w = World()
+        w.driver.screens = [DRAFT_SCREEN]
+        self.assertEqual(w.run("soft"), result("exit", "input_not_empty", "untouched"))
+        self.assertEqual(w.driver.calls, [("read_screen", HANDLE)])
+
+    def test_hidden_draft_in_front_of_exit_is_kept_and_nothing_submitted(self):
+        w = World()
+        w.driver.pre = "보내지 않은 초안"  # in the box, but not on the screen the pre-check read
+        with self.assertLogs("rotator.switcher", "INFO") as cm:
+            self.assertEqual(w.run("soft"), self._stopped())
+        self.assertEqual(w.driver.calls, [
+            ("read_screen", HANDLE),
+            ("send", HANDLE, "/exit", False, False),
+            ("read_screen", HANDLE),
+            ("send", HANDLE, BACKSPACES, False, False),
+        ])
+        self.assertEqual(w.driver.submitted, [])
+        self.assertEqual((w.driver.pre, w.driver.typed), ("보내지 않은 초안", ""))
+        self.assertIn("event=exit_erased pid=1111 delivery=accepted", [r.getMessage() for r in cm.records])
+
+    def test_text_after_exit_is_never_erased(self):
+        # Claude Code restored a cancelled prompt (or the user typed) after /exit: the box no longer ends with it.
+        w = World("busy")
+        w.driver.readback = [_screen("❯ /exitrestored prompt")]
+        with self.assertLogs("rotator.switcher", "INFO") as cm:
+            self.assertEqual(w.run("hard"), self._left("interrupted"))
+        self.assertIs(w.driver.sent("backspace"), False)
+        self.assertIs(w.driver.sent("enter"), False)
+        self.assertIn("event=exit_left_typed pid=1111", [r.getMessage() for r in cm.records])
+
+    def test_tail_read_back_on_older_hosts(self):
+        # Hosts without draft keep the input box in tail.
+        w = World()
+        w.driver.readback = [_screen("❯ /exit")]
+        self.assertEqual(w.run("soft"), HAPPY)
+
+    def test_lagging_render_is_waited_for(self):
+        w = World()
+        w.driver.readback = [EMPTY_SCREEN, dataclasses.replace(EMPTY_SCREEN, draft="/ex")]
+        self.assertEqual(w.run("soft"), HAPPY)
+        reads = [c for c in w.driver.calls if c[0] == "read_screen"]
+        self.assertEqual(len(reads), 1 + 3 + 1)  # check, three read-backs, continue prompt
+        self.assertEqual(w.driver.submitted, ["/exit", LINE, P])
+
+    def test_exit_never_shows_up_erases_nothing(self):
+        w = World()
+        w.driver.readback = [EMPTY_SCREEN] * 10
+        self.assertEqual(w.run("soft"), self._left())
+        self.assertIs(w.driver.sent("backspace"), False)
+        self.assertEqual(w.clock.now, FAST.screen_s)
+
+    def test_partial_text_at_deadline_erases_nothing(self):
+        w = World()
+        w.driver.readback = [dataclasses.replace(EMPTY_SCREEN, draft="/ex")] * 10
+        self.assertEqual(w.run("soft"), self._left())
+        self.assertIs(w.driver.sent("backspace"), False)
+
+    def test_unreadable_read_back_erases_nothing(self):
+        w = World()
+        w.driver.readback = [ScreenReceipt(ok=False)] * 3 + [RuntimeError("orca down")] * 10
+        self.assertEqual(w.run("soft"), self._left())
+        self.assertEqual(w.driver.submitted, [])
+        self.assertIs(w.driver.sent("backspace"), False)
+
+    def test_refused_enter_erases_exit(self):
+        w = World()
+        w.driver.script["enter"] = [SendReceipt("refused", refused_reason="busy")]
+        self.assertEqual(w.run("soft"), self._stopped())
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None, BACKSPACES])
+        self.assertEqual((w.driver.typed, w.driver.submitted), ("", []))
+
+    def test_refused_erase_is_logged(self):
+        w = World()
+        w.driver.pre = "x"
+        w.driver.script["backspace"] = [SendReceipt("refused", refused_reason="busy")]
+        with self.assertLogs("rotator.switcher", "INFO") as cm:
+            self.assertEqual(w.run("soft"), self._left())
+        msgs = [r.getMessage() for r in cm.records]
+        self.assertIn("event=exit_erased pid=1111 delivery=refused", msgs)
+        self.assertIn("event=exit_left_typed pid=1111", msgs)
+        self.assertEqual(w.driver.typed, "/exit")
+
+    def test_zero_window_reads_once(self):
+        w = World()
+        self.assertEqual(w.run("soft", timeouts=dataclasses.replace(FAST, screen_s=0)), HAPPY)
+        w = World()
+        w.driver.readback = [EMPTY_SCREEN]
+        self.assertEqual(w.run("soft", timeouts=dataclasses.replace(FAST, screen_s=0)), self._left())
+
+    def test_unconfirmed_erase_counts_as_not_erased(self):
+        w = World()
+        w.driver.pre = "x"
+        w.driver.script["backspace"] = [SendReceipt("unconfirmed")]
+        self.assertEqual(w.run("soft"), self._left())
+
+    def test_hints_say_what_is_in_the_box(self):
+        self.assertIn("erased again", sw.result_hint(self._stopped()))
+        left = sw.result_hint(self._left("interrupted"))
+        self.assertNotIn("no text was typed", left)
+        self.assertIn("remove /exit", left)
+
+    def test_mismatch_log_has_shape_not_text(self):
+        w = World()
+        w.driver.pre = "SECRETDRAFT"
+        with self.assertLogs("rotator.switcher", "DEBUG") as cm:
+            w.run("soft")
+        msgs = [r.getMessage() for r in cm.records]
+        self.assertIn("switch read-back mismatch ok=True source=screen lines=5 rules=[1, 3] input_len=16 "
+                      "draft_len=16", msgs)
+        self.assertFalse(any("SECRET" in m for m in msgs))
+
+
+UNREADABLE = ScreenReceipt(ok=True, source="screen", tail=("● SECRETLINE", RULE))
+
+
+class TestSettledScreen(unittest.TestCase):
+    """Issue #18: right after a relaunch or a Ctrl-C an unreadable screen is read again for up to screen_s."""
+
+    def test_continue_prompt_waits_for_a_readable_screen(self):
+        w = World()
+        w.driver.screens = [EMPTY_SCREEN, UNREADABLE, ScreenReceipt(ok=False), EMPTY_SCREEN]
+        self.assertEqual(w.run(), HAPPY)
+        self.assertEqual(w.driver.sends()[-1][2], P)
+
+    def test_continue_prompt_unreadable_for_the_whole_window(self):
+        w = World()
+        w.driver.screens = [EMPTY_SCREEN] + [UNREADABLE] * 10
+        self.assertEqual(w.run(), result("continue_prompt", "screen_unreadable", "verified", new_pid=NEW_PID))
+        self.assertIs(w.driver.sent("prompt"), False)
+        # 1 check + 1 read-back before /exit, then 5 reads (at 0-4 s) over screen_s=5 with 1 s polls.
+        self.assertEqual(len([c for c in w.driver.calls if c[0] == "read_screen"]), 7)
+
+    def test_other_verdict_stops_at_once(self):
+        w = World()
+        w.driver.screens = [EMPTY_SCREEN, UNREADABLE, _screen("❯ typed"), EMPTY_SCREEN]
+        self.assertEqual(w.run(), result("continue_prompt", "input_not_empty", "verified", new_pid=NEW_PID))
+        self.assertEqual(len(w.driver.screens), 1)
+
+    def test_exit_after_interrupt_waits_for_a_readable_screen(self):
+        w = World("busy")
+        w.driver.screens = [EMPTY_SCREEN, ScreenReceipt(ok=False), UNREADABLE, EMPTY_SCREEN]
+        self.assertEqual(w.run("hard"), HAPPY)
+
+    def test_exit_after_interrupt_unreadable_for_the_whole_window(self):
+        w = World("busy")
+        w.driver.screens = [EMPTY_SCREEN] + [UNREADABLE] * 10
+        self.assertEqual(w.run("hard"), result("exit", "screen_unreadable", "interrupted"))
+        self.assertIs(w.driver.sent("exit"), False)
+
+    def test_soft_exit_reads_once(self):
+        w = World()
+        w.driver.screens = [UNREADABLE, EMPTY_SCREEN]
+        self.assertEqual(w.run("soft"), result("exit", "screen_unreadable", "untouched"))
+        self.assertEqual(w.driver.calls, [("read_screen", HANDLE)])
+
+    def test_zero_window_reads_once(self):
+        w = World()
+        w.driver.screens = [EMPTY_SCREEN, UNREADABLE, EMPTY_SCREEN]
+        res = w.run(timeouts=dataclasses.replace(FAST, screen_s=0))
+        self.assertEqual(res, result("continue_prompt", "screen_unreadable", "verified", new_pid=NEW_PID))
+
+    def test_unreadable_shape_logged_without_text(self):
+        w = World()
+        w.driver.screens = [EMPTY_SCREEN, UNREADABLE, EMPTY_SCREEN]
+        with self.assertLogs("rotator.switcher", "DEBUG") as cm:
+            self.assertEqual(w.run(), HAPPY)
+        msgs = [r.getMessage() for r in cm.records]
+        self.assertIn("switch screen unreadable ok=True source=screen lines=2 rules=[1] input_len=- draft_len=0", msgs)
+        self.assertFalse(any("SECRET" in m for m in msgs))
+
+
 class TestWaitExit(unittest.TestCase):
     def test_exit_timeout_is_exit_pending(self):
         w = World()
@@ -1952,7 +2235,8 @@ class TestWaitExit(unittest.TestCase):
         w.driver.script["exit"] = [SendReceipt("unconfirmed")]
         w.procs.alive[OLD_PID] = [True]
         self.assertEqual(w.run("soft"), result("wait_exit", "exit_timeout", "exit_pending"))
-        self.assertEqual(len(w.driver.sends()), 1)
+        # The read-back showed /exit in the input box, so the unconfirmed text did arrive and Enter was sent.
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None])
 
     def test_zero_budget_probe_counts(self):
         w = World()
@@ -2162,9 +2446,14 @@ HAPPY = SwitchResult(
     other_account_id=None,
 )
 P = DEFAULT_CONTINUE_PROMPT
+EXIT_LOG = [
+    ("send", HANDLE, "/exit", False, False),
+    ("read_screen", HANDLE),
+    ("send", HANDLE, None, True, False),
+]
 SOFT_LOG = [
     ("read_screen", HANDLE),
-    ("send", HANDLE, "/exit", True, False),
+] + EXIT_LOG + [
     ("wait_for", HANDLE, "exit", 5000),
     ("send", HANDLE, LINE, True, False),
     ("read_screen", HANDLE),
@@ -2305,21 +2594,23 @@ class TestExitConfirm(unittest.TestCase):
         w = self._world(DIALOG_HIGHLIGHTED)
         res = w.run("soft")
         self.assertEqual(res, dataclasses.replace(HAPPY, tasks_stopped=True))
-        self.assertEqual(w.driver.calls, SOFT_LOG[:2] + [("read_screen", HANDLE), ("send", HANDLE, None, True, False)]
-                         + SOFT_LOG[2:])
+        self.assertEqual(w.driver.calls, SOFT_LOG[:4] + [("read_screen", HANDLE), ("send", HANDLE, None, True, False)]
+                         + SOFT_LOG[4:])
 
     def test_unhighlighted_dialog_gets_digit_then_enter(self):
         w = self._world(DIALOG_ON_STAY)
         res = w.run("soft")
         self.assertEqual(res, dataclasses.replace(HAPPY, tasks_stopped=True))
         self.assertIn(("send", HANDLE, "1", True, False), w.driver.calls)
-        self.assertIs(w.driver.sent("enter"), False)
+        # The only Enter is the one that submitted /exit.
+        self.assertEqual([c[2] for c in w.driver.sends()][:3], ["/exit", None, "1"])
+        self.assertEqual(len([c for c in w.driver.sends() if c[2] is None]), 1)
 
     def test_dialog_appears_after_a_first_poll(self):
         w = self._world(EMPTY_SCREEN, DIALOG_HIGHLIGHTED)
         res = w.run("soft")
         self.assertEqual(res, dataclasses.replace(HAPPY, tasks_stopped=True))
-        self.assertEqual(len([c for c in w.driver.sends() if c[2] is None]), 1)
+        self.assertEqual(len([c for c in w.driver.sends() if c[2] is None]), 2)  # submit + confirm
 
     def test_dialog_after_the_first_window_is_still_answered(self):
         # Claude Code may need longer than exit_s to stop background agents before it opens the dialog.
@@ -2329,7 +2620,7 @@ class TestExitConfirm(unittest.TestCase):
             res = w.run("soft", timeouts=dataclasses.replace(FAST, exit_s=2, poll_s=1))
         self.assertEqual(res, dataclasses.replace(HAPPY, tasks_stopped=True))
         self.assertTrue(any("event=exit_wait_extended" in m for m in cm.output))
-        self.assertEqual(len([c for c in w.driver.sends() if c[2] is None]), 1)
+        self.assertEqual(len([c for c in w.driver.sends() if c[2] is None]), 2)  # submit + confirm
 
     def test_no_second_window_after_an_answered_dialog(self):
         w = self._world(DIALOG_HIGHLIGHTED)
@@ -2344,7 +2635,7 @@ class TestExitConfirm(unittest.TestCase):
         w = self._world(*([LOOK_ALIKE] * 7))
         res = w.run("soft")
         self.assertEqual(res, result("wait_exit", "exit_timeout", "exit_pending"))
-        self.assertIs(w.driver.sent("enter"), False)
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None])  # only the submit
         self.assertIs(w.driver.sent("digit"), False)
         self.assertIs(w.driver.sent("relaunch"), False)
 
@@ -2353,24 +2644,25 @@ class TestExitConfirm(unittest.TestCase):
         w = self._world(*([other] * 7))
         res = w.run("soft")
         self.assertEqual(res, result("wait_exit", "exit_timeout", "exit_pending"))
-        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit"])
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None])
 
     def test_confirms_at_most_once(self):
         w = self._world(DIALOG_HIGHLIGHTED, DIALOG_HIGHLIGHTED, DIALOG_HIGHLIGHTED)
         w.procs.alive[OLD_PID] = [True]
         res = w.run("soft")
         self.assertEqual(res, result("wait_exit", "exit_timeout", "exit_pending", tasks_stopped=True))
-        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None])
-        # No screen is read once the confirm key is out: the probe only checks the process.
-        self.assertEqual([c for c in w.driver.calls if c[0] == "read_screen"], [("read_screen", HANDLE)] * 2)
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None, None])
+        # No screen is read once the confirm key is out: the probe only checks the process. The reads are the
+        # check before /exit, its read-back and the one that found the dialog.
+        self.assertEqual([c for c in w.driver.calls if c[0] == "read_screen"], [("read_screen", HANDLE)] * 3)
 
     def test_refused_confirm_is_not_recorded_as_stopped(self):
         w = self._world(DIALOG_HIGHLIGHTED)
-        w.driver.script["enter"] = [SendReceipt("refused", refused_reason="busy")]
+        w.driver.script["enter"] = [SendReceipt("accepted"), SendReceipt("refused", refused_reason="busy")]
         w.procs.alive[OLD_PID] = [True]  # the refused key never reached the dialog
         res = w.run("soft")
         self.assertEqual(res, result("wait_exit", "exit_timeout", "exit_pending"))
-        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None])
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None, None])
 
     def test_unreadable_screen_keeps_waiting(self):
         w = self._world(ScreenReceipt(ok=False), DIALOG_HIGHLIGHTED)
@@ -3074,7 +3366,8 @@ class TestSeamFailures(unittest.TestCase):
 
     def test_read_screen_raises_before_prompt(self):
         w = World()
-        w.driver.screens = [EMPTY_SCREEN, RuntimeError("x")]
+        # Every read in the continue-prompt window raises (screen_s=5 with 1 s polls reads 5 times).
+        w.driver.screens = [EMPTY_SCREEN] + [RuntimeError("x")] * 10
         self.assertEqual(w.run(), result("continue_prompt", "screen_unreadable", "verified", new_pid=NEW_PID))
         self.assertIs(w.driver.sent("prompt"), False)
 
@@ -3296,6 +3589,12 @@ class TestTrustDialogState(unittest.TestCase):
         self.assertIsNone(sw.trust_dialog_state(EMPTY_SCREEN, CWD))
 
 
+def _enters_after_relaunch(w):
+    sends = w.driver.sends()
+    i = next(k for k, c in enumerate(sends) if FakeDriver._kind(c[2], c[4]) == "relaunch")
+    return len([c for c in sends[i + 1:] if c[2] is None])
+
+
 class TestTrustDialogOnResume(unittest.TestCase):
     def _world(self, *screens, trusted=False, status_before="none", enters=1):
         w = World()
@@ -3305,7 +3604,7 @@ class TestTrustDialogOnResume(unittest.TestCase):
         def new_reg():
             if not w.driver.sent("relaunch"):
                 return None
-            if len([c for c in w.driver.sends() if c[2] is None]) < enters:
+            if _enters_after_relaunch(w) < enters:
                 return None if status_before == "none" else reg(NEW_PID, status_before, started_at=2000)
             return reg(NEW_PID, "busy" if w.driver.sent("prompt") else "idle", started_at=2000)
 
@@ -3316,13 +3615,13 @@ class TestTrustDialogOnResume(unittest.TestCase):
     def test_cursor_moved_to_yes_then_confirmed(self):
         w = self._world(TRUST_ON_NO, TRUST_ON_YES)
         self.assertEqual(w.run(accept_trust=True), HAPPY)
-        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE, sw.KEY_DOWN, None, P])
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None, LINE, sw.KEY_DOWN, None, P])
         self.assertIn(("send", HANDLE, sw.KEY_DOWN, False, False), w.driver.calls)
 
     def test_cursor_already_on_yes(self):
         w = self._world(TRUST_ON_YES)
         self.assertEqual(w.run(accept_trust=True), HAPPY)
-        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE, None, P])
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None, LINE, None, P])
 
     def test_dialog_after_some_polls(self):
         w = self._world(EMPTY_SCREEN, ScreenReceipt(ok=False), TRUST_ON_YES)
@@ -3331,29 +3630,29 @@ class TestTrustDialogOnResume(unittest.TestCase):
     def test_waiting_entry_stays_a_dialog_stop(self):
         w = self._world(TRUST_ON_YES, TRUST_ON_YES, status_before="waiting")
         self.assertEqual(w.run(accept_trust=True), result("wait_ready", "trust_dialog", "relaunched", new_pid=NEW_PID))
-        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE])
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None, LINE])
 
     def test_lagging_render_gets_no_second_down(self):
         w = self._world(TRUST_ON_NO, TRUST_ON_NO, TRUST_ON_NO, TRUST_ON_YES)
         self.assertEqual(w.run(accept_trust=True), HAPPY)
-        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE, sw.KEY_DOWN, None, P])
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None, LINE, sw.KEY_DOWN, None, P])
 
     def test_other_folder_never_answered(self):
         other = _trust_dialog(path_lines=("/Users/user",), on_yes=True)
         w = self._world(*([other] * 20))
         self.assertEqual(w.run(accept_trust=True), result("wait_ready", "trust_dialog", "relaunched"))
-        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE])
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None, LINE])
 
     def test_one_down_only(self):
         w = self._world(*([TRUST_ON_NO] * 20))
         self.assertEqual(w.run(accept_trust=True), result("wait_ready", "trust_dialog", "relaunched"))
-        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE, sw.KEY_DOWN])
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None, LINE, sw.KEY_DOWN])
 
     def test_off_never_reads_or_answers(self):
         w = self._world(*([TRUST_ON_YES] * 20), trusted=True)
         self.assertEqual(w.run(), result("wait_ready", "trust_dialog", "relaunched"))
-        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE])
-        self.assertEqual(len([c for c in w.driver.calls if c[0] == "read_screen"]), 2)
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None, LINE])
+        self.assertEqual(len([c for c in w.driver.calls if c[0] == "read_screen"]), 3)
 
     def test_untrusted_target_needs_accept(self):
         assert_untouched(self, self._world(TRUST_ON_YES).run(), "target_untrusted", World())
@@ -3375,10 +3674,10 @@ class TestTrustDialogOnResume(unittest.TestCase):
 
     def test_refused_enter_is_retried(self):
         w = self._world(TRUST_ON_YES, TRUST_ON_YES, enters=2)  # the refused Enter never reached the dialog
-        w.driver.script["enter"] = [SendReceipt("refused", refused_reason="busy")]
+        w.driver.script["enter"] = [SendReceipt("accepted"), SendReceipt("refused", refused_reason="busy")]
         res = w.run(accept_trust=True)
         self.assertEqual(res, HAPPY)
-        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", LINE, None, None, P])
+        self.assertEqual([c[2] for c in w.driver.sends()], ["/exit", None, LINE, None, None, P])
 
     def test_log_names_folder_not_screen(self):
         w = self._world(TRUST_ON_YES)

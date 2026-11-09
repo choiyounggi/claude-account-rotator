@@ -34,7 +34,8 @@ REASONS = ("no_terminal_handle", "terminal_handle_invalid", "no_argv", "relaunch
            "send_refused", "interrupt_timeout", "screen_unreadable", "trust_dialog", "input_not_empty",
            "exit_timeout", "session_already_running", "ready_timeout", "launched_elsewhere",
            "account_unverified", "wrong_account", "prompt_blocked_permission", "prompt_unconfirmed",
-           "shell_unsupported", "orca_cli_unavailable")
+           "shell_unsupported", "orca_cli_unavailable", "exit_unconfirmed",
+           "exit_left_typed")
 DEFAULT_CONTINUE_PROMPT = "계정 전환으로 세션이 재시작됐어. 중단된 작업을 이어서 진행해줘."
 MAX_PROMPT_CHARS = 800
 ENV_BINARY = "/usr/bin/env"
@@ -56,9 +57,16 @@ TRUST_TITLE = "Accessing workspace:"
 TRUST_YES_RE = re.compile(r"^(❯\s*)?(\d+\.\s+)?Yes, I trust this folder$")
 TRUST_PATH_MAX_LINES = 4
 KEY_DOWN = "\x1b[B"
+KEY_BACKSPACE = "\x7f"
+EXIT_TEXT = "/exit"
 # A session resumed by something else is adopted only while its last status change came this soon after it started.
 ADOPT_FRESH_S = 60.0
 TASKS_STOPPED_HINT = "Background tasks running in the session were stopped at /exit (Exit and stop tasks)."
+EXIT_UNCONFIRMED_HINT = ("/exit was typed but the input box did not read back as exactly /exit, so it was not "
+                         "submitted and was erased again; the input box is as it was.")
+EXIT_LEFT_TYPED_HINT = ("/exit was typed but not submitted, and it may still be in the input box, next to text "
+                        "already there. Look at the input box and remove /exit before pressing Enter.")
+_REASON_HINTS = {"exit_unconfirmed": EXIT_UNCONFIRMED_HINT, "exit_left_typed": EXIT_LEFT_TYPED_HINT}
 RULE_CHARS = frozenset("─━")
 RULE_MIN_LEN = 10
 BOTTOM_LINES = 15
@@ -123,9 +131,12 @@ class Timeouts:
     ready_s: float = 60.0
     prompt_s: float = 15.0
     poll_s: float = 0.5
+    # How long a screen read is repeated: while it is unreadable right after a relaunch or a Ctrl-C, and while
+    # the typed /exit has not shown up in the input box yet.
+    screen_s: float = 5.0
 
     def __post_init__(self) -> None:
-        for name in ("idle_s", "exit_s", "shell_s", "ready_s", "prompt_s", "poll_s"):
+        for name in ("idle_s", "exit_s", "shell_s", "ready_s", "prompt_s", "poll_s", "screen_s"):
             v = getattr(self, name)
             if type(v) is bool or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
                 raise ValueError("Timeouts.%s must be a finite number >= 0" % name)
@@ -188,7 +199,8 @@ class SwitchResult:
 
 def result_hint(r: SwitchResult) -> str:
     """The state hint, plus a note when /exit stopped the session's background tasks."""
-    hint = STATE_HINTS.get(r.state, "")
+    # Replaces the state hint: "untouched"/"interrupted" say nothing was typed, which is not true here.
+    hint = _REASON_HINTS.get(r.reason or "", STATE_HINTS.get(r.state, ""))
     if r.tasks_stopped:
         return (hint + " " + TASKS_STOPPED_HINT).strip()
     return hint
@@ -237,9 +249,12 @@ def _wait_until(probe: Callable[[], Any], budget_s: float, poll_s: float,
 def switch_budget_s(timeouts: Timeouts) -> float:
     """Upper bound in seconds for one ``switch_session`` run with these timeouts."""
     # The exit wait has two windows, each of which may overrun by one screen read, and sends one exit-confirm
-    # key; the ready wait may overrun by one screen read and send one trust-dialog key.
-    return float(7 * ORCA_CALL_TIMEOUT_S + 5 * ORCA_SEND_TIMEOUT_S + timeouts.idle_s + 2 * timeouts.exit_s
-                 + timeouts.shell_s + 5.0 + timeouts.ready_s + timeouts.prompt_s + 5 * PS_TIMEOUT_S)
+    # key; the ready wait may overrun by one screen read and send one trust-dialog key. Three screen windows:
+    # the exit check after a Ctrl-C and the continue-prompt check repeat a read that is already counted, the
+    # /exit read-back adds one more read and one more send (Enter, or the backspaces).
+    return float(8 * ORCA_CALL_TIMEOUT_S + 6 * ORCA_SEND_TIMEOUT_S + timeouts.idle_s + 2 * timeouts.exit_s
+                 + timeouts.shell_s + 5.0 + timeouts.ready_s + timeouts.prompt_s + 3 * timeouts.screen_s
+                 + 5 * PS_TIMEOUT_S)
 
 
 # ---------------------------------------------------------------- relaunch line
@@ -627,6 +642,29 @@ def _is_rule(line: str) -> bool:
     return len(s) >= RULE_MIN_LEN and set(s) <= RULE_CHARS
 
 
+def input_text(receipt: ScreenReceipt) -> Optional[str]:
+    """The text in the input box, "" when it is empty or shows only the placeholder, None when no input box
+    is on the screen.
+
+    Orca reports what is typed in an agent's input box as ``draft`` and leaves it out of ``tail``; without a
+    draft the text is read from the tail lines between the last two rules.
+    """
+    if not receipt.ok or receipt.source != "screen":
+        return None
+    draft = receipt.draft.strip() if isinstance(receipt.draft, str) else ""
+    if draft:
+        # Orca already leaves the placeholder out of draft, so a draft is always typed text.
+        return draft
+    lines = list(receipt.tail)
+    rules = [i for i, line in enumerate(lines) if _is_rule(line)]
+    if len(rules) < 2:
+        return None
+    s = " ".join(lines[rules[-2] + 1:rules[-1]]).replace(" ", " ").replace("│", "").strip()
+    if s[:1] in ("❯", ">"):
+        s = s[1:].strip()
+    return "" if PLACEHOLDER_RE.match(s) else s
+
+
 def classify_screen(receipt: ScreenReceipt) -> Optional[str]:
     """None when the input box is provably empty, else the reason token that forbids typing."""
     if not receipt.ok or receipt.source != "screen":
@@ -642,14 +680,20 @@ def classify_screen(receipt: ScreenReceipt) -> Optional[str]:
         return "trust_dialog"
     if any(m in text for m in DIALOG_MARKERS):
         return "dialog_open"
-    if len(rules) < 2:
+    s = input_text(receipt)
+    if s is None:
         return "screen_unreadable"
-    s = " ".join(lines[rules[-2] + 1:rules[-1]]).replace(" ", " ").replace("│", "").strip()
-    if s[:1] in ("❯", ">"):
-        s = s[1:].strip()
-    if s == "" or PLACEHOLDER_RE.match(s):
-        return None
-    return "input_not_empty"
+    return None if s == "" else "input_not_empty"
+
+
+def screen_shape(receipt: ScreenReceipt) -> str:
+    """The layout of a screen read for a debug log, without any of its text."""
+    lines = list(receipt.tail)
+    rules = [i for i, line in enumerate(lines) if _is_rule(line)]
+    s = input_text(receipt)
+    return "ok=%s source=%s lines=%d rules=%s input_len=%s draft_len=%d" % (
+        receipt.ok, receipt.source, len(lines), rules, "-" if s is None else len(s),
+        len(receipt.draft) if isinstance(receipt.draft, str) else 0)
 
 
 def exit_confirm_choice(receipt: ScreenReceipt) -> Optional[str]:
@@ -1090,7 +1134,50 @@ def _preflight(run: _Run) -> Optional[SwitchResult]:
 def _screen_verdict(run: _Run) -> Optional[str]:
     rec = run.driver.read_screen(run.session.terminal_handle)
     logger.debug("switch screen draft=%s agent_wait=%s", rec.draft is not None, rec.agent_wait is not None)
-    return classify_screen(rec)
+    v = classify_screen(rec)
+    if v == "screen_unreadable":
+        logger.debug("switch screen unreadable %s", screen_shape(rec))
+    return v
+
+
+def _settled_verdict(run: _Run) -> Optional[str]:
+    """The screen verdict, read again every poll_s for up to screen_s while it is screen_unreadable: right after a
+    relaunch or a Ctrl-C, Claude Code may still be redrawing the input box. Any other verdict stops at once."""
+    t = run.timeouts
+    last = ["screen_unreadable"]
+
+    def readable() -> bool:
+        last[0] = _screen_verdict(run)
+        return last[0] != "screen_unreadable"
+
+    _wait_until(readable, t.screen_s, t.poll_s, run.clock, run.sleep)
+    return last[0]
+
+
+def _read_back(run: _Run, typed: str) -> Tuple[bool, Optional[str]]:
+    """(True, ``typed``) once the input box holds exactly ``typed``, else (False, the last text read, None when the
+    box was unreadable).
+
+    Text the screen read did not show before typing (issue #22: a draft that ended up in front of /exit) shows up
+    here. Reads repeat for up to screen_s while the box is empty or holds only the start of ``typed``."""
+    h, t = run.session.terminal_handle, run.timeouts
+    last: List[Optional[str]] = [None]
+
+    def probe() -> Optional[str]:
+        rec = run.driver.read_screen(h)
+        s = input_text(rec)
+        last[0] = s
+        if s == typed:
+            return "match"
+        if s is None or typed.startswith(s):
+            return None
+        logger.debug("switch read-back mismatch %s", screen_shape(rec))
+        return "mismatch"
+
+    out = _wait_until(probe, t.screen_s, t.poll_s, run.clock, run.sleep)
+    if out is None:
+        logger.debug("switch read-back timeout input_len=%s", "-" if last[0] is None else len(last[0]))
+    return out == "match", last[0]
 
 
 def _interrupt(run: _Run) -> Optional[SwitchResult]:
@@ -1132,7 +1219,7 @@ def _interrupt(run: _Run) -> Optional[SwitchResult]:
 
 def _exit(run: _Run) -> Optional[SwitchResult]:
     h = run.session.terminal_handle
-    v = _screen_verdict(run)
+    v = _settled_verdict(run) if run.state == "interrupted" else _screen_verdict(run)
     if v:
         return _finish(run, "exit", v, run.state)
     reg = _read_registry(run.read_text, _registry_path(run.session))
@@ -1145,11 +1232,26 @@ def _exit(run: _Run) -> Optional[SwitchResult]:
         return _finish(run, "exit", "pane_not_claude", run.state)
     if _binding_fault(run) is not None:
         return _finish(run, "exit", "pane_binding_unverified", run.state)
-    r = run.driver.send(h, "/exit", enter=True, interrupt=False)
+    # Typed without Enter, checked, then submitted: the screen read above can miss text that is in the input box.
+    r = run.driver.send(h, EXIT_TEXT, enter=False, interrupt=False)
     if r.delivery == "refused":
         return _finish(run, "exit", "send_refused", run.state)
-    _step_ok(run, "exit")
-    return None
+    matched, seen = _read_back(run, EXIT_TEXT)
+    if matched:
+        r = run.driver.send(h, None, enter=True, interrupt=False)
+        if r.delivery != "refused":
+            _step_ok(run, "exit")
+            return None
+    # /exit was typed but not submitted. Erase it only while the box provably ends with it, so the backspaces never
+    # reach text in front of it or typed after it; otherwise leave the box as it is for the user to look at.
+    if seen is not None and seen.endswith(EXIT_TEXT):
+        r = run.driver.send(h, KEY_BACKSPACE * len(EXIT_TEXT), enter=False, interrupt=False)
+        logger.info("event=exit_erased pid=%d delivery=%s", run.session.pid, r.delivery)
+        if r.delivery == "accepted":
+            # Reasons of their own: a retry types into this box again, so the daemon holds it (rotator.daemon).
+            return _finish(run, "exit", "exit_unconfirmed", run.state)
+    logger.warning("event=exit_left_typed pid=%d", run.session.pid)
+    return _finish(run, "exit", "exit_left_typed", run.state)
 
 
 def _wait_exit(run: _Run) -> Optional[SwitchResult]:
@@ -1405,7 +1507,7 @@ def _adopt(run: _Run, path: str, entry: dict, *, wait_s: float) -> Optional[Swit
 def _continue_prompt(run: _Run, *, home: Optional[str] = None, other_account_id: Optional[str] = None,
                      fail_state: str = "verified") -> SwitchResult:
     h, t = run.session.terminal_handle, run.timeouts
-    v = _screen_verdict(run)
+    v = _settled_verdict(run)
     if v:
         return _finish(run, "continue_prompt", v, fail_state, new_pid=run.new_pid, other_account_id=other_account_id)
     r = run.driver.send(h, run.prompt, enter=True, interrupt=False)

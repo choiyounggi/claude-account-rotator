@@ -48,7 +48,7 @@ TOP_KEYS = (
     "profiles_root",
     "experimental_windows_switch",
 )
-TIMEOUT_KEYS = ("idle_s", "exit_s", "shell_s", "ready_s", "prompt_s", "poll_s")
+TIMEOUT_KEYS = ("idle_s", "exit_s", "shell_s", "ready_s", "prompt_s", "poll_s", "screen_s")
 
 _PROMPT_MESSAGE = (
     "continue_prompt: must be one non-empty line of at most %d characters, "

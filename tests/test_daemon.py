@@ -345,7 +345,7 @@ class TestReasonClasses(unittest.TestCase):
             for b in sets[i + 1:]:
                 self.assertEqual(a & b, frozenset())
         self.assertEqual(frozenset().union(*sets), set(switcher.REASONS))
-        self.assertEqual([len(s) for s in sets], [10, 2, 8, 1, 9])
+        self.assertEqual([len(s) for s in sets], [11, 2, 9, 1, 9])
 
     def test_classify(self):
         self.assertEqual(classify_untouched("target_untrusted"), "target")
@@ -1070,6 +1070,40 @@ class TestRunSwitchOutcomes(RunSwitchBase):
                 out = self.run_switch()
                 self.assertEqual(out.record["unswitchable"], expected)
                 self.assertIs(out.record["touched"], False)
+
+    def test_exit_left_typed_is_never_retried(self):
+        # /exit may still be in the input box (issue #22): leave the process alone until it is replaced.
+        for state, mode in (("untouched", "soft"), ("interrupted", "hard")):
+            with self.subTest(state=state):
+                self.env = FakeEnv()
+                self.logger = self.env.deps().make_logger()
+                self.env.results = [result(state, "exit_left_typed", step="exit")]
+                out = self.run_switch(mode=mode)
+                self.assertIs(daemon.interrupt_only(out.record), False)
+                if state == "untouched":
+                    # The tick skips a record with unswitchable set, whatever may_retry says.
+                    self.assertEqual(out.record["unswitchable"], "exit_left_typed")
+                else:
+                    self.assertIs(daemon.may_retry(out.record), False)
+
+    def test_exit_unconfirmed_is_held_in_both_modes(self):
+        # /exit was erased again: retried, but only after cooldown_s, and a hard one only as soft.
+        for state, mode in (("untouched", "soft"), ("interrupted", "hard")):
+            with self.subTest(state=state):
+                self.env = FakeEnv()
+                self.logger = self.env.deps().make_logger()
+                self.env.results = [result(state, "exit_unconfirmed", step="exit")]
+                out = self.run_switch(mode=mode)
+                self.assertIsNone(out.record["unswitchable"])
+                self.assertEqual(out.record["hard_hold_until"], "2026-10-28T12:05:00+00:00")
+                self.assertIs(daemon.may_retry(out.record), True)
+                self.assertIs(daemon.holds_all(out.record), True)
+                self.assertIs(daemon.interrupt_only(out.record), state == "interrupted")
+
+    def test_holds_all_only_for_its_reasons(self):
+        self.assertIs(daemon.holds_all({"result": {"reason": "input_not_empty"}}), False)
+        self.assertIs(daemon.holds_all({"result": None}), False)
+        self.assertIs(daemon.holds_all({}), False)
 
     def test_hard_transient_sets_hold(self):
         for reason, mode, expected in (("input_not_empty", "hard", "2026-10-28T12:05:00+00:00"),
@@ -2226,7 +2260,7 @@ class TestInFlight(DispatchBase):
     def test_lease_follows_configured_timeouts(self):
         self.make(make_cfg(timeouts=switcher.Timeouts(ready_s=120.0)))
         self.d.tick()
-        self.assertEqual(self.d._inflight[SID1].deadline, 1000.0 + 615.0 + 30.0)
+        self.assertEqual(self.d._inflight[SID1].deadline, 1000.0 + 695.0 + 30.0)
 
     def test_on_attempt_refreshes_deadline(self):
         self.env.results = [result("untouched", "target_untrusted"),
@@ -2243,7 +2277,7 @@ class TestInFlight(DispatchBase):
         self.d = Daemon(self.cfg, self.deps, self.deps.make_logger())
         self.d.tick()
         self.env.run_worker(0)
-        self.assertEqual(seen, [1585.0, 1685.0])
+        self.assertEqual(seen, [1665.0, 1765.0])
 
 
 class TestTouchedNeverRetried(DispatchBase):
@@ -2582,6 +2616,19 @@ class TestRetryRules(DispatchBase):
         self.assertEqual(self.env.now_v, T0 + timedelta(seconds=300))
         self.assertEqual(len(self.spawns()), 2)
 
+    def test_exit_unconfirmed_holds_soft_too(self):
+        self.env.results = [result("untouched", "exit_unconfirmed", step="exit"), result()]
+        self.env.pcts[ACC_A] = 90.0  # a soft decision
+        self.d.tick()
+        self.env.run_worker(0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_B, "soft")])
+        for _ in range(29):
+            self.tick_after(10)
+        self.assertEqual(len(self.spawns()), 1)
+        self.assertEqual(len(self.env.logs("hard_hold_active")), 1)
+        self.tick_after(10)
+        self.assertEqual(len(self.spawns()), 2)
+
     def test_soft_not_held(self):
         self.env.results = [result("untouched", "input_not_empty"), result()]
         self.d.tick()
@@ -2721,14 +2768,14 @@ class TestRunDaemon(RunDaemonBase):
         self.env.wait_hook = hook
 
     def test_drain_abandons_overrun_worker(self):
-        self._stop_on_first_wait(610.0)
+        self._stop_on_first_wait(690.0)
         self.assertEqual(self.run_d(), 0)
         self.assertEqual(len(self.env.spawned), 1)
         self.assertEqual(self.env.spawned[0].joins, [0.0])
         self.assertEqual(len(self.env.logs("worker_abandoned")), 1)
 
     def test_drain_waits_remaining_lease(self):
-        self._stop_on_first_wait(485.0)
+        self._stop_on_first_wait(565.0)
         self.assertEqual(self.run_d(), 0)
         self.assertEqual(self.env.spawned[0].joins, [100.0])
         self.assertEqual(len(self.env.logs("worker_abandoned")), 1)
