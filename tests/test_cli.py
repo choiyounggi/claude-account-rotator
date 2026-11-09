@@ -99,6 +99,12 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(cfg.timeouts.idle_s, 30.0)
         self.assertEqual(cfg.hard_pct, 95.0)
 
+    def test_timeouts_screen_s(self):
+        self.assertEqual(load('{"timeouts": {"screen_s": 2}}').timeouts.screen_s, 2.0)
+        self.assertEqual(load('{"timeouts": {"screen_s": 0}}').timeouts.screen_s, 0.0)
+        with self.assertRaises(ConfigError):
+            load('{"timeouts": {"screen_s": -1}}')
+
     def test_empty_object(self):
         self.assertEqual(load("{}"), Config())
 
@@ -680,7 +686,7 @@ class TestLaunchd(LaunchdBase):
         with open(self.plist, "rb") as f:
             pl = plistlib.load(f)
         self.assertEqual(pl["Label"], LABEL)
-        self.assertEqual(pl["ExitTimeOut"], 615)
+        self.assertEqual(pl["ExitTimeOut"], 695)
         self.assertGreaterEqual(pl["ExitTimeOut"], 510)
         self.assertEqual(pl["ProgramArguments"][0], "/usr/bin/python3")
         self.assertEqual(pl["ProgramArguments"][1], os.path.join(self.app, "bin", "rotator"))
@@ -696,7 +702,7 @@ class TestLaunchd(LaunchdBase):
         r = FakeRunner()
         self.assertEqual(self.install(r)[0], 0)
         self.assertEqual(r.verbs(), ["print", "bootout", "bootstrap", "print"])
-        self.assertEqual(r.calls[1][1], 615 + 30.0)
+        self.assertEqual(r.calls[1][1], 695 + 30.0)
         self.assertEqual(r.calls[1][0], ["/bin/launchctl", "bootout", "gui/501/" + LABEL])
 
     def test_install_bootstrap_failure(self):
@@ -722,7 +728,7 @@ class TestLaunchd(LaunchdBase):
         r = FakeRunner()
         self.assertEqual(self.uninstall(r)[0], 0)
         self.assertEqual(r.verbs(), ["print", "bootout"])
-        self.assertEqual(r.calls[1][1], 615 + 30.0)
+        self.assertEqual(r.calls[1][1], 695 + 30.0)
         self.assertFalse(os.path.exists(self.plist))
 
     def test_uninstall_not_loaded(self):
@@ -735,7 +741,7 @@ class TestLaunchd(LaunchdBase):
     def test_uninstall_absent_plist(self):
         r = FakeRunner()
         self.assertEqual(self.uninstall(r), (0, "uninstalled " + LABEL))
-        self.assertEqual(r.calls[1][1], 615 + 30.0)
+        self.assertEqual(r.calls[1][1], 695 + 30.0)
 
     def test_uninstall_bootout_failure_keeps_plist(self):
         self.install(FakeRunner({"print": (113, "", "")}))
@@ -762,7 +768,7 @@ class TestLaunchd(LaunchdBase):
                     self.assertNotIn(bad, part)
 
     def test_exit_timeout_tracks_timeouts(self):
-        self.assertEqual(exit_timeout_for(Timeouts()), 615)
+        self.assertEqual(exit_timeout_for(Timeouts()), 695)
         self.assertEqual(exit_timeout_for(Timeouts(ready_s=120.0)), exit_timeout_for(Timeouts()) + 60)
 
     def test_required_seams(self):

@@ -67,6 +67,9 @@ ORPHANED_HINT = (
 STRUCTURAL_REASONS = frozenset({
     "no_terminal_handle", "terminal_handle_invalid", "no_argv", "relaunch_unbuildable", "same_account",
     "cwd_missing", "registry_mismatch", "pane_binding_unverified", "shell_unsupported", "orca_cli_unavailable",
+    # /exit was typed, not submitted, and may still be in the input box (issue #22): the screen read that let it be
+    # typed cannot be trusted for this process, so it is left alone until it is replaced.
+    "exit_left_typed",
 })
 TARGET_REASONS = frozenset({"target_untrusted", "target_home_missing"})
 # Exclusions for these reasons expire after Config.exclusion_ttl_s: the cause (an untrusted folder, a transcript
@@ -74,8 +77,11 @@ TARGET_REASONS = frozenset({"target_untrusted", "target_home_missing"})
 EXPIRING_EXCLUSION_REASONS = frozenset({"target_untrusted", "transcript_not_visible", "target_home_missing"})
 TRANSIENT_REASONS = frozenset({
     "not_idle", "dialog_open", "input_not_empty", "screen_unreadable", "trust_dialog", "send_refused",
-    "pane_not_claude", "transcript_not_visible",
+    "pane_not_claude", "transcript_not_visible", "exit_unconfirmed",
 })
+# /exit was typed and erased again (issue #22). Retried like any transient reason, but only after cooldown_s, in
+# soft mode too: an immediate retry would type into the same input box on every tick.
+HOLD_ALL_REASONS = frozenset({"exit_unconfirmed"})
 GONE_REASONS = frozenset({"pid_not_alive"})
 TOUCHED_ONLY_REASONS = frozenset({
     "interrupt_timeout", "exit_timeout", "session_already_running", "ready_timeout", "launched_elsewhere",
@@ -141,11 +147,12 @@ def touched(record: Mapping[str, Any]) -> bool:
 
 # Per step, the reasons of an ``interrupted`` result where the only input the session received was one Ctrl-C:
 # the interrupt step stopped waiting for idle, and the exit step stopped before sending /exit (or the send was
-# refused). Nothing was typed, so a later soft switch (which never interrupts) cannot collide with the user's input.
+# refused, or the typed /exit was erased again: exit_unconfirmed). Nothing is left typed, so a later soft switch
+# (which never interrupts) cannot collide with the user's input.
 INTERRUPT_ONLY_REASONS: Mapping[str, FrozenSet[str]] = {
     "interrupt": frozenset({"interrupt_timeout", "dialog_open"}),
     "exit": frozenset({"input_not_empty", "dialog_open", "screen_unreadable", "trust_dialog", "not_idle",
-                       "pane_not_claude", "pane_binding_unverified", "send_refused"}),
+                       "pane_not_claude", "pane_binding_unverified", "send_refused", "exit_unconfirmed"}),
 }
 
 
@@ -156,6 +163,12 @@ def interrupt_only(record: Mapping[str, Any]) -> bool:
     res = record.get("result")
     return (isinstance(res, dict) and res.get("state") == "interrupted"
             and res.get("reason") in INTERRUPT_ONLY_REASONS.get(res.get("step"), frozenset()))
+
+
+def holds_all(record: Mapping[str, Any]) -> bool:
+    """True when the record's ``hard_hold_until`` also holds soft switches (HOLD_ALL_REASONS)."""
+    res = record.get("result")
+    return isinstance(res, dict) and res.get("reason") in HOLD_ALL_REASONS
 
 
 def soft_only(record: Optional[Mapping[str, Any]]) -> bool:
@@ -618,6 +631,9 @@ def run_switch(session: Session, own: Profile, target: Profile, mode: str, *, cf
             break
 
         assert res is not None
+        if res.reason in HOLD_ALL_REASONS:
+            hold = _iso(deps.now() + timedelta(seconds=cfg.cooldown_s))
+            logger.warning("event=hold pid=%d until=%s reason=%s", pid, hold, res.reason)
         # After a failed later intent, the final record describes the last call that actually ran.
         final = _new_record(session, source=source, mode=last_mode, target=last_target, attempt=calls,
                             now=deps.now(), record_state="final", excluded=excluded, hold=hold, result=res,
@@ -1294,7 +1310,7 @@ class Daemon:
             self._would.pop(s.session_id, None)
             return row
         hold = _parse_iso(rec.get("hard_hold_until")) if rec is not None else None
-        if d.action == "hard" and hold is not None and now < hold:
+        if hold is not None and now < hold and (d.action == "hard" or holds_all(rec)):
             if self._hold_logged.get(s.session_id) != rec["hard_hold_until"]:
                 self._hold_logged[s.session_id] = rec["hard_hold_until"]
                 self._log.warning("event=hard_hold_active pid=%d until=%s", s.pid, rec["hard_hold_until"])

@@ -821,6 +821,7 @@ _SWITCH_REASONS = {
     "launched_elsewhere": "다른 계정으로 실행됨", "account_unverified": "계정 미확인", "wrong_account": "잘못된 계정",
     "prompt_blocked_permission": "권한 확인창", "prompt_unconfirmed": "이어가기 미확인",
     "shell_unsupported": "지원하지 않는 셸", "orca_cli_unavailable": "orca 실행 파일 없음",
+    "exit_unconfirmed": "/exit 확인 실패(지움)", "exit_left_typed": "/exit 입력창에 남음",
 }
 _SWITCH_STATES = {
     "interrupted": "작업만 중단됨", "exit_pending": "종료 확인 안 됨", "exited": "종료 후 재실행 미확인",
