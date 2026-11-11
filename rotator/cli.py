@@ -40,6 +40,7 @@ from rotator.daemon import (
     IN_PROGRESS_HINT, ORPHANED_HINT, STATE_FILENAME, Deps, UsageCache, UsageStore, identity_of,
     load_records, real_deps, run_daemon, run_switch, touched,
 )
+from rotator.models import Profile
 from rotator.policy import decide
 from rotator.sessions import session_homes
 from rotator.switcher import ORCA_BINARY_DEFAULT, build_relaunch_command, relaunch_shell, result_hint
@@ -151,7 +152,32 @@ def account_label(p: Any) -> str:
     return _clean(getattr(p, "account_id", ""))[:8]
 
 
-_PLANS = {"default_claude_max_5x": "Max5x", "default_claude_max_20x": "Max20x", "default_raven": "Team"}
+def resolve_account(profiles: Sequence[Profile], query: str) -> List[Profile]:
+    """Accounts named by ``query``: the folder id, else the email, else the name ``status`` shows (both
+    case-insensitive). Exactly one = found; none = unknown; two or more = ambiguous. A name never matches by prefix:
+    ``rtb.team.1`` must not pick ``rtb.team.11``."""
+    q = query.strip()
+    if not q:
+        return []
+    by_id = [p for p in profiles if p.account_id == q]
+    if by_id:
+        return by_id
+    folded = q.casefold()
+    by_email = [p for p in profiles if _clean(p.email).casefold() == folded]
+    if by_email:
+        return by_email
+    return [p for p in profiles if account_label(p).casefold() == folded]
+
+
+def _account_lines(profiles: Sequence[Profile]) -> List[str]:
+    """``  name  email  folder-id`` per account, columns aligned; every field cleaned of control characters."""
+    rows = [(account_label(p), _clean(p.email) or "-", _clean(p.account_id)) for p in profiles]
+    widths = [max((display_width(r[i]) for r in rows), default=0) for i in (0, 1)]
+    return ["  " + "  ".join(r[i] + " " * (widths[i] - display_width(r[i])) for i in (0, 1)) + "  " + r[2]
+            for r in rows]
+
+
+_PLANS ={"default_claude_max_5x": "Max5x", "default_claude_max_20x": "Max20x", "default_raven": "Team"}
 
 
 def plan_tag(tier: object) -> Optional[str]:
@@ -1237,7 +1263,8 @@ def build_parser() -> argparse.ArgumentParser:
     dm.add_argument("--dry-run", action="store_true", help="never switch and never write selected-host")
     sw = sub.add_parser("switch", help="switch one session to another account once")
     sw.add_argument("--session", type=int, required=True, metavar="PID", help="pid of the Claude Code session")
-    sw.add_argument("--to", required=True, metavar="ACCOUNT_ID", help="target account folder name")
+    sw.add_argument("--to", required=True, metavar="ACCOUNT",
+                    help="target account: the name status shows (rtb.team.1), its email or its folder id")
     how = sw.add_mutually_exclusive_group()
     how.add_argument("--soft", dest="mode", action="store_const", const="soft", help="switch only when idle (default)")
     how.add_argument("--hard", dest="mode", action="store_const", const="hard", help="interrupt a running turn first")
@@ -1535,10 +1562,16 @@ def _switch(args: argparse.Namespace, cfg: Config, deps: Deps, out: TextIO, err:
     if own is None:
         print("session %d is unmanaged: its CLAUDE_CONFIG_DIR is not an Orca account folder" % s.pid, file=err)
         return 2
-    target = next((p for p in profiles if p.account_id == args.to), None)
-    if target is None:
-        print("unknown account %s" % args.to, file=err)
+    matches = resolve_account(profiles, args.to)
+    if len(matches) != 1:
+        if matches:
+            print("account %s matches %d accounts; name one by its folder id:" % (_clean(args.to), len(matches)),
+                  file=err)
+        else:
+            print("unknown account %s; accounts:" % _clean(args.to), file=err)
+        print("\n".join(_account_lines(matches or profiles)), file=err)
         return 2
+    target = matches[0]
     if target.account_id == own.account_id:
         print("session %d already runs on account %s" % (s.pid, own.account_id), file=err)
         return 2

@@ -4276,6 +4276,88 @@ class TestSwitchCommand(MainBase):
         self.assertIn("already runs on account", self.err.getvalue())
         self.assertEqual(self.switches(), [])
 
+    def named(self):
+        self.env.profiles = [dataclasses.replace(prof(ACC_A), email="rtb.team.1@example.com"),
+                             dataclasses.replace(prof(ACC_B), email="rtb.team.11@example.com"),
+                             dataclasses.replace(prof(ACC_C), email="Kim@other.com")]
+
+    def test_to_accepts_account_name_and_email(self):
+        for to in ("rtb.team.11", "RTB.Team.11", "rtb.team.11@example.com", "RTB.TEAM.11@Example.COM", ACC_B):
+            self.env = standard_env()
+            self.named()
+            self.env.sessions = [sess(101, ACC_C)]
+            self.env.results = [result("continued", None, ok=True, step="continue_prompt")]
+            self.assertEqual(self.sw(to=to), 0, to)
+            self.assertEqual(self.switches(), [("switch", 101, ACC_B, "soft")], to)
+
+    def test_name_is_exact_not_a_prefix(self):
+        self.named()
+        self.env.sessions = [sess(101, ACC_C)]
+        self.env.results = [result("continued", None, ok=True, step="continue_prompt")]
+        self.assertEqual(self.sw(to="rtb.team.1"), 0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_A, "soft")])
+
+    def test_unknown_name_lists_accounts(self):
+        self.named()
+        self.assertEqual(self.sw(to="rtb.team"), 2)
+        err = self.err.getvalue()
+        self.assertIn("unknown account rtb.team", err)
+        for label, email, aid in (("rtb.team.1", "rtb.team.1@example.com", ACC_A),
+                                  ("rtb.team.11", "rtb.team.11@example.com", ACC_B), ("Kim", "Kim@other.com", ACC_C)):
+            self.assertRegex(err, r"\n  %s +%s +%s" % (re.escape(label), re.escape(email), aid))
+        self.assertEqual(self.switches(), [])
+
+    def test_unknown_name_is_printed_without_control_characters(self):
+        self.named()
+        self.assertEqual(self.sw(to="x\x1b[2Jy"), 2)
+        self.assertIn("unknown account x[2Jy;", self.err.getvalue())
+        self.assertNotIn("\x1b", self.err.getvalue())
+
+    def test_folder_id_wins_over_a_name(self):
+        self.env.profiles = [dataclasses.replace(prof(ACC_A), email=ACC_B + "@example.com"),
+                             dataclasses.replace(prof(ACC_B), email="b@example.com")]
+        self.env.sessions = [sess(101, ACC_C)]
+        self.env.profiles.append(prof(ACC_C))
+        self.env.results = [result("continued", None, ok=True, step="continue_prompt")]
+        self.assertEqual(self.sw(to=ACC_B), 0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_B, "soft")])
+
+    def test_display_name_is_a_name(self):
+        self.env.profiles = [prof(ACC_A), dataclasses.replace(prof(ACC_B), email=None, display_name="홍길동")]
+        self.env.results = [result("continued", None, ok=True, step="continue_prompt")]
+        self.assertEqual(self.sw(to="홍길동"), 0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_B, "soft")])
+
+    def test_shared_name_is_ambiguous(self):
+        other = "00000000-0000-0000-0000-00000000000d"
+        self.env.profiles = [dataclasses.replace(prof(ACC_A), email="kim@a.com"),
+                             dataclasses.replace(prof(ACC_B), email="kim@b.com"),
+                             dataclasses.replace(prof(ACC_C), email="kim@c.com"),
+                             dataclasses.replace(prof(other), email="lee@d.com")]
+        self.assertEqual(self.sw(to="kim"), 2)
+        err = self.err.getvalue()
+        self.assertIn("account kim matches 3 accounts; name one by its folder id:", err)
+        self.assertRegex(err, r"\n  kim +kim@b\.com +%s" % ACC_B)
+        self.assertNotIn(other, err)
+        self.assertEqual(self.switches(), [])
+        self.env.results = [result("continued", None, ok=True, step="continue_prompt")]
+        self.assertEqual(self.sw(to="kim@b.com"), 0)
+        self.assertEqual(self.switches(), [("switch", 101, ACC_B, "soft")])
+
+    def test_empty_to_and_id_prefix_are_unknown(self):
+        self.named()
+        self.assertEqual(self.sw(to=""), 2)
+        self.assertIn("unknown account", self.err.getvalue())
+        self.assertEqual(self.sw(to=ACC_B[:8]), 2)
+        self.assertEqual(self.switches(), [])
+
+    def test_folder_id_name_of_an_account_without_email(self):
+        self.env.profiles = [prof(ACC_A), dataclasses.replace(prof("10000000-0000-0000-0000-00000000000b"), email=None,
+                                                              display_name=None)]
+        self.env.results = [result("continued", None, ok=True, step="continue_prompt")]
+        self.assertEqual(self.sw(to="10000000"), 0)
+        self.assertEqual([c[2] for c in self.switches()], ["10000000-0000-0000-0000-00000000000b"])
+
     def _assert_preview(self):
         text = self.out.getvalue()
         self.assertIn("decide: action=hard target=" + ACC_B, text)
