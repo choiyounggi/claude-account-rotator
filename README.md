@@ -238,7 +238,7 @@ rotator status [--ascii]             # one table
 rotator status --watch [--interval S] [--ascii] [--details]
 rotator status --json
 rotator daemon [--dry-run]           # foreground
-rotator switch --session <pid> --to <account-id> [--soft|--hard] [--dry-run]
+rotator switch --session <pid> --to <account> [--soft|--hard] [--dry-run]
 ```
 
 - `status` draws one table of accounts and one of sessions (synthetic example):
@@ -334,6 +334,11 @@ q 또는 Ctrl-C 종료
 - `switch` is a manual one-shot switch with the same checks and the same per-session lock as the daemon.
   `--dry-run` prints the policy verdict and the relaunch line and sends nothing. It ignores `auto_switch` and
   honours `dry_run`.
+- `--to` takes the account name the status table shows (`rtb.team.1`), its email or its folder id, tried in the
+  order folder id, email, name. Name and email ignore case; the folder id does not. An account with neither email
+  nor display name is shown, and named, by its folder id's first 8 characters. A name never matches by prefix, so
+  `rtb.team.1` never picks `rtb.team.11`. Both failures exit 2 and print `name  email  folder-id` lines: an unknown
+  account lists every account, and a name several accounts share lists only those, to pick one by folder id.
 - Exit codes: `0` ok; `1` runtime failure, switch not ok, daemon already running, session busy or already
   touched; `2` usage or config error, unknown or unmanaged pid or account, `profiles_root` missing.
 
